@@ -423,7 +423,7 @@ pub(crate) fn create_array(
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn create_with_frame(
     doc: &mut CadDocument,
     definition: Handle,
