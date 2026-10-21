@@ -1403,6 +1403,7 @@ fn lookup_basepoint_palette_and_table_dialog_real_controls() {
     with_stack(|| {
         use crate::ui::window::{authoring_palettes::Tab, block_lookup::Action as A};
         let mut app = authoring_app();
+        let _ = app.dispatch_command("BACTIONBARMODE 0");
         let _ = app.dispatch_command("BAUTHORPALETTE");
         for (id, point_text) in [
             ("authoring-tool-basepoint", "0.2,0.1"),
