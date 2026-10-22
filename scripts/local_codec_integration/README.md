@@ -1,12 +1,14 @@
-# Unfinished local integration harness snapshot
+# Local codec integration: current recipe and historical snapshots
 
-Restore these Python files under ignored `target/assoc-arc-integration/` before using them. They are preserved work in progress, not a completed build or an executable release.
+Use [the current checkpoint guide](../../docs/checkpoints/dwg2010-codec-integration.md) to restore both verified codec fixes and build the compatible upstream application. Do not execute the Python snapshots for the current checkpoint.
 
-Start with [the checkpoint guide](../../docs/checkpoints/dwg2010-codec-integration.md). It explains recovery of the exact codec commit, required local worktrees/configuration and the two known preparation issues: all-platform offline metadata requests Android manifests, and the snapshot assumes the main checkout still has the pre-checkpoint HEAD.
+| File | Purpose |
+|---|---|
+| `codec-local.toml.in` | Current local source override template. Replace `__LOCAL_CODEC_PATH__` with the absolute restored codec path. |
+| `Cargo.lock.integration.patch` | Current temporary lock delta for app `ea4537429` and codec base `ff75fdd`: removes only acadrust's Git source. Apply only in the isolated build worktree, never to the root lockfile. |
+| `prepare.py` | Historical unfinished provenance harness for app `0b414389c`; assumes an obsolete root HEAD and uses all-platform offline metadata. |
+| `verify.py` | Historical seven-private-fixture stdio harness; never executed for the current build and does not prove strict-open or zero-recovery status. |
 
-- `codec-local.toml.in`: replace `__LOCAL_CODEC_PATH__` with this machine's absolute codec checkout path.
-- `prepare.py`: protected-state/provenance and lock-delta checks; the latest attempt failed before provenance closure.
-- `verify.py`: intended post-build stdio checks; not executed against a new application binary yet.
-- `Cargo.lock.integration.patch`: records the sole temporary lock delta observed in the isolated worktree. Do not apply it to the public root lockfile or treat it as a permanent dependency update.
+The old application is incompatible with the newer codec's plugin type registry. The guide replaces its preparation/build recipe with native-target `cargo tree`, `cargo pkgid`, focused public tests and a compatible pinned application worktree.
 
-Private inputs, raw outputs and builds are intentionally not included.
+Private inputs, raw outputs, builds and new memory/task logs are not included in this checkpoint update.

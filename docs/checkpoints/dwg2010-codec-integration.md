@@ -1,24 +1,23 @@
-# Resume the DWG 2010 codec integration
+# Restore the verified DWG 2010 codec fixes
 
-**Checkpoint only: the codec fix is verified; the new application has not been built.** Work stopped at the user's request. Resume from branch `checkpoint/dwg2010-codec-integration` in `sclMAX/OpenCADStudio`. No installed application was replaced.
+**Both fixes are preserved, built and user-tested.** The affected drawings now open without recovery. This checkpoint carries source transport and reproducible build instructions, not an installed application or published codec PR.
 
-## What is preserved
+## Exact source identities
 
-| Component | State |
+| Component | Commit / transport |
 |---|---|
-| Application source base | `0b414389cb1a954ed22ddb95c44727fe0a5bd075` |
-| Codec fix | `b058a27d36b5bfa83b9ba16e72cae3a8185fb935`, branch `fix/dwg2010-associative-arc` |
-| Codec transport | `patches/opencadcodec/dwg2010-associative-arc.bundle` preserves the exact commit; adjacent `.patch` is readable source |
-| Integration scripts | `scripts/local_codec_integration/` contains the current, unfinished harness source snapshot |
-| Application manifests | Unchanged; all five codec declarations still use upstream revision `14fdae5` |
-| Temporary integration lock delta | Saved as `scripts/local_codec_integration/Cargo.lock.integration.patch`; not applied to the public source lockfile |
-| Not included | Private DWG/DXF/PDF samples, binaries, build directories, caches, Engram data, ODD conversation/task logs |
+| Codec upstream base | `ff75fddc322bda4cf817c5f68535c5c2b316b9c4` |
+| Associative-arc fix | `58eb8bab76482186367ee7a8b3fba9c24c1b4308`, branch `fix/dwg2010-associative-arc-upstream` |
+| REGION tail fix, stacked on the arc fix | `cb96711852f97db10811a4e8d632824c940a1134`, branch `fix/dwg2010-region-tail` |
+| Application tested with both fixes | `ea4537429dfbdda6a94ea31dbc6c5cc684363f26` from upstream OpenCADStudio |
+| Current codec transport | `patches/opencadcodec/dwg2010-codec-fixes.bundle` plus ordered `0001-*.patch` and `0002-*.patch` |
+| Historical transport only | `dwg2010-associative-arc.bundle` preserves the older `b058a27` fix on base `14fdae5`; do not use it for this build |
 
-There is no `sclMAX/opencadcodec` fork. No new repository was created and nothing was pushed to the codec upstream. The source bundle carries the local fix inside this checkpoint instead.
+No codec fork, upstream PR, AppImage, installation or source dependency upgrade is included. The application base does not include our pending REGION snap/performance PRs. Private drawings, binaries, caches and new memory/task logs are not part of this checkpoint update.
 
-## Restore the code on another PC
+## Restore on another PC
 
-These commands assume a fresh Linux checkout. Install the native prerequisites described in the project README; adapt environment setup for other operating systems.
+Use a **fresh checkout** and the Linux native prerequisites from the project README. Commands below create only new ignored build paths. Do not overwrite an existing `target/Cargo.toml` or reuse a dirty codec checkout.
 
 ```bash
 git clone --branch checkpoint/dwg2010-codec-integration https://github.com/sclMAX/OpenCADStudio.git
@@ -26,23 +25,20 @@ cd OpenCADStudio
 ROOT="$(pwd)"
 mkdir -p target
 
-git clone https://github.com/HakanSeven12/opencadcodec.git target/codec-assoc-2010
-git -C target/codec-assoc-2010 fetch origin 14fdae51c24ea6cbfdaf2af257079a71ef806351
-git -C target/codec-assoc-2010 bundle verify "$ROOT/patches/opencadcodec/dwg2010-associative-arc.bundle"
-git -C target/codec-assoc-2010 fetch "$ROOT/patches/opencadcodec/dwg2010-associative-arc.bundle" \
-  refs/heads/fix/dwg2010-associative-arc:refs/heads/fix/dwg2010-associative-arc
-git -C target/codec-assoc-2010 switch fix/dwg2010-associative-arc
-git -C target/codec-assoc-2010 rev-parse HEAD
-# Expected: b058a27d36b5bfa83b9ba16e72cae3a8185fb935
+git clone --no-checkout https://github.com/HakanSeven12/opencadcodec.git target/codec-assoc-2010
+git -C target/codec-assoc-2010 fetch origin ff75fddc322bda4cf817c5f68535c5c2b316b9c4
+git -C target/codec-assoc-2010 bundle verify "$ROOT/patches/opencadcodec/dwg2010-codec-fixes.bundle"
+git -C target/codec-assoc-2010 fetch "$ROOT/patches/opencadcodec/dwg2010-codec-fixes.bundle" \
+  refs/heads/fix/dwg2010-associative-arc-upstream:refs/heads/fix/dwg2010-associative-arc-upstream \
+  refs/heads/fix/dwg2010-region-tail:refs/heads/fix/dwg2010-region-tail
+git -C target/codec-assoc-2010 switch fix/dwg2010-region-tail
+test "$(git -C target/codec-assoc-2010 rev-parse HEAD)" = cb96711852f97db10811a4e8d632824c940a1134
 
-# Local-only workspace boundary for the nested codec checkout.
 printf '[workspace]\nmembers = ["codec-assoc-2010"]\nresolver = "2"\n' > target/Cargo.toml
 
-git worktree add -b build/assoc-arc-codec-integration \
-  target/worktrees/assoc-arc-integration 0b414389cb1a954ed22ddb95c44727fe0a5bd075
+git fetch https://github.com/HakanSeven12/OpenCADStudio.git ea4537429dfbdda6a94ea31dbc6c5cc684363f26
+git worktree add --detach target/worktrees/codec-upstream-test ea4537429dfbdda6a94ea31dbc6c5cc684363f26
 mkdir -p target/assoc-arc-integration
-cp scripts/local_codec_integration/prepare.py scripts/local_codec_integration/verify.py \
-  target/assoc-arc-integration/
 python3 - <<'PY'
 from pathlib import Path
 root = Path.cwd()
@@ -52,33 +48,43 @@ config = template.replace('__LOCAL_CODEC_PATH__', (root / 'target/codec-assoc-20
 PY
 ```
 
-The bundle requires the upstream base commit above; it is not a standalone full repository. Use the bundle to retain the exact commit identity. The adjacent textual patch is an alternative transport, not an additional patch to apply after importing the bundle.
+The bundle requires its stated upstream base; it is not a complete repository. It restores the exact two commit identities. The textual patches are an alternative: apply them in order to `ff75fdd` with `git am`, **not after importing the bundle**.
 
-Copy private samples separately if functional verification is needed. Expected paths are `diagnostics/region-dwg/originals/8216.dwg`, the 2013/2018 DWG and DXF variants, and `diagnostics/region-dwg/variants/8216_v2010.{dwg,dxf}`. They remain ignored and must not be published.
+## Resolve, test and build
 
-## Exact stopping point and next work
-
-1. **Fix the unfinished provenance check before rerunning the harness.** `prepare.py` called full `cargo metadata --offline`; Cargo demanded uncached `android-activity v0.6.1`, even though this is a native Linux build. That command exited 101. Do not fetch irrelevant Android dependencies or call the integration verified without deciding the appropriate native dependency inspection. Cargo documentation says `--filter-platform` filters `resolve`, but still includes all packages; it is not proven to solve the manifest-fetch issue. Native `cargo tree --target x86_64-unknown-linux-gnu -p OpenCADStudio -i acadrust` / `cargo pkgid` are possible approaches, **not yet executed or proven**.
-2. The snapshot also assumes the main checkout HEAD equals the application base. The checkpoint commit necessarily advances the main checkout. Adjust that assumption while keeping the **build worktree** pinned to the exact application base and protecting the main checkout before/after. Do not run the snapshots directly from `scripts/`; restore them under ignored `target/` first.
-3. Validate resolution of the source-wide override to the clean local codec commit. The only observed worktree `Cargo.lock` change was removal of the Git `source` from the `acadrust 0.6.4` entry. No other dependency/version changed. The saved lock patch is evidence of that temporary delta, not a permanent source dependency update.
-4. Once provenance and the lock delta are validated, compile the application. The command below is the intended next build, **not a completed build**:
+Use native-target dependency inspection rather than full offline `cargo metadata`, which previously requested irrelevant Android packages. A new PC may download dependencies already pinned in the lockfile; do not upgrade their versions.
 
 ```bash
-ROOT="$(git rev-parse --show-toplevel)"
-cd target/worktrees/assoc-arc-integration
+cargo test --manifest-path "$ROOT/target/codec-assoc-2010/Cargo.toml" \
+  --test dwg2010_region_tail --test dwg_assoc_edge_arc \
+  --test acis_wireframe_bounds --test issue129 \
+  --target-dir "$ROOT/target/assoc-arc-integration/codec-tests"
+
+cd "$ROOT/target/worktrees/codec-upstream-test"
+git apply "$ROOT/scripts/local_codec_integration/Cargo.lock.integration.patch"
 cargo --config "$ROOT/target/assoc-arc-integration/codec-local.toml" \
-  build --release --bin OpenCADStudio --offline --locked \
-  --target-dir "$ROOT/target/assoc-arc-integration/build"
+  tree --locked --target x86_64-unknown-linux-gnu -p OpenCADStudio -i acadrust
+cargo --config "$ROOT/target/assoc-arc-integration/codec-local.toml" pkgid --offline acadrust
+# Expected: path+file://.../target/codec-assoc-2010#acadrust@0.6.4
+# git diff must show only removal of acadrust's Git source from Cargo.lock.
+cargo --config "$ROOT/target/assoc-arc-integration/codec-local.toml" \
+  build --release --bin OpenCADStudio --locked \
+  --target-dir "$ROOT/target/assoc-arc-integration/build-upstream"
+"$ROOT/target/assoc-arc-integration/build-upstream/release/OpenCADStudio" --new-instance --read-only
 ```
 
-5. Run the restored `verify.py` against the resulting executable using isolated HOME/XDG state. It uses public stdio `--serve --read-only` requests and inspects all five typed auxiliary handles across seven files. Legacy `open` drops read statistics: success does not establish strict-open success or zero recovered errors. Verify the actual codec source/build provenance independently before declaring completion.
+Do not use application base `0b414389c` with the updated codec: its plugin type registry fails with `MissingVariants(["DxfVersion"])`. The preserved `prepare.py` / `verify.py` are historical, unfinished snapshots for that older application and seven unavailable fixtures; **do not run them for this checkpoint**. Use the commands above. See [snapshot notes](../../scripts/local_codec_integration/README.md).
 
-No AppImage packaging, installation, publishing or unrelated REGION correction is authorized by this checkpoint.
+## Verification already observed
 
-## Prior codec verification and limitations
+- Associative arcs: five public synthetic regressions pass; the user confirmed that the original fix opened previously failing drawings. The original seven-file/70-comparison evidence predates the rebase; it was not rerun on this PC.
+- REGION framing: public synthetic RED reproduced the optional empty silhouette-count error; final focused checks passed **21 tests**, including two independent verifier cases retained as regressions.
+- Codec suite: **2020 passed, 35 ignored**, with `properties_table_numeric_rows_roundtrip_in_dxf_and_dwg` explicitly excluded because its failure was previously reproduced on the untouched base. This is not an unfiltered-green claim; the count predates adding the final two independent tests.
+- Six affected DWG 2010 drawings plus the DWG 2018 control read with **zero skipped records and zero recovered errors**. REGION geometry/materials survive an exact in-memory DWG save/reopen comparison. The nine previously skipped REGIONs are retained. Original file hashes remained unchanged.
+- The DWG 2018 control produced identical stdout, stderr and exit code before/after the REGION fix. Independent structural/runtime verification found no blocker.
+- The user subsequently confirmed that **all supplied drawings open without recovery in the UI** and moved them to their local `ok` folder. This is opening acceptance, not an exhaustive visual geometry audit.
+- Final release build and `--version` / `--help` passed. Local binary SHA256: `f81cf3c664347f7b229b66cf1afb585235618c01648ff6638ad191b3c810427f`. This identifies the observed binary, not a promised reproducible-build checksum. No installed application was replaced.
 
-- Five focused public synthetic regressions passed after observed RED.
-- Independent verification decoded all five auxiliary objects in seven inputs and passed **70 exact object-data comparisons** through DWG and DXF save/reopen, without synthesized scalar values.
-- The full codec suite has a properties-table assertion failure also reproduced on the untouched base. Excluding that one known failure: **2013 passed, 35 ignored**. Do not call the unfiltered suite green.
-- Repository-wide formatting differences predate this fix; partially encoded-scalar truncation lacks an independent fixture (coverage advisory).
-- Source fix is limited to terminal root AC1024 associative arcs with no prior reader error and exact main-stream exhaustion. Modern four-scalar and nested parsing remain unchanged. REGION framing in other drawings is a separate unresolved problem.
+## Next delivery
+
+Preserve the fixes separately when preparing codec PRs. The REGION branch currently contains the arc commit as its parent; restack or declare that dependency rather than sending the same arc fix twice. No codec PR creation or upstream push is implied by this checkpoint.

@@ -1,4 +1,4 @@
-From b058a27d36b5bfa83b9ba16e72cae3a8185fb935 Mon Sep 17 00:00:00 2001
+From 58eb8bab76482186367ee7a8b3fba9c24c1b4308 Mon Sep 17 00:00:00 2001
 From: sclMAX <maxi.indumatics@gmail.com>
 Date: Wed, 21 Oct 2026 15:07:19 -0300
 Subject: [PATCH] fix(dwg): preserve terminal AC1024 associative arcs
@@ -11,12 +11,12 @@ Subject: [PATCH] fix(dwg): preserve terminal AC1024 associative arcs
  create mode 100644 tests/dwg_assoc_edge_arc.rs
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5093a105df81ee47459b65798ce7c60b22a9bdbd..2d4bdfe5635c20b9fe5fe5be8ae4a6e3f5b1891c 100644
+index 8a2a7d3..d333575 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -2,6 +2,10 @@
- 
- ### Unreleased
+@@ -18,6 +18,10 @@
+   The serialized structs gain fields; positional formats require a separate
+   compatibility strategy.
  
 +- **DWG 2010 associative arcs** - Preserve the observed terminal AC1024
 +  three-scalar edge-arc layout without synthesizing a fourth value. Modern
@@ -26,7 +26,7 @@ index 5093a105df81ee47459b65798ce7c60b22a9bdbd..2d4bdfe5635c20b9fe5fe5be8ae4a6e3
    writes a real R12 file: no handles, CLASSES or OBJECTS, R12 table records,
    and R12 entities only. LWPOLYLINE becomes a 2D POLYLINE with its bulges,
 diff --git a/src/io/dwg/dwg_stream_readers/object_reader/associative.rs b/src/io/dwg/dwg_stream_readers/object_reader/associative.rs
-index 5e3e72b03bdcf609a089a503df09c32920b3b2e9..f494692a55417891b0b38688a3bea05dc29d301a 100644
+index 5e3e72b..f494692 100644
 --- a/src/io/dwg/dwg_stream_readers/object_reader/associative.rs
 +++ b/src/io/dwg/dwg_stream_readers/object_reader/associative.rs
 @@ -20,7 +20,20 @@ fn read_edge_curve(
@@ -53,7 +53,7 @@ index 5e3e72b03bdcf609a089a503df09c32920b3b2e9..f494692a55417891b0b38688a3bea05d
          }
 diff --git a/tests/dwg_assoc_edge_arc.rs b/tests/dwg_assoc_edge_arc.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d55f48357b4c657ec60398fb0168f1d95905ce4d
+index 0000000..d55f483
 --- /dev/null
 +++ b/tests/dwg_assoc_edge_arc.rs
 @@ -0,0 +1,154 @@
