@@ -645,8 +645,8 @@ fn refresh_measurement(dimension: &mut Dimension, plane: Plane) {
             value.base.actual_measurement = (second - first).dot(axis).abs();
         }
         Dimension::Aligned(value) => value.base.actual_measurement = value.measurement(),
-        Dimension::Angular2Ln(value) => value.base.actual_measurement = value.measurement_degrees(),
-        Dimension::Angular3Pt(value) => value.base.actual_measurement = value.measurement_degrees(),
+        Dimension::Angular2Ln(value) => value.base.actual_measurement = value.measurement_radians(),
+        Dimension::Angular3Pt(value) => value.base.actual_measurement = value.measurement_radians(),
         Dimension::Ordinate(value) => value.refresh_measurement(),
         _ => {}
     }

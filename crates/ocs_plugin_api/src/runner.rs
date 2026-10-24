@@ -231,6 +231,9 @@ fn handle_host_request(
                     InteractiveEvent::ObjectPick { handle, pt } => {
                         cmd_ref.on_object_pick(handle, pt)
                     }
+                    InteractiveEvent::SelectionComplete(handles) => {
+                        cmd_ref.on_selection_complete(handles)
+                    }
                     InteractiveEvent::Cancel => CommandStep::Cancel,
                 }));
                 match res {
@@ -284,6 +287,51 @@ fn handle_host_request(
             match result {
                 Some(Ok(b)) => HostResponse::Bool(b),
                 Some(Err(_)) => HostResponse::Error("needs_object_pick() panicked".to_string()),
+                None => HostResponse::Error(format!("unknown interactive command {command_id}")),
+            }
+        }
+        HostRequest::IsSelectionGathering { command_id } => {
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.is_selection_gathering()
+                    }))
+                })
+            };
+            match result {
+                Some(Ok(b)) => HostResponse::Bool(b),
+                Some(Err(_)) => HostResponse::Error("is_selection_gathering() panicked".to_string()),
+                None => HostResponse::Error(format!("unknown interactive command {command_id}")),
+            }
+        }
+        HostRequest::AcceptsDragSelection { command_id } => {
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.accepts_drag_selection()
+                    }))
+                })
+            };
+            match result {
+                Some(Ok(b)) => HostResponse::Bool(b),
+                Some(Err(_)) => HostResponse::Error("accepts_drag_selection() panicked".to_string()),
+                None => HostResponse::Error(format!("unknown interactive command {command_id}")),
+            }
+        }
+        HostRequest::SelectionRejectsLockedLayers { command_id } => {
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.selection_rejects_locked_layers()
+                    }))
+                })
+            };
+            match result {
+                Some(Ok(b)) => HostResponse::Bool(b),
+                Some(Err(_)) => HostResponse::Error("selection_rejects_locked_layers() panicked".to_string()),
                 None => HostResponse::Error(format!("unknown interactive command {command_id}")),
             }
         }
@@ -400,6 +448,9 @@ fn handle_host_request_v4(
                     InteractiveEvent::ObjectPick { handle, pt } => {
                         cmd_ref.on_object_pick(handle, pt)
                     }
+                    InteractiveEvent::SelectionComplete(handles) => {
+                        cmd_ref.on_selection_complete(handles)
+                    }
                     InteractiveEvent::Cancel => CommandStep::Cancel,
                 }));
                 match res {
@@ -458,6 +509,63 @@ fn handle_host_request_v4(
                 Some(Ok(b)) => Some(HostResponse::Bool(b)),
                 Some(Err(_)) => Some(HostResponse::Error(
                     "needs_object_pick() panicked".to_string(),
+                )),
+                None => Some(HostResponse::Error(format!(
+                    "unknown interactive command {command_id}"
+                ))),
+            }
+        }
+        HostRequest::IsSelectionGathering { command_id } => {
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.is_selection_gathering()
+                    }))
+                })
+            };
+            match result {
+                Some(Ok(b)) => Some(HostResponse::Bool(b)),
+                Some(Err(_)) => Some(HostResponse::Error(
+                    "is_selection_gathering() panicked".to_string(),
+                )),
+                None => Some(HostResponse::Error(format!(
+                    "unknown interactive command {command_id}"
+                ))),
+            }
+        }
+        HostRequest::AcceptsDragSelection { command_id } => {
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.accepts_drag_selection()
+                    }))
+                })
+            };
+            match result {
+                Some(Ok(b)) => Some(HostResponse::Bool(b)),
+                Some(Err(_)) => Some(HostResponse::Error(
+                    "accepts_drag_selection() panicked".to_string(),
+                )),
+                None => Some(HostResponse::Error(format!(
+                    "unknown interactive command {command_id}"
+                ))),
+            }
+        }
+        HostRequest::SelectionRejectsLockedLayers { command_id } => {
+            let result = {
+                let registry = interactive.borrow();
+                registry.get(&command_id).map(|cmd| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.selection_rejects_locked_layers()
+                    }))
+                })
+            };
+            match result {
+                Some(Ok(b)) => Some(HostResponse::Bool(b)),
+                Some(Err(_)) => Some(HostResponse::Error(
+                    "selection_rejects_locked_layers() panicked".to_string(),
                 )),
                 None => Some(HostResponse::Error(format!(
                     "unknown interactive command {command_id}"

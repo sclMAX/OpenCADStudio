@@ -9,6 +9,9 @@ const EDIT_GRIP_START: usize = usize::MAX / 4;
 pub(super) fn is_editor_grip(id: usize) -> bool {
     (EDIT_GRIP_START..EDIT_GRIP_START + 16).contains(&id)
 }
+pub(super) fn editor_grip_index(id: usize) -> Option<usize> {
+    is_editor_grip(id).then(|| id - EDIT_GRIP_START)
+}
 struct EditCommand {
     document: u64,
     definition: Handle,

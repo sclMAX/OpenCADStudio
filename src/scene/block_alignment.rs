@@ -31,6 +31,22 @@ pub fn grips(doc: &CadDocument, definition: Handle, insert: Handle) -> Vec<Align
     let Some(EntityType::Insert(reference)) = doc.get_entity(insert) else {
         return vec![];
     };
+    reference_grips(doc, definition, reference)
+}
+
+/// Definition-space insertion grips, measured from the native block base.
+pub(crate) fn insertion_grips(doc: &CadDocument, name: &str) -> Vec<Alignment> {
+    let Some(definition) = doc.block_records.get(name) else {
+        return vec![];
+    };
+    reference_grips(
+        doc,
+        definition.handle,
+        &Insert::new(name, codec::types::Vector3::ZERO),
+    )
+}
+
+fn reference_grips(doc: &CadDocument, definition: Handle, reference: &Insert) -> Vec<Alignment> {
     let transform = render_graph::insert_transform(doc, reference);
     let x = actions::v(transform.apply_rotation(actions::native(DVec3::X)));
     let y = actions::v(transform.apply_rotation(actions::native(DVec3::Y)));

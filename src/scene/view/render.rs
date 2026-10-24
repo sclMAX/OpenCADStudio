@@ -2768,7 +2768,7 @@ impl Scene {
         // paints no canvas at all; anything else would erase the page beneath
         // it. Only model space clears to the editor background.
         let canvas_background = if viewport.paper_sheet {
-            crate::scene::PAPER_DESK_COLOR
+            self.desk_bg_color
         } else if self.current_layout != "Model" {
             // This viewport paints no canvas of its own (`skip_background`),
             // but shading and fog still blend toward whatever is behind it —
@@ -3372,6 +3372,15 @@ impl Scene {
         (final_color, pl, pat, lw, aci)
     }
 
+    /// Whether lines are drawn at their lineweights on screen. `$LWDISPLAY`
+    /// decides it in model space and in every layout alike: a layout that
+    /// displays plot styles takes its lineweights from the style table, but
+    /// AutoCAD and DWG TrueView still draw them hairline while LWDISPLAY is
+    /// off.
+    pub(crate) fn lineweights_on_screen(&self) -> bool {
+        self.document.header.lineweight_display
+    }
+
     fn display_plot_style(&self) -> Option<Arc<crate::io::plot_style::PlotStyleTable>> {
         if self.current_layout == "Model" {
             return None;
@@ -3427,7 +3436,9 @@ impl Scene {
         if let Some((gen, wires)) = self.styled_wire_cache.borrow().get(&key) {
             return (Arc::clone(wires), *gen);
         }
-        let mut wires = source.as_ref().clone();
+        // A repeated block's further copies are stubs drawn in their
+        // prototype's colour; expand them so each copy takes the style (#2030).
+        let mut wires = crate::scene::model::instance_model::expand_stubs(&source).into_owned();
         for wire in &mut wires {
             self.apply_display_plot_style(&mut wire.color, wire.aci, &style);
             if wire.aci > 0 {
@@ -3726,6 +3737,9 @@ pub(crate) fn render_style_for_common_viewport(
     common: &codec::entities::EntityCommon,
     viewport: Option<Handle>,
 ) -> ([f32; 4], f32, [f32; 8], f32, u8) {
+    if crate::scene::block_construction::is_construction(common) {
+        return crate::scene::block_construction::display_style();
+    }
     let layer_name = &common.layer;
     let (entity_color, aci) = {
         let book_color = common
@@ -4884,15 +4898,7 @@ impl Scene {
             width: full.width.max(1.0),
             height: full.height.max(1.0),
         };
-        let display_plot_lineweights = self.current_layout != "Model"
-            && self.effective_plot_settings().is_some_and(|settings| {
-                settings.flags.show_plot_styles && settings.flags.print_lineweights
-            });
-        let mut uniforms = Uniforms::new(
-            &inst.camera,
-            full_bounds,
-            self.document.header.lineweight_display || display_plot_lineweights,
-        );
+        let mut uniforms = Uniforms::new(&inst.camera, full_bounds, self.lineweights_on_screen());
         if self.current_layout == "Model" {
             uniforms.lineweight_scale = -self.model_lineweight_scale;
         } else {
@@ -5530,6 +5536,52 @@ mod layer0_inherit_tests {
         entity.common_mut().transparency = Transparency::OPAQUE;
         let color = resolve(&d, &entity, [0.2, 0.4, 0.6, 0.25]);
         assert_eq!(color[3], 1.0);
+    }
+
+    /// A layout that displays plot styles and plots lineweights still draws
+    /// hairlines while LWDISPLAY is off, as AutoCAD 2025 does on such a
+    /// drawing; turning LWDISPLAY on shows the lineweights.
+    #[test]
+    fn displayed_plot_styles_do_not_turn_lineweights_on() {
+        let mut scene = Scene::new();
+        scene.set_current_layout("Layout1".into());
+        let mut settings = scene.effective_plot_settings().expect("layout settings");
+        settings.current_style_sheet = crate::io::plot_style::MONOCHROME_PLOT_STYLE.into();
+        settings.flags.show_plot_styles = true;
+        settings.flags.print_lineweights = true;
+        assert!(scene.set_layout_plot_settings("Layout1", &settings));
+
+        scene.document.header.lineweight_display = false;
+        assert!(!scene.lineweights_on_screen());
+        scene.document.header.lineweight_display = true;
+        assert!(scene.lineweights_on_screen());
+    }
+
+    /// Displayed plot styles recolour a repeated block's stubbed copies too,
+    /// not only its first copy. (#2030)
+    #[test]
+    fn display_plot_style_reaches_stubbed_block_copies() {
+        use crate::scene::model::instance_model::{expand_stubs, stub_wire, RenderInstance};
+        let mut scene = Scene::new();
+        scene.set_current_layout("Layout1".into());
+        let mut settings = scene.effective_plot_settings().expect("layout settings");
+        settings.current_style_sheet = crate::io::plot_style::MONOCHROME_PLOT_STYLE.into();
+        settings.flags.show_plot_styles = true;
+        assert!(scene.set_layout_plot_settings("Layout1", &settings));
+        let magenta = [1.0, 0.0, 1.0, 1.0];
+        let points = vec![[0.0; 3], [1.0, 0.0, 0.0]];
+        let mut copy = WireModel::solid("1".into(), points, magenta, false);
+        copy.aci = 6;
+        copy.render_instance = Some(RenderInstance {
+            source_id: 1,
+            translation: [0.0; 3],
+        });
+        let mut stub = stub_wire(Arc::new(vec![copy]), [0.0, 0.0, 1.0, 0.0], [5.0, 0.0, 0.0], 0.0);
+        stub.name = "1".into();
+        let (styled, _) = scene.display_styled_wires(Arc::new(vec![stub]), 1);
+        let styled = expand_stubs(&styled);
+        assert_eq!(styled.len(), 1);
+        assert_eq!(styled[0].color[..3], [0.0; 3]);
     }
 
     #[test]

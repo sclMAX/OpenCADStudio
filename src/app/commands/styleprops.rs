@@ -853,206 +853,74 @@ impl OpenCADStudio {
                 }
             }
 
-            // OVERKILL gathers objects, exposes cleanup settings, then applies one undo group.
+            // OVERKILL gathers objects, exposes cleanup settings (dialog, or the
+            // command line for -OVERKILL), then applies one undo group.
             "OVERKILL" | "-OVERKILL" => {
-                let handles = self.tabs[i]
+                use crate::modules::draw::modify::overkill;
+                let handles: Vec<_> = self.tabs[i]
                     .scene
                     .selected_entities()
                     .iter()
                     .map(|(h, _)| *h)
                     .collect();
-                let command = crate::modules::draw::modify::overkill::OverkillCommand::new(handles);
-                self.command_line.push_info(&command.prompt());
-                self.tabs[i].active_cmd = Some(Box::new(command));
+                let dialog = cmd == "OVERKILL";
+                if dialog && !handles.is_empty() {
+                    let settings =
+                        *overkill::remembered().lock().unwrap_or_else(|e| e.into_inner());
+                    self.overkill_dialog = Some(crate::ui::window::overkill::State::new(settings));
+                    self.active_modal = Some(crate::app::ModalKind::Overkill);
+                } else {
+                    let command = overkill::OverkillCommand::new(handles, dialog);
+                    self.command_line.push_info(&command.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(command));
+                }
             }
             value if value.starts_with("OVERKILL_APPLY ") => {
-                use crate::modules::draw::modify::overkill::{normalized, optimize};
+                use codec::objects::ObjectType;
                 let values: Vec<_> = value.split_whitespace().skip(1).collect();
                 if values.len() != 6 {
                     return Some(self.finish_dispatch(cmd));
                 }
-                let tolerance = values[0].parse::<f64>().unwrap_or(1e-6);
-                let ignore = values[1].parse::<u16>().unwrap_or(0);
-                let optimize_plines = values[2] == "1";
-                let overlap = values[3] == "1";
-                let end_to_end = values[4] == "1";
-                let preserve_associative = values[5] == "1";
-                let mut candidates: Vec<_> = self.tabs[i]
-                    .scene
-                    .selected_entities()
+                let settings = crate::modules::draw::modify::overkill::Settings {
+                    tolerance: values[0].parse::<f64>().unwrap_or(1e-6),
+                    ignore: values[1].parse::<u16>().unwrap_or(0),
+                    optimize: values[2] == "1",
+                    overlap: values[3] == "1",
+                    end_to_end: values[4] == "1",
+                    associativity: values[5] == "1",
+                };
+                let scene = &self.tabs[i].scene;
+                // Reactors that are groups only record membership; any other
+                // live reactor (dimension association, hatch boundary, ...)
+                // makes the object associative.
+                let associative = |e: &codec::EntityType| {
+                    e.common().reactors.iter().any(|r| {
+                        scene.document.get_entity(*r).is_some()
+                            || scene
+                                .document
+                                .objects
+                                .get(r)
+                                .is_some_and(|o| !matches!(o, ObjectType::Group(_)))
+                    })
+                };
+                let selected = scene.selected_entities();
+                let found = selected.len();
+                let mut candidates: Vec<_> = selected
                     .into_iter()
                     .filter(|(h, e)| {
-                        !self.tabs[i].scene.is_layer_locked(*h)
-                            && (!preserve_associative || e.common().reactors.is_empty())
+                        !scene.is_layer_locked(*h) && !(settings.associativity && associative(e))
                     })
                     .map(|(h, e)| (h, e.clone()))
                     .collect();
-                candidates.sort_by_key(|(h, _)| h.value());
-                let mut changed = std::collections::HashSet::new();
-                if optimize_plines {
-                    for (h, e) in &mut candidates {
-                        let before = e.clone();
-                        optimize(e, tolerance);
-                        if *e != before {
-                            changed.insert(*h);
-                        }
-                    }
-                }
-                let mut removed = std::collections::HashSet::new();
-                // Iterate to a fixed point: a bridge can join two previously disjoint intervals.
-                loop {
-                    let mut progress = false;
-                    for a in 0..candidates.len() {
-                        if removed.contains(&candidates[a].0) {
-                            continue;
-                        }
-                        for b in a + 1..candidates.len() {
-                            if removed.contains(&candidates[b].0) {
-                                continue;
-                            }
-                            let left = normalized(&candidates[a].1, ignore);
-                            let right = normalized(&candidates[b].1, ignore);
-                            if left == right {
-                                removed.insert(candidates[b].0);
-                                progress = true;
-                                continue;
-                            }
-                            if overlap {
-                                let contained = |circle: &codec::entities::Circle, arc: &codec::entities::Arc| {
-                                    circle.common == arc.common && circle.thickness == arc.thickness
-                                        && kernel::space::arc_union::circle_contains_arc(
-                                            [circle.center.x,circle.center.y,circle.center.z],
-                                            [circle.normal.x,circle.normal.y,circle.normal.z],circle.radius,
-                                            kernel::space::arc_union::CircularArc { center:[arc.center.x,arc.center.y,arc.center.z],
-                                                normal:[arc.normal.x,arc.normal.y,arc.normal.z],radius:arc.radius,start:arc.start_angle,end:arc.end_angle })
-                                };
-                                match (&left, &right) {
-                                    (
-                                        codec::EntityType::Circle(circle),
-                                        codec::EntityType::Arc(arc),
-                                    ) if contained(circle, arc) => {
-                                        removed.insert(candidates[b].0);
-                                        progress = true;
-                                        continue;
-                                    }
-                                    (
-                                        codec::EntityType::Arc(arc),
-                                        codec::EntityType::Circle(circle),
-                                    ) if contained(circle, arc) => {
-                                        removed.insert(candidates[a].0);
-                                        progress = true;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if let (codec::EntityType::Arc(l), codec::EntityType::Arc(r)) =
-                                (&left, &right)
-                            {
-                                use kernel::space::arc_union::{
-                                    circular_arc_union, ArcUnionKind, CircularArc,
-                                };
-                                if l.common != r.common || l.thickness != r.thickness {
-                                    continue;
-                                }
-                                let arc = |v: &codec::entities::Arc| CircularArc {
-                                    center: [v.center.x, v.center.y, v.center.z],
-                                    normal: [v.normal.x, v.normal.y, v.normal.z],
-                                    radius: v.radius,
-                                    start: v.start_angle,
-                                    end: v.end_angle,
-                                };
-                                let Some(union) = circular_arc_union(arc(l), arc(r), tolerance)
-                                else {
-                                    continue;
-                                };
-                                let allowed = match union.kind {
-                                    ArcUnionKind::Duplicate => true,
-                                    ArcUnionKind::Overlap => overlap,
-                                    ArcUnionKind::EndToEnd => end_to_end,
-                                };
-                                if !allowed {
-                                    continue;
-                                }
-                                if let codec::EntityType::Arc(source) = &candidates[a].1 {
-                                    let replacement = if union.full_circle {
-                                        let mut circle = codec::entities::Circle::new();
-                                        circle.common = source.common.clone();
-                                        circle.center = source.center.clone();
-                                        circle.normal = source.normal.clone();
-                                        circle.radius = source.radius;
-                                        circle.thickness = source.thickness;
-                                        codec::EntityType::Circle(circle)
-                                    } else {
-                                        let mut arc = source.clone();
-                                        arc.start_angle = union.start;
-                                        arc.end_angle = union.end;
-                                        codec::EntityType::Arc(arc)
-                                    };
-                                    candidates[a].1 = replacement;
-                                }
-                                changed.insert(candidates[a].0);
-                                removed.insert(candidates[b].0);
-                                progress = true;
-                                continue;
-                            }
-                            let (codec::EntityType::Line(l), codec::EntityType::Line(r)) =
-                                (&left, &right)
-                            else {
-                                continue;
-                            };
-                            if l.common != r.common
-                                || l.thickness != r.thickness
-                                || l.normal != r.normal
-                            {
-                                continue;
-                            }
-                            let point = |p: codec::types::Vector3| [p.x, p.y, p.z];
-                            let Some(union) = kernel::space::line_union(
-                                [point(l.start), point(l.end)],
-                                [point(r.start), point(r.end)],
-                                tolerance,
-                            ) else {
-                                continue;
-                            };
-                            let allowed = match union.kind {
-                                kernel::space::LineUnionKind::Duplicate => true,
-                                kernel::space::LineUnionKind::Overlap => overlap,
-                                kernel::space::LineUnionKind::EndToEnd => end_to_end,
-                            };
-                            if !allowed {
-                                continue;
-                            }
-                            if let codec::EntityType::Line(line) = &mut candidates[a].1 {
-                                line.start = codec::types::Vector3::new(
-                                    union.start[0],
-                                    union.start[1],
-                                    union.start[2],
-                                );
-                                line.end = codec::types::Vector3::new(
-                                    union.end[0],
-                                    union.end[1],
-                                    union.end[2],
-                                );
-                            }
-                            changed.insert(candidates[a].0);
-                            removed.insert(candidates[b].0);
-                            progress = true;
-                        }
-                    }
-                    if !progress {
-                        break;
-                    }
-                }
+                let (changed, removed) =
+                    crate::modules::draw::modify::overkill::run(&mut candidates, &settings);
                 if !changed.is_empty() || !removed.is_empty() {
                     self.push_undo_snapshot(i, "OVERKILL");
-                    let updates: Vec<_> = candidates
-                        .into_iter()
-                        .filter(|(h, _)| changed.contains(h) && !removed.contains(h))
-                        .collect();
-                    let updated_count = updates.len();
                     let mut changes = Vec::new();
-                    for (handle, entity) in updates {
+                    for (handle, entity) in candidates {
+                        if !changed.contains(&handle) {
+                            continue;
+                        }
                         if let Some(target) = self.tabs[i].scene.document.get_entity_mut(handle) {
                             *target = entity;
                             changes.push((handle, crate::scene::ChangeKind::Modified));
@@ -1064,14 +932,23 @@ impl OpenCADStudio {
                     self.tabs[i].scene.erase_entities(&handles);
                     self.tabs[i].dirty = true;
                     self.refresh_properties();
-                    self.command_line.push_output(&format!(
-                        "OVERKILL: removed {} objects; updated {} objects.",
-                        removed.len(),
-                        updated_count
-                    ));
+                    self.command_line.push_output(
+                        crate::tf!(
+                            "OVERKILL: {} object(s) checked, {} removed, {} modified.",
+                            found,
+                            removed.len(),
+                            changed.len()
+                        )
+                        .as_ref(),
+                    );
                 } else {
-                    self.command_line
-                        .push_output("OVERKILL: no objects required changes.");
+                    self.command_line.push_output(
+                        crate::tf!(
+                            "OVERKILL: {} object(s) checked, no duplicates found.",
+                            found
+                        )
+                        .as_ref(),
+                    );
                 }
             }
             // ── PICKADD / PICKDRAG — selection UX (#226, app settings) ───
@@ -1181,6 +1058,7 @@ impl OpenCADStudio {
                     | "PICKBOX"
                     | "APERTURE"
                     | "HPASSOC"
+                    | "HPGAPTOL"
                     | "COMMANDLINEOPACITY"
                     | "MENUBAR"
                     | "CURSORTYPE"
@@ -2622,6 +2500,22 @@ impl OpenCADStudio {
                                     false,
                                 )),
                             },
+                            "HPGAPTOL" => {
+                                let max = crate::modules::draw::draw::hatch::MAX_GAP_TOLERANCE;
+                                match value.as_deref().map(|v| v.replace(',', ".").parse::<f64>()) {
+                                    Some(Ok(v)) if (0.0..=max).contains(&v) => {
+                                        self.hatch_gap_tolerance = v;
+                                        Ok((format!("HPGAPTOL = {v}"), true))
+                                    }
+                                    Some(_) => {
+                                        Err(format!("SETVAR: value must be between 0 and {max}."))
+                                    }
+                                    None => Ok((
+                                        format!("HPGAPTOL = {}", self.hatch_gap_tolerance),
+                                        false,
+                                    )),
+                                }
+                            }
                             "CURSORTYPE" => match &value {
                                 Some(v) => match v.as_str() {
                                     "0" => {
@@ -3598,6 +3492,7 @@ impl OpenCADStudio {
                                         | "PICKBOX"
                                         | "APERTURE"
                                         | "HPASSOC"
+                                        | "HPGAPTOL"
                                         | "COMMANDLINEOPACITY"
                                         | "MENUBAR"
                                         | "CURSORTYPE"

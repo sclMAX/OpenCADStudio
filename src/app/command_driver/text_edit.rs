@@ -223,8 +223,10 @@ impl OpenCADStudio {
                 }
                 codec::EntityType::Dimension(d) => {
                     // Empty string resets to auto-measured value; otherwise set override.
-                    let base = d.base_mut();
-                    base.text = new_text;
+                    crate::entities::dimension::set_dimension_text_override(
+                        d.base_mut(),
+                        (!new_text.trim().is_empty()).then_some(new_text),
+                    );
                     updated = true;
                     is_dim = true;
                 }

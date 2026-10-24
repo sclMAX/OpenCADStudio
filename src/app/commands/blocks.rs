@@ -1878,6 +1878,268 @@ mod tests {
     }
 
     #[test]
+    fn blockpalette_click_on_a_drawing_block_keeps_the_previews() {
+        let mut app = fresh_app();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let mut line = codec::entities::Line::new();
+        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        app.tabs[i]
+            .scene
+            .define_block_from_owned_entities(
+                vec![codec::EntityType::Line(line)],
+                "Widget",
+                glam::DVec3::ZERO,
+            )
+            .unwrap();
+        app.refresh_block_palette();
+        let before = std::rc::Rc::clone(&app.block_palette.blocks[0].preview);
+        let _ = app.palette_insert(
+            crate::ui::window::block_palette::Item::Current("Widget".into()),
+            None,
+        );
+        assert_eq!(app.block_palette.placing.as_deref(), Some("Widget"));
+        // No rebuild: the same preview (and its drawn thumbnail) stays.
+        assert!(std::rc::Rc::ptr_eq(
+            &app.block_palette.blocks[0].preview,
+            &before
+        ));
+    }
+
+    #[test]
+    fn blockpalette_refresh_keeps_previews_of_blocks_a_change_did_not_touch() {
+        use std::rc::Rc;
+        let mut app = fresh_app();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let line = |x: f64| {
+            let mut line = codec::entities::Line::new();
+            line.end = codec::types::Vector3::new(x, 0.0, 0.0);
+            codec::EntityType::Line(line)
+        };
+        let insert = |name: &str| {
+            codec::EntityType::Insert(codec::entities::Insert::new(
+                name.to_string(),
+                codec::types::Vector3::ZERO,
+            ))
+        };
+        let scene = &mut app.tabs[i].scene;
+        scene.define_block_raw("Part", codec::types::Vector3::ZERO, vec![line(1.0)]);
+        scene.define_block_raw("Holder", codec::types::Vector3::ZERO, vec![insert("Part")]);
+        scene.define_block_raw("Outer", codec::types::Vector3::ZERO, vec![insert("Holder")]);
+        scene.define_block_raw("Other", codec::types::Vector3::ZERO, vec![line(2.0)]);
+        app.refresh_block_palette();
+        let preview = |app: &crate::app::OpenCADStudio, name: &str| {
+            Rc::clone(&app.block_palette.current_entry(name).unwrap().preview)
+        };
+        // A preview is worked out once shown, and the one kept for Recent /
+        // Favorites is the same, not a copy.
+        let kept = |app: &crate::app::OpenCADStudio, name: &str| {
+            let key = format!("|{}", name.to_ascii_uppercase());
+            app.block_palette
+                .ref_wires
+                .iter()
+                .find(|(k, _)| k.ends_with(&key))
+                .map(|(_, p)| Rc::clone(p))
+                .expect("kept preview")
+        };
+        assert!(preview(&app, "Part").wires().is_none());
+        app.ensure_block_previews();
+        assert!(preview(&app, "Part").wires().is_some_and(|w| !w.is_empty()));
+        assert!(Rc::ptr_eq(&kept(&app, "Part"), &preview(&app, "Part")));
+        let before: Vec<_> = ["Part", "Holder", "Outer", "Other"]
+            .iter()
+            .map(|n| preview(&app, n))
+            .collect();
+        // Redefining Part redraws it and the blocks holding it, directly or
+        // nested; Other keeps its preview.
+        let fresh = !app.block_palette_stale();
+        app.tabs[i]
+            .scene
+            .redefine_block_raw("Part", codec::types::Vector3::ZERO, vec![line(5.0)])
+            .unwrap();
+        app.note_block_changes(fresh, ["Part"]);
+        app.refresh_block_palette();
+        let after: Vec<_> = ["Part", "Holder", "Outer", "Other"]
+            .iter()
+            .map(|n| preview(&app, n))
+            .collect();
+        for k in 0..3 {
+            assert!(!Rc::ptr_eq(&before[k], &after[k]), "{k}");
+        }
+        assert!(Rc::ptr_eq(&before[3], &after[3]));
+        assert!(Rc::ptr_eq(&kept(&app, "Part"), &after[0]));
+        // A change made while the palette was out of date rebuilds all.
+        app.note_block_changes(false, ["Part"]);
+        app.refresh_block_palette();
+        assert!(!Rc::ptr_eq(&preview(&app, "Other"), &after[3]));
+        // Without a hint every preview is rebuilt, as before.
+        let other = preview(&app, "Other");
+        app.refresh_block_palette();
+        assert!(!Rc::ptr_eq(&preview(&app, "Other"), &other));
+        // A hint only lives for the message that made it.
+        let fresh = !app.block_palette_stale();
+        app.note_block_changes(fresh, ["Part"]);
+        let _ = app.update(crate::app::Message::Dock(
+            crate::ui::dock::DockMsg::HoverExit,
+        ));
+        assert_eq!(
+            app.block_palette.change_hint,
+            crate::ui::window::block_palette::ChangeHint::Unknown
+        );
+    }
+
+    #[test]
+    fn blockpalette_works_out_only_the_previews_it_shows() {
+        use crate::ui::window::block_palette::{BlockPaletteMsg, ViewMode};
+        let mut app = fresh_app();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        for k in 0..300 {
+            let mut line = codec::entities::Line::new();
+            line.end = codec::types::Vector3::new(1.0 + k as f64, 0.0, 0.0);
+            app.tabs[i].scene.define_block_raw(
+                &format!("B{k:03}"),
+                codec::types::Vector3::ZERO,
+                vec![codec::EntityType::Line(line)],
+            );
+        }
+        app.show_block_palette = true;
+        app.block_palette.view = ViewMode::Large;
+        let built = |app: &crate::app::OpenCADStudio| {
+            app.block_palette
+                .blocks
+                .iter()
+                .filter(|b| b.preview.wires().is_some())
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // Before the list reports its viewport: about a screenful.
+        let _ = app.update(crate::app::Message::BlockPalette(
+            BlockPaletteMsg::Scrolled {
+                offset: 0.0,
+                height: 0.0,
+            },
+        ));
+        let first = built(&app);
+        assert!(first.contains(&"B000".to_string()));
+        assert!(first.len() < 100, "{}", first.len());
+        // Scrolled far down: those rows are worked out too, the rest not.
+        let _ = app.update(crate::app::Message::BlockPalette(
+            BlockPaletteMsg::Scrolled {
+                offset: 5000.0,
+                height: 400.0,
+            },
+        ));
+        let now = built(&app);
+        assert!(now.len() > first.len() && now.len() < 150, "{}", now.len());
+        assert!(!now.contains(&"B299".to_string()));
+        // The List view shows no thumbnails and works out none.
+        app.refresh_block_palette();
+        app.block_palette.view = ViewMode::List;
+        let _ = app.update(crate::app::Message::BlockPalette(BlockPaletteMsg::Refresh));
+        assert!(built(&app).is_empty());
+        // Placing a block works out its preview for the drag.
+        let _ = app.palette_insert(
+            crate::ui::window::block_palette::Item::Current("B299".into()),
+            None,
+        );
+        assert_eq!(built(&app), vec!["B299".to_string()]);
+    }
+
+    #[test]
+    fn block_gallery_works_out_only_the_previews_it_shows() {
+        use crate::ui::window::block_palette::BlockPaletteMsg;
+        let gallery = crate::modules::insert::insert_block::GALLERY_ID.to_string();
+        let mut app = fresh_app();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let define = |app: &mut crate::app::OpenCADStudio, name: &str| {
+            app.tabs[i].scene.define_block_raw(
+                name,
+                codec::types::Vector3::ZERO,
+                vec![codec::EntityType::Line(codec::entities::Line::new())],
+            );
+        };
+        for k in 0..300 {
+            define(&mut app, &format!("B{k:03}"));
+        }
+        let built = |app: &crate::app::OpenCADStudio| {
+            app.block_palette
+                .blocks
+                .iter()
+                .filter(|b| b.preview.wires().is_some())
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // Opening the gallery (with the palette hidden) works out its first
+        // rows only.
+        assert!(!app.show_block_palette);
+        let _ = app.update(crate::app::Message::ToggleRibbonDropdown(gallery.clone()));
+        let first = built(&app);
+        assert!(first.contains(&"B000".to_string()));
+        assert!(first.len() < 40, "{}", first.len());
+        // Scrolled down: those rows are worked out too, the rest not.
+        let _ = app.update(crate::app::Message::BlockPalette(
+            BlockPaletteMsg::GalleryScrolled(2000.0),
+        ));
+        let now = built(&app);
+        assert!(now.len() > first.len() && now.len() < 80, "{}", now.len());
+        assert!(!now.contains(&"B299".to_string()));
+        // Opened again, it starts at the top.
+        let _ = app.update(crate::app::Message::ToggleRibbonDropdown(gallery.clone()));
+        let _ = app.update(crate::app::Message::ToggleRibbonDropdown(gallery));
+        assert_eq!(app.block_palette.gallery_offset, 0.0);
+        // A block defined while it is open replaces the previews, and the
+        // ones in view are worked out again.
+        define(&mut app, "ZNEW");
+        let _ = app.update(crate::app::Message::BlockPalette(
+            BlockPaletteMsg::GalleryScrolled(0.0),
+        ));
+        assert!(app.block_palette.current_entry("ZNEW").is_some());
+        assert!(built(&app).contains(&"B000".to_string()));
+    }
+
+    #[test]
+    fn blockpalette_library_thumbnails_arrive_in_the_background() {
+        use crate::ui::window::block_palette::BlockPaletteMsg;
+        let dir = std::env::temp_dir().join(format!(
+            "ocs_palette_thumbs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let drawing = dir.join("part.dwg");
+        std::fs::write(&drawing, b"not a drawing").unwrap();
+        let mut app = fresh_app();
+        app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.update(crate::app::Message::BlockPalette(
+            BlockPaletteMsg::LibrarySelect(dir.display().to_string()),
+        ));
+        // Listed at once, without its thumbnail: that is read in the
+        // background once the message is handled.
+        let entry = |app: &crate::app::OpenCADStudio| {
+            app.block_palette
+                .library_entries
+                .iter()
+                .find(|e| e.path == drawing)
+                .map(|e| e.thumb.is_some())
+        };
+        assert_eq!(entry(&app), Some(false));
+        assert!(app.block_palette.thumb_requests.is_empty());
+        // The read thumbnail lands on its entry.
+        let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]);
+        let _ = app.update(crate::app::Message::BlockPalette(
+            BlockPaletteMsg::Thumbnails(vec![(drawing.clone(), Some(handle))]),
+        ));
+        assert_eq!(entry(&app), Some(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn xref_dash_alias_lists_like_xref() {
         // `-XREF` asks on the command line: `?` then Enter prints the
         // reference table; `XREF ?` keeps the legacy list output for scripts.

@@ -49,6 +49,9 @@ use crate::t;
 
 use super::entity_index::ModifyEntityIndex;
 
+#[path = "trim_hatch_region.rs"]
+mod hatch_region;
+
 // ── Dropdown constants ─────────────────────────────────────────────────────
 
 pub const DROPDOWN_ID: &str = "trim_extend";
@@ -2961,6 +2964,12 @@ fn pick_trim_at(
             Some(trim_spline(s, &ts, t_click))
         }
         Some(EntityType::LwPolyline(p)) => trim_lwpolyline(p, px, py, geos),
+        Some(EntityType::MLine(m)) => {
+            super::mledit::trim_mline_at(m, DVec3::new(px, py, 0.0), |a, b| {
+                line_seg_ts(a.x, a.y, b.x, b.y, handle, geos)
+            })
+            .map(|trimmed| vec![EntityType::MLine(trimmed)])
+        }
         Some(EntityType::Hatch(hatch)) => trim_hatch_at(hatch, geos, px, py)
             .map(|result| vec![EntityType::Hatch(Box::new(result))]),
         _ => None,
@@ -3850,6 +3859,25 @@ impl TrimCommand {
             .collect()
     }
 
+    fn hatch_trim_at(&self, handle: Handle, point: DVec3) -> Option<hatch_region::HatchTrim> {
+        let EntityType::Hatch(hatch) = self.entity_index.get(&self.all_entities, handle)? else {
+            return None;
+        };
+        let nearby = (!self.implied_edges)
+            .then(|| self.entity_index.nearby_handles(&self.all_entities, handle))
+            .flatten();
+        let edges: std::collections::HashSet<_> = self.edge_set.iter().copied().collect();
+        let cutters = self.all_entities.iter().filter(|entity| {
+            let handle = entity.common().handle;
+            is_trim_boundary_entity(entity)
+                && (edges.is_empty() || edges.contains(&handle))
+                && nearby
+                    .as_ref()
+                    .is_none_or(|handles| handles.contains(&handle))
+        });
+        hatch_region::trim(hatch, cutters, point, self.implied_edges)
+    }
+
     fn fence_run(&mut self, fence: &[[f64; 2]], window: Option<CrossingWindow>) -> CmdResult {
         let replacements = fence_pass(&self.all_entities, &self.geos, fence, window, self.shift);
         if replacements.is_empty() {
@@ -4029,9 +4057,16 @@ impl CadCommand for TrimCommand {
                     return CmdResult::ReplaceEntity(handle, Vec::new());
                 }
                 let (px, py) = (pt.x, pt.y);
+                let entity = self.entity_index.get(&self.all_entities, handle);
                 let new_entities = if self.shift {
                     // Shift+click swaps to Extend for this pick (#336).
                     pick_extend_at(&self.all_entities, &self.geos, handle, px, py).map(|e| vec![e])
+                } else if matches!(entity, Some(EntityType::Hatch(_))) {
+                    // Treat a HATCH as a filled arrangement of cells. This extends
+                    // the legacy half-plane solver to multi-edge partitions and
+                    // curved / tilted boundaries while retaining exact paths.
+                    self.hatch_trim_at(handle, pt)
+                        .map(|trim| vec![EntityType::Hatch(Box::new(trim.kept))])
                 } else {
                     let geos = self.nearby_geos(handle);
                     if self.quick {
@@ -4426,33 +4461,9 @@ impl CadCommand for TrimCommand {
                         ))
                     }).collect();
                 }
-                let Some(trimmed) = trim_hatch_at(hatch, geos, pt.x, pt.y) else {
-                    return vec![];
-                };
-                let mut out = Vec::new();
-                for (index, path) in hatch.paths.iter().enumerate() {
-                    if let Some(mut points) = crate::scene::hatch_path_ring(path) {
-                        points.push(points[0]);
-                        out.push(WireModel::solid_f64(
-                            format!("trim_hatch_original_{index}"),
-                            points.into_iter().map(|p| [p[0], p[1], hatch.elevation]).collect(),
-                            TRIM_REMOVE_GRAY,
-                            false,
-                        ));
-                    }
-                }
-                for (index, path) in trimmed.paths.iter().enumerate() {
-                    if let Some(mut points) = crate::scene::hatch_path_ring(path) {
-                        points.push(points[0]);
-                        out.push(WireModel::solid_f64(
-                            format!("trim_hatch_keep_{index}"),
-                            points.into_iter().map(|p| [p[0], p[1], hatch.elevation]).collect(),
-                            WireModel::CYAN,
-                            false,
-                        ));
-                    }
-                }
-                out
+                self.hatch_trim_at(handle, pt)
+                    .map(|trim| trim.preview_wires())
+                    .unwrap_or_default()
             }
             Some(EntityType::LwPolyline(p)) => {
                 let Some(survivors) = trim_lwpolyline(p, pt.x as f64, pt.y as f64, geos) else {
@@ -5304,7 +5315,7 @@ mod tests {
         let EntityType::Hatch(trimmed) = &edited[0] else { panic!("HATCH expected"); };
         assert!(!trimmed.is_associative);
         assert!(trimmed.paths.iter().all(|p| p.boundary_handles.is_empty()));
-        assert_eq!(trimmed.common.handle, Handle::NULL);
+        assert_eq!(trimmed.common.handle, Handle::new(1));
         assert_eq!(trimmed.paths.len(), 1);
         let ring = crate::scene::hatch_path_ring(&trimmed.paths[0]).unwrap();
         assert!(ring.iter().all(|p| p[0] >= 5.0 - 1e-8));

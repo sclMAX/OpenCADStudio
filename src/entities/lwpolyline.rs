@@ -1605,6 +1605,7 @@ pub(crate) fn wide_fills(pl: &codec::entities::LwPolyline) -> ([f64; 2], Vec<Vec
     let origin = [verts[0].location.x, verts[0].location.y];
     let seg_count = if pl.is_closed { n } else { n - 1 };
     let mut out = Vec::new();
+    let mut segments = Vec::new();
     for i in 0..seg_count {
         let v0 = &verts[i];
         let v1 = &verts[(i + 1) % n];
@@ -1622,12 +1623,19 @@ pub(crate) fn wide_fills(pl: &codec::entities::LwPolyline) -> ([f64; 2], Vec<Vec
             (v1.location.x - origin[0]) as f32,
             (v1.location.y - origin[1]) as f32,
         ];
+        let segment = (p0, p1, hw0, hw1, v0.bulge as f32);
         if let Some(poly) =
             crate::entities::common::polyline_segment_fill(p0, p1, hw0, hw1, v0.bulge as f32)
         {
             out.push(poly);
+            segments.push(segment);
         }
     }
+    crate::entities::common::mitre_wide_joins(
+        &mut out,
+        &segments,
+        pl.is_closed && segments.len() == seg_count,
+    );
     (origin, out)
 }
 

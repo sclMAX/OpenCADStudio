@@ -822,6 +822,7 @@ impl OpenCADStudio {
             pick_box: self.pick_box,
             aperture: self.snapper.osnap_radius_px,
             hatch_associative: self.hatch_associative,
+            hatch_gap_tolerance: self.hatch_gap_tolerance,
             show_menu_bar: self.show_menu_bar,
             ribbon_closed: self.ribbon_closed,
             options_tab: self.options_tab,
@@ -847,8 +848,11 @@ impl OpenCADStudio {
                 block_defaults.wblock_mode,
             ),
             field_display: crate::entities::field::display(),
+            hyperlink_options: crate::app::commands::hyperlink_options(),
             xref_fade: crate::scene::cache::block_cache::xref_fade_ctl(),
             file_dia: crate::sys::file_dia(),
+            ole_hide: crate::entities::ole2frame::hide_mode(),
+            ole_quality: crate::app::commands::ole_quality(),
             trim_extend_quick: crate::modules::draw::modify::trim::quick_mode(),
             #[cfg(not(target_arch = "wasm32"))]
             fonts_folder: crate::io::font_repo::fonts_folder().map(|p| p.display().to_string()),
@@ -946,6 +950,7 @@ impl OpenCADStudio {
             count_service: self.count_palette.service,
             count_invalid_area: self.count_palette.invalid_choice,
             sheet_set: self.sheet_set.settings,
+            quick_calc: self.quick_calc.settings(),
         }
     }
 
@@ -974,6 +979,11 @@ impl OpenCADStudio {
             crate::snap::DEFAULT_OSNAP_RADIUS_PX
         };
         self.hatch_associative = s.hatch_associative;
+        let max_gap = crate::modules::draw::draw::hatch::MAX_GAP_TOLERANCE;
+        self.hatch_gap_tolerance = s.hatch_gap_tolerance;
+        if !(0.0..=max_gap).contains(&self.hatch_gap_tolerance) {
+            self.hatch_gap_tolerance = 0.0;
+        }
         self.show_menu_bar = s.show_menu_bar;
         self.ribbon_closed = s.ribbon_closed;
         self.options_tab = s.options_tab;
@@ -1004,9 +1014,12 @@ impl OpenCADStudio {
             remembered.wblock_mode = bc::mode_from_code(s.wblock_object_mode);
         }
         crate::entities::field::set_display(s.field_display);
+        crate::app::commands::set_hyperlink_options(s.hyperlink_options);
         crate::scene::cache::block_cache::set_xref_fade_ctl(s.xref_fade);
         self.ribbon.xref_fade = crate::scene::cache::block_cache::xref_fade_ctl();
         crate::sys::set_file_dia(s.file_dia);
+        crate::entities::ole2frame::set_hide_mode(s.ole_hide);
+        crate::app::commands::set_ole_quality(s.ole_quality);
         crate::modules::draw::modify::trim::set_quick_mode(s.trim_extend_quick);
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1140,6 +1153,7 @@ impl OpenCADStudio {
         self.count_palette.service = s.count_service;
         self.count_palette.invalid_choice = s.count_invalid_area.min(2);
         self.sheet_set.settings = s.sheet_set;
+        self.quick_calc.apply_settings(&s.quick_calc);
         self.block_palette.recent = s.block_recent.clone();
         self.block_palette.favorites = s.block_favorites.clone();
         self.block_palette.libraries = s.block_libraries.clone();
@@ -1291,6 +1305,7 @@ impl OpenCADStudio {
         tab.scene.selection_color = self.model_space.resolve_selection_color();
         tab.scene.selection_effect = self.model_space.selection_effect;
         tab.scene.selection_widen = f32::from(self.model_space.selection_highlight_widen.min(6));
+        tab.scene.desk_bg_color = self.model_space.resolve_desk_bg();
         if bg.is_none() && paper_bg.is_none() {
             return;
         }
@@ -1562,6 +1577,7 @@ impl OpenCADStudio {
     pub(in crate::app) fn sync_model_space_theme(&mut self, geometry_changed: bool) {
         let model_bg = self.model_space.resolve_model_bg(&self.active_theme);
         let paper_bg = self.model_space.resolve_paper_bg();
+        let desk_bg = self.model_space.resolve_desk_bg();
         let sel_color = self.model_space.resolve_selection_color();
         let sel_effect = self.model_space.selection_effect;
         let sel_widen = f32::from(self.model_space.selection_highlight_widen.min(6));
@@ -1571,6 +1587,7 @@ impl OpenCADStudio {
         for tab in &mut self.tabs {
             let old_bg = tab.scene.bg_color;
             let old_paper = tab.scene.paper_bg_color;
+            let old_desk = std::mem::replace(&mut tab.scene.desk_bg_color, desk_bg);
             let old_sel_color = tab.scene.selection_color;
             let old_sel_effect = tab.scene.selection_effect;
             tab.scene.bg_color = model_bg;
@@ -1588,7 +1605,11 @@ impl OpenCADStudio {
                 tab.scene.selection_generation = tab.scene.selection_generation.wrapping_add(1);
             }
 
-            if geometry_changed || old_bg != model_bg || old_paper != paper_bg {
+            if geometry_changed
+                || old_bg != model_bg
+                || old_paper != paper_bg
+                || old_desk != desk_bg
+            {
                 tab.scene.recolor_meshes();
                 tab.scene.bump_geometry();
             }

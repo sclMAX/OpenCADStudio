@@ -9,8 +9,8 @@ use std::io::Read;
 
 use super::model::{
     arc_cubics, bspline_points, dgn_color_table, paths_bounds, scaled_elements, By, DgnCollector,
-    DgnColor, DgnElement, DgnGeom, DgnImport, DgnReference, Path, PathBuilder, Segment, Sheet,
-    SubPath, Text, DGN_DEFAULT_COLORS,
+    DgnColor, DgnDimLook, DgnDimStyle, DgnElement, DgnGeom, DgnImport, DgnReference, Path,
+    PathBuilder, Segment, Sheet, SubPath, Text, DGN_DEFAULT_COLORS,
 };
 
 // ── Compound file ───────────────────────────────────────────────────────────
@@ -317,18 +317,75 @@ fn text_style_table(nm: &[&[u8]]) -> Vec<(u32, String, String)> {
     out
 }
 
-/// The dimension style table (table 5): each entry's element id and name.
-/// One style can have more than one entry.
-fn dim_style_table(nm: &[&[u8]]) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
+/// The dimension style table (table 5), lengths in master units (`s` per
+/// UOR). One style can have more than one entry. An entry holds its
+/// element id (16), text style id (56), accuracy (72), flags (85: 0x10
+/// text in the line, 0x20 horizontal text; 184: 0x01 a line between the
+/// extension lines, 0x10 trailing zeros shown), text height (112),
+/// extension line offset and extension (152, 160), text gap (360) and
+/// terminator width (408) as text heights, stack offset (288), centre
+/// mark (296), angle decimal places (307, plus one), its master and sub
+/// units (numerator and denominator per metre at 520 and 544) and name
+/// (after 104); the linkage `de 56` holds its scale 54 bytes in.
+fn dim_style_table(nm: &[&[u8]], s: f64) -> Vec<DgnDimStyle> {
+    // Text style id (32) → its font number and kind (40); the text style
+    // table can follow the dimension style table.
+    let mut fonts = HashMap::new();
     let mut table = 0;
     for e in nm {
         match kind(e) {
             96 => table = u32_at(e, 12).unwrap_or(0),
-            95 if table == 5 => {
-                if let (Some(id), Some(name)) = (u32_at(e, 16), marked_string(e, 104)) {
-                    out.push((id, name));
+            95 if table == 3 => {
+                if let (Some(id), Some(f)) = (u32_at(e, 32), e.get(40..42)) {
+                    fonts.entry(id).or_insert((f[0], f[1]));
                 }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for e in nm {
+        match kind(e) {
+            96 => table = u32_at(e, 12).unwrap_or(0),
+            95 if table == 5 => {
+                let (Some(id), Some(name)) = (u32_at(e, 16), marked_string(e, 104)) else {
+                    continue;
+                };
+                let real = |at: usize| f64_at(e, at).filter(|v| v.is_finite()).unwrap_or(0.0);
+                let bit = |at: usize, mask: u8| e.get(at).is_some_and(|b| b & mask != 0);
+                let text_height = real(112) * s;
+                // Metres per unit: denominator over numerator.
+                let metres = |at: usize| {
+                    let n = real(at);
+                    (n > 0.0).then(|| real(at + 8) / n)
+                };
+                let near = |m: Option<f64>, v: f64| m.is_some_and(|m| (m - v).abs() < 1e-9);
+                let scale = (600..e.len().saturating_sub(4))
+                    .find(|&k| e[k + 1] == 0x10 && e[k + 2] == 0xde && e[k + 3] == 0x56)
+                    .and_then(|k| f64_at(e, k + 54))
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0);
+                out.push(DgnDimStyle {
+                    id,
+                    name,
+                    text_style: u32_at(e, 56).unwrap_or(0),
+                    font: u32_at(e, 56).and_then(|t| fonts.get(&t).copied()).unwrap_or((0, 0)),
+                    text_height,
+                    arrow: real(408) * text_height,
+                    ext_offset: real(152) * text_height,
+                    ext_extension: real(160) * text_height,
+                    gap: real(360) * text_height,
+                    stack_offset: real(288) * s,
+                    center: real(296) * s,
+                    accuracy: e.get(72).copied().unwrap_or(0x84),
+                    angle_places: e.get(307).map_or(0, |b| b.saturating_sub(1)),
+                    trailing_zeros: bit(184, 0x10),
+                    inline_text: bit(85, 0x10),
+                    horizontal_text: bit(85, 0x20),
+                    line_inside: bit(184, 0x01),
+                    scale,
+                    two_units: near(metres(520), 0.3048) && near(metres(544), 0.0254),
+                });
             }
             _ => {}
         }
@@ -1098,12 +1155,30 @@ fn read_run(run: &[&[u8]], styles: &Styles, xf: &Xf) -> Raw {
                     {
                         let x = dir3(x);
                         let y = dir3(y);
+                        // Its own settings: text height (152), font number
+                        // and kind (168), text off the line (180, 0x40),
+                        // extension line offset and extension (192, 200),
+                        // text gap and margin (208, 216), terminator width
+                        // (232).
+                        let real = |at: usize| f64_at(e, at).unwrap_or(0.0);
+                        let byte = |at: usize| e.get(at).copied().unwrap_or(0);
+                        let look = DgnDimLook {
+                            font: (byte(168), byte(169)),
+                            text_height: real(152),
+                            ext_offset: real(192),
+                            ext_extension: real(200),
+                            gap: real(208),
+                            margin: real(216),
+                            arrow: real(232),
+                            text_outside: byte(180) & 0x40 != 0,
+                        };
                         collect.push(element(DgnGeom::Dimension {
                             kind: dim,
                             points,
                             offset: f64_at(e, 328).unwrap_or(0.0),
                             axes: [[x[0], x[1]], [y[0], y[1]]],
                             style,
+                            look,
                         }));
                     }
                     // Otherwise the dimension comes in as its drawing.
@@ -1780,7 +1855,14 @@ pub fn import(bytes: &[u8], name: &str) -> Option<DgnImport> {
         v7: false,
         references,
         text_styles: text_style_table(&nm),
-        dim_styles: dim_style_table(&nm),
+        dim_styles: dim_style_table(&nm, s),
+        fonts: font_table(&nm)
+            .into_iter()
+            .map(|(n, k, name)| {
+                let file = font_file(Some((k, &name)));
+                (n, k, name, file)
+            })
+            .collect(),
         three_d: false,
         construction_layers: false,
     })

@@ -471,6 +471,7 @@ impl OpenCADStudio {
         };
         let source_name = session.block_name.clone();
         let source_handle = session.br_handle;
+        let fresh = !self.block_palette_stale();
         let name = match self.validate_block_save_as_name(i, raw) {
             Ok(name) => name,
             Err(error) => {
@@ -499,13 +500,23 @@ impl OpenCADStudio {
         for mut set in self.tabs[i].scene.parametric_constraints.iter().filter(|set| {
             matches!(set.scope, crate::scene::parametric_constraints::ParametricScope::Block(handle) if copied.handles.contains_key(&handle))
         }).cloned() {
-            if !set.retained_standard_groups.is_empty() || set.constraints.iter().any(|c| c.native_origin.is_some()) {
-                self.command_line.push_error(crate::t!("Save Block As cannot copy retained native constraints yet.").as_ref());
-                return false;
+            for group in &mut set.retained_standard_groups {
+                let Some(new) = copied.handles.get(group) else {
+                    self.command_line.push_error(crate::t!("A retained block constraint group is missing.").as_ref());
+                    return false;
+                };
+                *group = *new;
             }
             let crate::scene::parametric_constraints::ParametricScope::Block(old) = set.scope else { unreachable!() };
             set.scope = crate::scene::parametric_constraints::ParametricScope::Block(copied.handles[&old]);
             for constraint in &mut set.constraints {
+                if let Some(origin) = &mut constraint.native_origin {
+                    let Some(new) = copied.handles.get(&origin.group) else {
+                        self.command_line.push_error(crate::t!("A retained block constraint group is missing.").as_ref());
+                        return false;
+                    };
+                    origin.group = *new;
+                }
                 for reference in constraint.refs.iter_mut().chain(constraint.rigid_points.iter_mut().map(|(r, _)| r)) {
                     let Some(new) = copied.handles.get(&reference.entity) else {
                         self.command_line.push_error(crate::t!("A block constraint refers to geometry outside the definition.").as_ref());
@@ -544,7 +555,12 @@ impl OpenCADStudio {
         }
         let parameters = self.tabs[i].scene.named_parameters.clone();
         let active_layer = self.tabs[i].active_layer.clone();
-        self.tabs[i].scene.document = copied.document;
+        let before = std::mem::replace(&mut self.tabs[i].scene.document, copied.document);
+        let touched = crate::app::update::blocks_palette::changed_block_names(
+            &before,
+            &self.tabs[i].scene.document,
+        );
+        drop(before);
         self.tabs[i].scene.parametric_constraints = constraints;
         self.tabs[i].scene.named_parameters = parameters;
         self.tabs[i].active_layer = active_layer;
@@ -564,6 +580,7 @@ impl OpenCADStudio {
         session.block_name = name.clone();
         session.unpersisted_pre_document = None;
         self.tabs[i].scene.block_edit_block = Some(copied.record);
+        self.reset_block_constraint_display(i);
         self.tabs[i].scene.deselect_all();
         self.tabs[i].active_grip = None;
         self.grip_hover = None;
@@ -574,6 +591,7 @@ impl OpenCADStudio {
         self.tabs[i].block_edit_history = Some(history);
         self.tabs[i].scene.bump_geometry();
         self.tabs[i].refresh_active_ucs();
+        self.note_block_changes(fresh, &touched);
         self.refresh_block_palette();
         self.refresh_properties();
         self.sync_ribbon_layers();
@@ -632,6 +650,10 @@ impl OpenCADStudio {
             return false;
         };
         let name = session.block_name.clone();
+        // The palette keeps the other blocks' previews when it was up to
+        // date before the save.
+        let fresh = !self.block_palette_stale();
+        let mut touched = vec![name.clone()];
         if let Err(error) = crate::scene::block_service::validate_block_name(&name) {
             // Existing anonymous definitions are editable; name validation
             // applies to named definitions rather than generated variants.
@@ -683,6 +705,11 @@ impl OpenCADStudio {
                 Ok(document) => {
                     self.apply_action_document(i, document);
                     self.coalesce_saved_representations(i, &before_sync);
+                    // A dynamic block's references are drawn again too.
+                    touched.extend(crate::app::update::blocks_palette::changed_block_names(
+                        &before_sync,
+                        &self.tabs[i].scene.document,
+                    ));
                 }
                 Err(error) => {
                     self.command_line.push_error(crate::t!(error).as_ref());
@@ -700,6 +727,7 @@ impl OpenCADStudio {
             history.checkpoint = self.block_edit_checkpoint(i);
             self.tabs[i].block_edit_history = Some(history);
             self.tabs[i].scene.bump_geometry();
+            self.note_block_changes(fresh, &touched);
         }
         if let Some(session) = self.tabs[i].active_block_edit_session_mut() {
             session.unpersisted_pre_document = None;

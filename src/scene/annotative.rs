@@ -851,6 +851,32 @@ fn apply_dimension_context(
         }
     }
 
+    // A context also keeps the fit settings its scale was drawn with, and
+    // `override_code` flags which of them it overrides, one bit each in the
+    // order stored: DIMTOFL, DIMSOXD, DIMATFIT, DIMTIX, DIMTMOVE. Without them
+    // a 1:50 context drawn with a leader (DIMTMOVE 1) under a style without
+    // one lost its leader. An override on the dimension itself still wins.
+    // DIMATFIT stays with the style: its field is one bit, the variable has
+    // four values.
+    {
+        use crate::entities::dim_override as ov;
+        let common = &mut dimension.base_mut().common;
+        for (bit, code, value) in [
+            (1, ov::DIMTOFL, context.dimtofl),
+            (2, ov::DIMSOXD, context.dimosxd),
+            (8, ov::DIMTIX, context.dimtix),
+            (16, ov::DIMTMOVE, context.dimtmove),
+        ] {
+            if context.override_code & bit != 0 && ov::int(&common.extended_data, code).is_none() {
+                ov::set_on_common(
+                    common,
+                    code,
+                    Some(codec::xdata::XDataValue::Integer16(value as i16)),
+                );
+            }
+        }
+    }
+
     match (&context.subtype, dimension) {
         (DimSubtype::Aligned { dimline_pt }, Dimension::Aligned(dim)) => {
             dim.definition_point = *dimline_pt;

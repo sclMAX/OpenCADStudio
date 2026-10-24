@@ -215,6 +215,9 @@ pub struct ImportDialogs {
     pub dgn: Option<DgnImportState>,
     pub tds: Option<TdsImportState>,
     pub tds_material: Option<TdsMaterialState>,
+    /// The texture maps the last 3D Studio import did not find, as (map
+    /// file, material); the window shows the first, one at a time.
+    pub tds_maps: Vec<(String, String)>,
     pub recent: Vec<String>,
 }
 
@@ -866,6 +869,78 @@ pub fn view_tds_material<'a>(
     ]
     .spacing(10)
     .padding([10, 12])
+    .width(sizing.width)
+    .into()
+}
+
+/// A texture map a 3D Studio import did not find: the file and the material
+/// that comes in without it.
+pub fn view_tds_map<'a>(map: &'a (String, String), sizing: crate::ui::modal::ModalSizing) -> Element<'a, Message> {
+    let (file, material) = map;
+    let badge = container(
+        iced::widget::svg(crate::ui::icons::themed_handle(crate::ui::icons::WARNING))
+            .width(18.0)
+            .height(18.0)
+            .style(|_: &Theme, _| iced::widget::svg::Style { color: Some(AMBER) }),
+    )
+    .width(34)
+    .height(34)
+    .center_x(34)
+    .center_y(34)
+    .style(|_: &Theme| container::Style {
+        background: Some(Background::Color(AMBER.scale_alpha(0.15))),
+        border: Border {
+            radius: 17.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let chip = container(
+        row![
+            crate::ui::icons::themed_secondary(crate::ui::icons::IMAGE, 12.0),
+            text(file.as_str()).size(11)
+        ]
+        .spacing(5)
+        .align_y(iced::Center),
+    )
+    .padding([2, 8])
+    .style(|theme: &Theme| container::Style {
+        background: Some(Background::Color(theme.palette().background.base.color)),
+        border: Border {
+            width: 1.0,
+            radius: 10.0.into(),
+            color: theme.palette().background.strong.color,
+        },
+        ..Default::default()
+    });
+    column![
+        row![
+            badge,
+            column![
+                text(crate::tr!("import-3ds-map", "heading")).size(13).font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::DEFAULT
+                }),
+                chip,
+                text(crate::tr!("import-3ds-map", "note", material = material.as_str()))
+                    .size(11)
+                    .style(muted_style),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12),
+        iced::widget::rule::horizontal(1),
+        row![
+            Space::new().width(Fill),
+            dialog_button_styled_opt(
+                std::borrow::Cow::Owned(crate::tr!("import-3ds-map", "ok")),
+                Some(Message::CloseModal),
+                button::primary
+            ),
+        ],
+    ]
+    .spacing(12)
+    .padding([12, 14])
     .width(sizing.width)
     .into()
 }

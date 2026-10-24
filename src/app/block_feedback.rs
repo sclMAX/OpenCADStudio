@@ -4,6 +4,7 @@ use codec::{EntityType, Handle};
 use glam::DVec3;
 use iced::{Point, Rectangle};
 use std::sync::Arc;
+mod grip_tips;
 
 pub(super) struct DependencyCache {
     key: (u64, u64, Handle),
@@ -11,12 +12,11 @@ pub(super) struct DependencyCache {
 }
 
 impl OpenCADStudio {
-    pub(super) fn dynamic_grip_tip(&self, handle: Handle, id: usize) -> Option<String> {
+    fn dynamic_grip_summary(&self, handle: Handle, id: usize) -> Option<String> {
         if !self.block_editor_preferences.grip_tips {
             return None;
         }
         if id == super::visibility::VIS_GRIP_ID {
-            let label = crate::t!("Visibility state");
             let state = self.tabs[self.active_tab]
                 .visibility_grip
                 .as_ref()
@@ -25,47 +25,69 @@ impl OpenCADStudio {
                     grip.current
                         .and_then(|current| grip.state_names.get(current))
                 });
-            return Some(state.map_or_else(
-                || label.clone().into_owned(),
-                |state| format!("{label}: {state}"),
-            ));
+            return Some(match state {
+                Some(state) => crate::tr!("block-grip", "visibility-value", state = state.clone()),
+                None => crate::tr!("block-grip", "visibility-label"),
+            });
         }
         if id == super::visibility::TABLE_GRIP_ID {
-            let label = crate::t!("Block properties");
             let row = self.tabs[self.active_tab]
                 .table_grip
                 .as_ref()
                 .filter(|grip| grip.insert_handle == handle)
                 .and_then(|grip| grip.current);
-            return Some(row.map_or_else(
-                || label.clone().into_owned(),
-                |row| format!("{label}: {}", row + 1),
-            ));
+            return Some(match row {
+                Some(row) => crate::tr!("block-grip", "table-row", row = (row + 1).to_string()),
+                None => crate::tr!("block-grip", "table-label"),
+            });
         }
-        if let Some(alignment) = self.tabs[self.active_tab].scene.alignment_grips(handle).into_iter().find(|grip| grip.id == id) {
-            return Some(crate::tf!("Alignment: {}", crate::t!(if alignment.perpendicular { "Perpendicular" } else { "Tangent" })).into_owned());
+        if let Some(alignment) = self.tabs[self.active_tab]
+            .scene
+            .alignment_grips(handle)
+            .into_iter()
+            .find(|grip| grip.id == id)
+        {
+            let mode = crate::t!(if alignment.perpendicular {
+                "Perpendicular"
+            } else {
+                "Tangent"
+            })
+            .into_owned();
+            return Some(crate::tr!("block-grip", "alignment", mode = mode));
         }
         let (parameter, value) = self.dynamic_grip_value(handle, id)?;
-        let base = match value { actions::Value::Frame { base, .. } => base, _ => parameter.base };
+        let base = match value {
+            actions::Value::Frame { base, .. } => base,
+            _ => parameter.base,
+        };
         let value = match value {
-            actions::Value::Flip(state) => if state {
-                crate::t!("Flipped")
-            } else {
-                crate::t!("Not flipped")
+            actions::Value::Flip(state) => {
+                let source = self.tabs[self.active_tab]
+                    .block_test
+                    .as_ref()
+                    .filter(|test| test.insert == handle)
+                    .map_or(&self.tabs[self.active_tab].scene.document, |test| {
+                        test.baseline.as_ref()
+                    });
+                crate::scene::block_parameter_properties::flip_state_label(
+                    source,
+                    parameter.handle,
+                    state,
+                )?
             }
-            .into_owned(),
-            actions::Value::Point(at) | actions::Value::Frame { end: at, .. } if parameter.point || parameter.xy => format!(
-                "({:.4}, {:.4})",
-                at.x - base.x,
-                at.y - base.y
-            ),
-            actions::Value::Point(at) | actions::Value::Frame { end: at, .. } if parameter.rotation => format!(
-                "{:.4}°",
-                (at.y - base.y)
-                    .atan2(at.x - base.x)
-                    .to_degrees()
-            ),
-            actions::Value::Point(at) | actions::Value::Frame { end: at, .. } => format!("{:.4}", at.distance(base)),
+            actions::Value::Point(at) | actions::Value::Frame { end: at, .. }
+                if parameter.point || parameter.xy =>
+            {
+                format!("({:.4}, {:.4})", at.x - base.x, at.y - base.y)
+            }
+            actions::Value::Point(at) | actions::Value::Frame { end: at, .. }
+                if parameter.rotation =>
+            {
+                format!("{:.4}°", (at.y - base.y).atan2(at.x - base.x).to_degrees())
+            }
+            actions::Value::Point(at) | actions::Value::Frame { end: at, .. } => {
+                format!("{:.4}", at.distance(base))
+            }
         };
         Some(format!("{}: {value}", parameter.name))
     }
@@ -82,7 +104,7 @@ impl OpenCADStudio {
                 .into_iter()
                 .find(|p| p.id == node)?;
             let value = actions::instance::test_value(&tab.scene.document, handle, &p).ok()?;
-            if !crate::scene::block_grips::runtime::grips(&test.baseline, test.definition, &p, value).iter().any(|grip| grip.id == id) { return None; }
+            if !crate::scene::block_grips::runtime::action_grips(&test.baseline, test.definition, &p, value).iter().any(|grip| grip.id == id) { return None; }
             Some((p, value))
         } else {
             let definition = actions::instance::definition(&tab.scene.document, handle)?;
@@ -90,7 +112,7 @@ impl OpenCADStudio {
                 .into_iter()
                 .find(|p| p.id == node)?;
             let value = actions::instance::value(&tab.scene.document, handle, &p).ok()?;
-            if !crate::scene::block_grips::runtime::grips(&tab.scene.document, definition, &p, value).iter().any(|grip| grip.id == id) { return None; }
+            if !crate::scene::block_grips::runtime::action_grips(&tab.scene.document, definition, &p, value).iter().any(|grip| grip.id == id) { return None; }
             Some((p, value))
         }
     }
@@ -215,7 +237,7 @@ impl OpenCADStudio {
                     let value = if tab.block_test.is_some() { actions::instance::test_value(&tab.scene.document, handle, &p).ok()? }
                         else { actions::instance::value(&tab.scene.document, handle, &p).ok()? };
                     let active_id = tab.active_cmd.as_ref().and_then(|command| command.block_parameter_grip_id());
-                    let grip = crate::scene::block_grips::runtime::grips(source, definition, &p, value).into_iter().find(|grip| active_id.is_none_or(|id| grip.id == id))?;
+                    let grip = crate::scene::block_grips::runtime::action_grips(source, definition, &p, value).into_iter().find(|grip| active_id.is_none_or(|id| grip.id == id))?;
                     Some((handle, grip.id))
                 });
             if let Some((handle, id)) = active.or(hot).or(hovered) {
@@ -356,6 +378,7 @@ mod tests {
         app.tabs[i].selected_handle = Some(insert);
         let grip_id = crate::scene::block_grips::runtime::id(actions::all_parameters(&app.tabs[i].scene.document, definition).into_iter().find(|p| p.handle == parameter).unwrap().id, 1).unwrap();
         app.grip_hover = Some(super::super::GripHover {
+            document: app.tabs[i].id,
             handle: insert,
             grip_id: grip_id,
             screen: Point::ORIGIN,

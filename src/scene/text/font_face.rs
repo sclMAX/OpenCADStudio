@@ -42,8 +42,6 @@ pub enum Face {
     /// A real compiled .SHX stroke font on disk (glyphs keyed by char code).
     Shx {
         path: String,
-        /// (above + below) / above — baseline step relative to cap height.
-        line: f32,
         /// Space advance (9-unit).
         word: f32,
     },
@@ -83,14 +81,13 @@ impl Face {
         if font_name.to_ascii_lowercase().ends_with(".shx")
             && std::path::Path::new(font_name).is_file()
         {
-            if let Some((above, below)) = shx::font_metrics(font_name) {
+            if shx::font_metrics(font_name).is_some() {
                 let word = shx::font_glyph(font_name, ' ' as u16)
                     .map(|g| g.advance)
                     .filter(|a| *a > 0.0)
                     .unwrap_or(4.5);
                 return Face::Shx {
                     path: font_name.to_string(),
-                    line: ((above + below) / above) as f32,
                     word,
                 };
             }
@@ -240,12 +237,13 @@ impl Face {
     }
 
     /// Line-spacing factor (1.0 = one cap height between baselines as scaled by
-    /// the caller). TTF uses the neutral 1.0; LFF carries its font's value.
+    /// the caller). TTF and SHX use the neutral 1.0 — an SHX font's
+    /// above/below metrics don't widen the baseline step; LFF carries its
+    /// font's value.
     pub fn line_spacing(&self) -> f32 {
         match self {
             Face::Lff(f) => f.line_spacing,
-            Face::Ttf { .. } => 1.0,
-            Face::Shx { line, .. } => *line,
+            Face::Ttf { .. } | Face::Shx { .. } => 1.0,
             Face::WithBig { primary, .. } => primary.line_spacing(),
         }
     }

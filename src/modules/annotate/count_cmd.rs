@@ -470,7 +470,7 @@ impl CadCommand for UpdateFieldCommand {
     }
 
     fn prompt(&self) -> String {
-        "Select objects:".into()
+        crate::t!("Select objects:").into_owned()
     }
 
     fn is_selection_gathering(&self) -> bool {

@@ -923,7 +923,12 @@ impl OpenCADStudio {
         use crate::app::command_driver::clipboard::{eed_app_map, merge_app_ids, remap_eed_apps};
         merge_app_ids(document, &deps);
         let apps = eed_app_map(document, &deps);
-        crate::app::command_driver::clipboard::merge_block_defs(document, &blocks, &apps);
+        crate::app::command_driver::clipboard::merge_block_defs(
+            document,
+            &blocks,
+            &apps,
+            &Default::default(),
+        );
         for entity in &mut copies {
             rename_symbols(entity, &rename);
             remap_eed_apps(entity, &apps);

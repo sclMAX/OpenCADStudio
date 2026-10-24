@@ -311,38 +311,6 @@ impl<'a> HostSession<'a> {
         Ok(())
     }
 
-    /// The `ACAD_IMAGE_DICT` dictionary under the named-objects root, created
-    /// when the drawing has none. `None` when the drawing has no root dictionary.
-    fn ensure_image_dictionary(&mut self) -> Option<Handle> {
-        use codec::objects::{Dictionary, ObjectType};
-        let root = self.document().header.named_objects_dict_handle;
-        let Some(ObjectType::Dictionary(root_dictionary)) = self.document().objects.get(&root)
-        else {
-            return None;
-        };
-        if let Some(existing) = root_dictionary.get("ACAD_IMAGE_DICT") {
-            if matches!(
-                self.document().objects.get(&existing),
-                Some(ObjectType::Dictionary(_))
-            ) {
-                return Some(existing);
-            }
-        }
-        let handle = self.document_mut().allocate_handle();
-        let mut dictionary = Dictionary::new();
-        dictionary.handle = handle;
-        dictionary.owner = root;
-        self.document_mut()
-            .objects
-            .insert(handle, ObjectType::Dictionary(dictionary));
-        if let Some(ObjectType::Dictionary(root_dictionary)) =
-            self.document_mut().objects.get_mut(&root)
-        {
-            root_dictionary.add_entry("ACAD_IMAGE_DICT", handle);
-        }
-        Some(handle)
-    }
-
     /// A scripted RasterImage names a file; the host creates the image
     /// definition object it needs (pixel size read from the file) and links it.
     fn prepare_scripted_raster_image(&mut self, entity: &mut EntityType) -> Result<(), String> {
@@ -381,27 +349,14 @@ impl<'a> HostSession<'a> {
                 );
                 definition.handle = handle;
                 definition.is_loaded = true;
-                // Register it in ACAD_IMAGE_DICT under the file's name, and let
-                // that dictionary own it, like an image AutoCAD attached.
-                let stem = std::path::Path::new(&image.file_path)
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("IMAGE")
-                    .to_owned();
-                if let Some(dictionary) = self.ensure_image_dictionary() {
+                if let Some(dictionary) =
+                    crate::app::command_driver::clipboard::register_image_definition(
+                        self.document_mut(),
+                        handle,
+                        &image.file_path,
+                    )
+                {
                     definition.owner = dictionary;
-                    if let Some(codec::objects::ObjectType::Dictionary(entries)) =
-                        self.document_mut().objects.get_mut(&dictionary)
-                    {
-                        let mut key = stem.clone();
-                        let mut suffix = 1;
-                        while entries.get(&key).is_some() {
-                            suffix += 1;
-                            key = format!("{stem}_{suffix}");
-                        }
-                        entries.add_entry(key, handle);
-                    }
                 }
                 self.document_mut().objects.insert(
                     handle,
@@ -4102,6 +4057,34 @@ impl crate::command::CadCommand for PluginInteractiveAdapter {
         .unwrap_or_default();
         convert_preview_wires(raw_wires)
     }
+    fn is_selection_gathering(&self) -> bool {
+        crate::plugin::guard("InteractiveCommand::is_selection_gathering", || {
+            self.inner.is_selection_gathering()
+        })
+        .unwrap_or(false)
+    }
+    fn accepts_drag_selection(&self) -> bool {
+        crate::plugin::guard("InteractiveCommand::accepts_drag_selection", || {
+            self.inner.accepts_drag_selection()
+        })
+        .unwrap_or(false)
+    }
+    fn on_selection_complete(&mut self, handles: Vec<Handle>) -> crate::command::CmdResult {
+        crate::plugin::guard("InteractiveCommand::on_selection_complete", || {
+            self.inner.on_selection_complete(handles)
+        })
+        .map(plugin_step_to_result)
+        .unwrap_or(crate::command::CmdResult::Cancel)
+    }
+    fn selection_rejects_locked_layers(&self) -> bool {
+        crate::plugin::guard("InteractiveCommand::selection_rejects_locked_layers", || {
+            self.inner.selection_rejects_locked_layers()
+        })
+        .unwrap_or(false)
+    }
+    fn entity_pick_highlights_hover(&self) -> bool {
+        self.needs_entity_pick() || self.is_selection_gathering()
+    }
 }
 
 /// Bridges an out-of-process plugin's interactive command to the host's
@@ -4113,6 +4096,9 @@ pub(crate) struct PluginProcessInteractiveAdapter {
     pub command_id: u64,
     prompt: Option<String>,
     needs_entity_pick: Option<bool>,
+    is_selection_gathering: Option<bool>,
+    accepts_drag_selection: Option<bool>,
+    selection_rejects_locked_layers: Option<bool>,
     is_done: bool,
 }
 
@@ -4123,11 +4109,17 @@ impl PluginProcessInteractiveAdapter {
     ) -> Self {
         let prompt = process.get_prompt(command_id).ok();
         let needs_entity_pick = process.needs_entity_pick(command_id).ok();
+        let is_selection_gathering = process.is_selection_gathering(command_id).ok();
+        let accepts_drag_selection = process.accepts_drag_selection(command_id).ok();
+        let selection_rejects_locked_layers = process.selection_rejects_locked_layers(command_id).ok();
         Self {
             process,
             command_id,
             prompt,
             needs_entity_pick,
+            is_selection_gathering,
+            accepts_drag_selection,
+            selection_rejects_locked_layers,
             is_done: false,
         }
     }
@@ -4135,6 +4127,9 @@ impl PluginProcessInteractiveAdapter {
     fn refresh(&mut self) {
         self.prompt = self.process.get_prompt(self.command_id).ok();
         self.needs_entity_pick = self.process.needs_entity_pick(self.command_id).ok();
+        self.is_selection_gathering = self.process.is_selection_gathering(self.command_id).ok();
+        self.accepts_drag_selection = self.process.accepts_drag_selection(self.command_id).ok();
+        self.selection_rejects_locked_layers = self.process.selection_rejects_locked_layers(self.command_id).ok();
     }
 
     fn cancel(&mut self) {
@@ -4175,11 +4170,14 @@ impl crate::command::CadCommand for PluginProcessInteractiveAdapter {
             result,
             crate::command::CmdResult::CommitAndExit(_)
                 | crate::command::CmdResult::CommitEntitiesAndExit(_)
+                | crate::command::CmdResult::Done
+                | crate::command::CmdResult::Script(_)
                 | crate::command::CmdResult::Cancel
         ) {
             self.is_done = true;
+        } else {
+            self.refresh();
         }
-        self.refresh();
         result
     }
     fn on_enter(&mut self) -> crate::command::CmdResult {
@@ -4193,11 +4191,14 @@ impl crate::command::CadCommand for PluginProcessInteractiveAdapter {
             result,
             crate::command::CmdResult::CommitAndExit(_)
                 | crate::command::CmdResult::CommitEntitiesAndExit(_)
+                | crate::command::CmdResult::Done
+                | crate::command::CmdResult::Script(_)
                 | crate::command::CmdResult::Cancel
         ) {
             self.is_done = true;
+        } else {
+            self.refresh();
         }
-        self.refresh();
         result
     }
     fn on_escape(&mut self) -> crate::command::CmdResult {
@@ -4224,11 +4225,14 @@ impl crate::command::CadCommand for PluginProcessInteractiveAdapter {
             result,
             crate::command::CmdResult::CommitAndExit(_)
                 | crate::command::CmdResult::CommitEntitiesAndExit(_)
+                | crate::command::CmdResult::Done
+                | crate::command::CmdResult::Script(_)
                 | crate::command::CmdResult::Cancel
         ) {
             self.is_done = true;
+        } else {
+            self.refresh();
         }
-        self.refresh();
         result
     }
     fn on_preview_wires(
@@ -4240,6 +4244,39 @@ impl crate::command::CadCommand for PluginProcessInteractiveAdapter {
             .on_cursor_move(self.command_id, [pt.x as f64, pt.y as f64, pt.z as f64])
             .unwrap_or_default();
         convert_preview_wires(raw_wires)
+    }
+    fn is_selection_gathering(&self) -> bool {
+        self.is_selection_gathering.unwrap_or(false)
+    }
+    fn accepts_drag_selection(&self) -> bool {
+        self.accepts_drag_selection.unwrap_or(false)
+    }
+    fn on_selection_complete(&mut self, handles: Vec<Handle>) -> crate::command::CmdResult {
+        use ocs_plugin_api::ipc::protocol::InteractiveEvent;
+        let result = self
+            .process
+            .interactive_event(self.command_id, InteractiveEvent::SelectionComplete(handles))
+            .map(plugin_step_to_result)
+            .unwrap_or(crate::command::CmdResult::Cancel);
+        if matches!(
+            result,
+            crate::command::CmdResult::CommitAndExit(_)
+                | crate::command::CmdResult::CommitEntitiesAndExit(_)
+                | crate::command::CmdResult::Done
+                | crate::command::CmdResult::Script(_)
+                | crate::command::CmdResult::Cancel
+        ) {
+            self.is_done = true;
+        } else {
+            self.refresh();
+        }
+        result
+    }
+    fn entity_pick_highlights_hover(&self) -> bool {
+        self.needs_entity_pick.unwrap_or(false) || self.is_selection_gathering.unwrap_or(false)
+    }
+    fn selection_rejects_locked_layers(&self) -> bool {
+        self.selection_rejects_locked_layers.unwrap_or(false)
     }
 }
 
@@ -4335,7 +4372,9 @@ fn plugin_step_to_result(step: ocs_plugin_api::host::CommandStep) -> crate::comm
         CommandStep::CommitMany(es) => CmdResult::CommitEntities(es),
         CommandStep::CommitAndEnd(e) => CmdResult::CommitAndExit(e),
         CommandStep::CommitManyAndEnd(es) => CmdResult::CommitEntitiesAndExit(es),
-        CommandStep::Done | CommandStep::Cancel => CmdResult::Cancel,
+        CommandStep::Done => CmdResult::Done,
+        CommandStep::Dispatch(script) => CmdResult::Script(script),
+        CommandStep::Cancel => CmdResult::Cancel,
     }
 }
 
@@ -6869,8 +6908,8 @@ mod tests {
             ("Aligned", "definition_point=P(1,5.5), first_point=P(0,0), second_point=P(3,4)", 5.0),
             ("Radius", "definition_point=P(5,0), angle_vertex=P(0,0)", 5.0),
             ("Diameter", "definition_point=P(10,0), angle_vertex=P(0,0)", 10.0),
-            ("Angular3Pt", "definition_point=P(3,3), first_point=P(5,0), second_point=P(0,5), angle_vertex=P(0,0)", 90.0),
-            ("Angular2Ln", "definition_point=P(0,5), dimension_arc=P(3,3), first_point=P(0,0), second_point=P(5,0), angle_vertex=P(0,0)", 90.0),
+            ("Angular3Pt", "definition_point=P(3,3), first_point=P(5,0), second_point=P(0,5), angle_vertex=P(0,0)", std::f64::consts::FRAC_PI_2),
+            ("Angular2Ln", "definition_point=P(0,5), dimension_arc=P(3,3), first_point=P(0,0), second_point=P(5,0), angle_vertex=P(0,0)", std::f64::consts::FRAC_PI_2),
             ("Ordinate", "feature_location=P(5,3), leader_endpoint=P(5,8), is_ordinate_type_x=True", 5.0),
             ("Arc", "definition_point=P(3.5,3.5), first_extension_point=P(5,0), second_extension_point=P(0,5), center_point=P(0,0), arc_start_parameter=0.0, arc_end_parameter=1.5707963267948966", 5.0 * std::f64::consts::FRAC_PI_2),
             ("LargeRadial", "definition_point=P(10,0), chord_point=P(4,0)", 6.0),

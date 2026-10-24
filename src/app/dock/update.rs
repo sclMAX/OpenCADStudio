@@ -57,9 +57,19 @@ impl OpenCADStudio {
                 },
                 None,
             ),
-            DockMsg::FloatResizeGrab(panel, from_left) => {
-                self.dock.raise_float(panel);
-                self.dock_begin(DockDrag::FloatSize { panel, from_left }, None);
+            DockMsg::FloatResizeGrab(panel, edge) => {
+                if let Some(f) = self.dock.float_rect(panel) {
+                    self.dock.raise_float(panel);
+                    self.dock_begin(
+                        DockDrag::FloatSize {
+                            panel,
+                            edge,
+                            start: (f.x, f.y, f.w, f.h),
+                            origin: None,
+                        },
+                        None,
+                    );
+                }
             }
             DockMsg::SplitReset(side, gi) => {
                 self.dock.reset_splits(side, gi);
@@ -86,18 +96,24 @@ impl OpenCADStudio {
             }
             DockMsg::FloatRaise(id) => self.dock.raise_float(id),
             DockMsg::FloatOut(id) => {
-                // Float beside the edge it was docked on, near the top.
+                // Float beside the edge it was docked on, near the top, with
+                // its title bar on that side.
                 let (ww, _) = self.dock_workspace_size();
                 let (w, h) = self.dock_float_size(id);
                 let strip = crate::ui::dock::DOCK_STRIP_W;
-                let x = match self.dock.location(id) {
-                    Some((DockSide::Right, _)) => {
+                let bar = self.dock.location(id).map_or(DockSide::Left, |(s, _)| s);
+                let x = match bar {
+                    DockSide::Right => {
                         ww - strip - self.dock_column_width(DockSide::Right) - w - 60.0
                     }
-                    _ => strip + self.dock_column_width(DockSide::Left) + 40.0,
+                    DockSide::Left => strip + self.dock_column_width(DockSide::Left) + 40.0,
                 };
                 self.dock_drag = None;
-                if self.dock.float(FloatPanel::new(id, x.max(0.0), 40.0, w, h)) {
+                let rect = FloatPanel {
+                    bar,
+                    ..FloatPanel::new(id, x.max(0.0), 40.0, w, h)
+                };
+                if self.dock.float(rect) {
                     self.save_config();
                 }
             }
@@ -248,12 +264,13 @@ impl OpenCADStudio {
                     DropTarget::Join { side, group, index } => {
                         self.dock.join_group(panel, side, group, index)
                     }
-                    DropTarget::Float { x, y } => {
+                    DropTarget::Float { x, y, bar } => {
                         let (w, h) = self.dock_float_size(panel);
                         // A floating panel keeps its docking choice.
                         let docking = self.dock.float_rect(panel).is_none_or(|f| f.docking);
                         self.dock.float(FloatPanel {
                             docking,
+                            bar,
                             ..FloatPanel::new(panel, x, y, w, h)
                         })
                     }
@@ -293,28 +310,36 @@ impl OpenCADStudio {
                 origin,
                 target,
                 grab,
+                bar,
             } => {
                 let origin = origin.unwrap_or(point);
                 let moved = (point.x - origin.x).hypot(point.y - origin.y);
                 let started = target.is_some() || moved >= DOCK_DRAG_THRESHOLD;
                 // Hold a floating panel where it was grabbed; a docked one by
-                // its title bar.
-                let grab = if target.is_none() && started {
+                // its title bar. Its title bar starts on the side it floats
+                // with, or the side it was docked on.
+                let (grab, bar) = if target.is_none() && started {
+                    // The title bar under the pointer stops counting as
+                    // hovered: its buttons must not ride along.
+                    self.dock_title_hover = None;
                     match self.dock.float_rect(panel) {
-                        Some(f) => iced::Vector::new(origin.x - f.x, origin.y - f.y),
-                        None => iced::Vector::new(
-                            (self.dock.width(panel, self.win_size.0) * 0.5).min(120.0),
-                            14.0,
+                        Some(f) => (iced::Vector::new(origin.x - f.x, origin.y - f.y), f.bar),
+                        None => (
+                            iced::Vector::new(
+                                (self.dock.width(panel, self.win_size.0) * 0.5).min(120.0),
+                                14.0,
+                            ),
+                            self.dock.location(panel).map_or(DockSide::Left, |(s, _)| s),
                         ),
                     }
                 } else {
-                    grab
+                    (grab, bar)
                 };
                 let target = if started {
                     // A floating panel that may not dock only floats.
                     let found = match self.dock.float_rect(panel) {
-                        Some(f) if !f.docking => self.dock_float_target(point, grab),
-                        _ => self.dock_drop_target(point, grab),
+                        Some(f) if !f.docking => self.dock_float_target(panel, point, grab, bar),
+                        _ => self.dock_drop_target(panel, point, grab, bar),
                     };
                     // A whole group only moves between group positions: it
                     // cannot join another group or float.
@@ -325,12 +350,23 @@ impl OpenCADStudio {
                 } else {
                     target
                 };
+                // The bar keeps the side it lands on: where a drop preview
+                // shows on an edge, or where the floating frame touched one.
+                let bar = match target {
+                    Some(
+                        DropTarget::Edge { side, .. }
+                        | DropTarget::Join { side, .. }
+                        | DropTarget::Float { bar: side, .. },
+                    ) => side,
+                    None => bar,
+                };
                 self.dock_drag = Some(DockDrag::Move {
                     panel,
                     group,
                     origin: Some(origin),
                     target,
                     grab,
+                    bar,
                 });
             }
             DockDrag::Split {
@@ -361,17 +397,21 @@ impl OpenCADStudio {
                     );
                 }
             }
-            DockDrag::FloatSize { panel, from_left } => {
-                let (Some(last), Some(f)) = (last, self.dock.float_rect(panel)) else {
-                    return;
-                };
-                let dx = point.x - last.x;
-                self.dock.resize_float(
+            DockDrag::FloatSize {
+                panel,
+                edge,
+                start,
+                origin,
+            } => {
+                let origin = origin.unwrap_or(point);
+                self.dock_drag = Some(DockDrag::FloatSize {
                     panel,
-                    if from_left { f.w - dx } else { f.w + dx },
-                    f.h + point.y - last.y,
-                    from_left,
-                );
+                    edge,
+                    start,
+                    origin: Some(origin),
+                });
+                self.dock
+                    .resize_float(panel, edge, start, point.x - origin.x, point.y - origin.y);
             }
             DockDrag::LayerColumn => {
                 let Some(last) = last else { return };
@@ -499,6 +539,7 @@ impl OpenCADStudio {
                         self.sync_ribbon_layers();
                         self.show_layers = true;
                     }
+                    PanelId::QuickCalc => self.quick_calc.show = true,
                 }
             }
             self.dock_reveal(id);
@@ -533,6 +574,7 @@ impl OpenCADStudio {
                 self.show_layers = false;
                 self.ribbon.deactivate_tool_if("LAYERS");
             }
+            PanelId::QuickCalc => self.quick_calc.show = false,
             PanelId::GraphicAttributes => {
                 self.show_graphic_attributes = false;
                 self.ribbon.set_graphic_attributes(false);
@@ -615,6 +657,7 @@ impl OpenCADStudio {
             PanelId::Count => self.count_palette.show,
             PanelId::SheetSetManager => self.sheet_set.show,
             PanelId::Layers => self.show_layers,
+            PanelId::QuickCalc => self.quick_calc.show,
             PanelId::GraphicAttributes => self.show_graphic_attributes,
         }
     }
@@ -747,6 +790,79 @@ impl OpenCADStudio {
             .collect()
     }
 
+    /// Room the docked edges take beside the viewport (left, right): an
+    /// edge's icon strip, plus its shown group and divider unless the edge
+    /// auto-hides (a revealed auto-hide group draws over the drawing).
+    pub(crate) fn dock_edge_insets(&self) -> (f32, f32) {
+        use crate::app::config::DockSide;
+        // Runs after every message: the shown group is looked up once. An
+        // edge that doesn't auto-hide always shows it.
+        let inset = |side: DockSide| match self.dock_shown_group(side) {
+            None => 0.0,
+            Some(_) if self.dock.edge_auto_hide(side) => crate::ui::dock::DOCK_STRIP_W,
+            Some(gi) => {
+                crate::ui::dock::DOCK_STRIP_W
+                    + self.dock_group_width(side, gi)
+                    + crate::ui::dock::DOCK_DIVIDER_W
+            }
+        };
+        (inset(DockSide::Left), inset(DockSide::Right))
+    }
+
+    /// Keep the drawing where it is on screen when the docked edges take
+    /// more or less room beside the viewport (a pallet docks or undocks, an
+    /// edge switches to auto-hide, a group is resized): the viewport's
+    /// centre moves, so the view pans by as much. Runs after every message;
+    /// a window resize doesn't pan.
+    ///
+    /// Either way the viewport's new size is set here too. It is otherwise
+    /// only measured during layout, after `view()` has built the overlays
+    /// from the old size (the ViewCube's controls, the UCS icon, the grid),
+    /// which then trail the drawing by a frame while the size keeps changing.
+    /// Layout still measures it afterwards, so a guess that is off (a ribbon
+    /// that wraps as the window narrows) only lasts that one frame.
+    pub(crate) fn dock_keep_view(&mut self) {
+        let (left, right) = self.dock_edge_insets();
+        let win = self.win_size;
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.is_start {
+            return;
+        }
+        let Some((was_left, was_right, was_win)) = tab.dock_inset.replace((left, right, win))
+        else {
+            return;
+        };
+        let resized = was_win != win;
+        if !resized && was_left == left && was_right == right {
+            return;
+        }
+        let (vw, vh) = tab.scene.selection.borrow().view.vp_size;
+        if vw < 1.0 || vh < 1.0 {
+            return;
+        }
+        let w = vw + (win.0 - was_win.0) - ((left - was_left) + (right - was_right));
+        let h = vh + (win.1 - was_win.1);
+        if w >= 1.0 && h >= 1.0 {
+            tab.scene.selection.borrow_mut().view.vp_size = (w, h);
+            tab.scene.sync_tiles_from_panes(w, h);
+        }
+        if resized {
+            return;
+        }
+        // Tiled model viewports each have their own view; they are left be.
+        let (vw, vh) = tab.scene.selection.borrow().view.vp_size;
+        let tile = tab.scene.active_model_tile_bounds(vw, vh);
+        if tile.width < vw - 0.5 || tile.height < vh - 0.5 {
+            return;
+        }
+        // How far right the viewport's centre moved.
+        let shift = ((left - was_left) - (right - was_right)) * 0.5;
+        tab.scene.camera.borrow_mut().pan_screen(-shift, 0.0, vh);
+        tab.scene.camera_generation += 1;
+    }
+
     /// Size a panel takes when floated: its current floating size, or its
     /// docked width by a comfortable share of the workspace height.
     pub(crate) fn dock_float_size(&self, id: crate::ui::dock::PanelId) -> (f32, f32) {
@@ -754,21 +870,26 @@ impl OpenCADStudio {
             return (f.w, f.h);
         }
         let (_, avail) = self.dock_workspace_size();
-        (
-            self.dock.width(id, self.win_size.0),
-            (avail * 0.6).clamp(crate::ui::dock::FLOAT_MIN_H, 520.0),
-        )
+        let mut h = (avail * 0.6).clamp(crate::ui::dock::FLOAT_MIN_H, 520.0);
+        // QuickCalc opens tall enough for its keypad and section headers.
+        if id == crate::ui::dock::PanelId::QuickCalc {
+            h = h.max(crate::ui::window::quick_calc::float_height().min(avail));
+        }
+        (self.dock.width(id, self.win_size.0), h)
     }
 
     /// Where a dragged pallet lands if released at workspace point `p`:
     /// on an edge's icon strip it joins a group between its icons or starts a
     /// new group; over the shown group's pallets it stacks above / below the
     /// one under the pointer; on an empty edge it starts a group; anywhere
-    /// else it floats, held at `grab` from its top-left corner.
+    /// else it floats, held at `grab` from its top-left corner, its title bar
+    /// on `bar` unless the frame touches an edge (see `dock_float_target`).
     pub(crate) fn dock_drop_target(
         &self,
+        panel: crate::ui::dock::PanelId,
         p: iced::Point,
         grab: iced::Vector,
+        bar: crate::app::config::DockSide,
     ) -> crate::ui::dock::DropTarget {
         use crate::app::config::DockSide;
         use crate::ui::dock::{DropTarget, StripHit, DOCK_EDGE_ZONE, DOCK_STRIP_W};
@@ -831,19 +952,44 @@ impl OpenCADStudio {
                 }
             }
         }
-        self.dock_float_target(p, grab)
+        self.dock_float_target(panel, p, grab, bar)
     }
 
-    /// Floating at workspace point `p`, held at `grab` from its top-left
-    /// corner (kept on the workspace).
+    /// `panel` floating at workspace point `p`, held at `grab` from its
+    /// top-left corner (kept on the workspace). Its title bar stays on `bar`
+    /// and only moves to the side whose edge the frame touches: the docked
+    /// pallets there (unless docking is off for the panel), else the
+    /// workspace edge. A drop preview on an edge moves it too (see
+    /// `dock_drag_move`).
     pub(crate) fn dock_float_target(
         &self,
+        panel: crate::ui::dock::PanelId,
         p: iced::Point,
         grab: iced::Vector,
+        bar: crate::app::config::DockSide,
     ) -> crate::ui::dock::DropTarget {
+        use crate::app::config::DockSide;
         let (ww, wh) = self.dock_workspace_size();
         let x = (p.x - grab.x).clamp(0.0, (ww - 60.0).max(0.0));
         let y = (p.y - grab.y).clamp(0.0, (wh - 30.0).max(0.0));
-        crate::ui::dock::DropTarget::Float { x, y }
+        let (w, _) = self.dock_float_size(panel);
+        let right = x + w + crate::ui::dock::DOCK_FLOAT_BAR_W;
+        let docking = self.dock.float_rect(panel).is_none_or(|f| f.docking);
+        // How far in from the workspace edge `side` the frame has to come to
+        // touch it: the docked pallets there, else the edge itself.
+        let reach = |side: DockSide| -> f32 {
+            match self.dock_shown_group(side) {
+                Some(_) if docking => crate::ui::dock::DOCK_STRIP_W + self.dock_column_width(side),
+                _ => 0.0,
+            }
+        };
+        let touches_left = x <= reach(DockSide::Left);
+        let touches_right = right >= ww - reach(DockSide::Right);
+        let bar = match (touches_left, touches_right) {
+            (true, false) => DockSide::Left,
+            (false, true) => DockSide::Right,
+            _ => bar,
+        };
+        crate::ui::dock::DropTarget::Float { x, y, bar }
     }
 }

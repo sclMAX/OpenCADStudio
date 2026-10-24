@@ -7,6 +7,7 @@
 //! an override over the style default, so editing one of these rows writes here
 //! and the change round-trips to file.
 
+use codec::entities::EntityCommon;
 use codec::types::Color;
 use codec::xdata::{ExtendedData, XDataValue};
 use codec::{CadDocument, EntityType, Handle};
@@ -245,7 +246,12 @@ pub fn set(doc: &mut CadDocument, handle: Handle, code: i16, value: Option<XData
 /// document. Keeping the override on the entity means it is part of the single
 /// committed object and rides the ordinary undo/redo history.
 pub fn set_on_entity(entity: &mut EntityType, code: i16, value: Option<XDataValue>) {
-    let common = entity.common_mut();
+    set_on_common(entity.common_mut(), code, value);
+}
+
+/// [`set_on_entity`] for an entity reached through its own type, such as a
+/// `Dimension` rather than its `EntityType`.
+pub fn set_on_common(common: &mut EntityCommon, code: i16, value: Option<XDataValue>) {
     let mut kept: Vec<(i16, XDataValue)> = pairs(&common.extended_data)
         .into_iter()
         .filter(|(c, _)| *c != code)

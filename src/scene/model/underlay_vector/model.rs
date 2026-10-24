@@ -642,13 +642,14 @@ pub enum DgnGeom {
     /// A dimension (V8, in the XY plane): its type (1 linear, 5 angle,
     /// 11 radius, 12 diameter), its points, the dimension line's offset
     /// from the last point (along `axes[1]`) and its x and y axes; `style`
-    /// is its dimension style's id.
+    /// is its dimension style's id, `look` the settings it carries itself.
     Dimension {
         kind: u8,
         points: Vec<P3>,
         offset: f64,
         axes: [[f64; 2]; 2],
         style: u32,
+        look: DgnDimLook,
     },
     /// A note's leader (V8): its points, the arrow first, and its
     /// dimension style's id.
@@ -682,12 +683,14 @@ impl DgnGeom {
                 offset,
                 axes,
                 style,
+                look,
             } => DgnGeom::Dimension {
                 kind: *kind,
                 points: points.iter().map(|q| p(*q)).collect(),
                 offset: offset * s,
                 axes: *axes,
                 style: *style,
+                look: look.scaled(s),
             },
             DgnGeom::Leader { points, style } => DgnGeom::Leader {
                 points: points.iter().map(|q| p(*q)).collect(),
@@ -842,6 +845,69 @@ impl DgnCollector {
     }
 }
 
+/// The settings a V8 dimension carries itself (lengths in master units):
+/// its text font (number, kind), text height, extension line offset and
+/// extension, text gap, text margin and terminator width, and whether its
+/// text sits off the dimension line.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DgnDimLook {
+    pub font: (u8, u8),
+    pub text_height: f64,
+    pub ext_offset: f64,
+    pub ext_extension: f64,
+    pub gap: f64,
+    pub margin: f64,
+    pub arrow: f64,
+    pub text_outside: bool,
+}
+
+impl DgnDimLook {
+    pub fn scaled(&self, s: f64) -> DgnDimLook {
+        DgnDimLook {
+            text_height: self.text_height * s,
+            ext_offset: self.ext_offset * s,
+            ext_extension: self.ext_extension * s,
+            gap: self.gap * s,
+            margin: self.margin * s,
+            arrow: self.arrow * s,
+            ..*self
+        }
+    }
+}
+
+/// A V8 dimension style (lengths in master units): its element id, name
+/// and text style id; text height, terminator width, extension line
+/// offset and extension and text gap (the last four as text heights);
+/// stack offset and centre mark size; the accuracy byte (0x80 and a bit
+/// per decimal place, else a fraction); whether trailing zeros show, the
+/// text sits in the line, reads horizontally and draws a line between
+/// the extension lines; its scale; and whether its units are two (master
+/// and sub).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DgnDimStyle {
+    pub id: u32,
+    pub name: String,
+    pub text_style: u32,
+    /// Its text style's font (number, kind).
+    pub font: (u8, u8),
+    pub text_height: f64,
+    pub arrow: f64,
+    pub ext_offset: f64,
+    pub ext_extension: f64,
+    pub gap: f64,
+    pub stack_offset: f64,
+    pub center: f64,
+    pub accuracy: u8,
+    /// Decimal places of an angle.
+    pub angle_places: u8,
+    pub trailing_zeros: bool,
+    pub inline_text: bool,
+    pub horizontal_text: bool,
+    pub line_inside: bool,
+    pub scale: f64,
+    pub two_units: bool,
+}
+
 /// What DGNIMPORT reads from a model: its elements and the shared cells
 /// they place (in master units, the global origin at 0,0), the levels by
 /// number or id (name, colour) and the sub units per master unit.
@@ -862,8 +928,11 @@ pub struct DgnImport {
     pub references: Vec<DgnReference>,
     /// The text style table (V8): each style's id, name and font file.
     pub text_styles: Vec<(u32, String, String)>,
-    /// The dimension style table (V8): each style's id and name.
-    pub dim_styles: Vec<(u32, String)>,
+    /// The dimension style table (V8).
+    pub dim_styles: Vec<DgnDimStyle>,
+    /// The font table (V8): number, kind (2 SHX, 4 TrueType), name and
+    /// the font file it imports with.
+    pub fonts: Vec<(u8, u8, String, String)>,
     /// A 3D V7 file.
     pub three_d: bool,
     /// The file's first view hides construction elements (V7): they come in

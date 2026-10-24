@@ -209,11 +209,14 @@ fn color_selector_with_indicator<'a>(
     // handles viewport placement, Escape, and outside-click dismissal.
     // By omitting `.width(...)`, DropDown defaults to the exact pixel width
     // of the underlay (`head`), matching the value column width and aligning flush.
-    iced_aw::DropDown::new(head, popup, true)
-        .alignment(iced_aw::drop_down::Alignment::Bottom)
-        .offset(2.0)
-        .on_dismiss(on_dismiss)
-        .into()
+    // Inside a scrollable (Layer Manager rows) the list needs the real
+    // visible area to flip above a field near the bottom edge.
+    crate::ui::drop_down_fit::drop_down_fit(
+        iced_aw::DropDown::new(head, popup, true)
+            .alignment(iced_aw::drop_down::Alignment::Bottom)
+            .offset(2.0)
+            .on_dismiss(on_dismiss),
+    )
 }
 
 pub(crate) fn popup_panel_style(theme: &Theme) -> container::Style {

@@ -402,6 +402,9 @@ pub struct TdsImport {
     pub materials: Vec<String>,
     pub views: Vec<TdsCameraView>,
     pub messages: Vec<String>,
+    /// The texture maps not found, as (map file, material), in the order
+    /// their materials were converted.
+    pub missing_maps: Vec<(String, String)>,
 }
 
 /// Polyface meshes of `faces` of `mesh`: its vertices in file order, or
@@ -488,6 +491,7 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
         materials: Vec::new(),
         views: Vec::new(),
         messages: Vec::new(),
+        missing_maps: Vec::new(),
     };
     let chosen = |name: &str| options.selected.iter().any(|s| s == name);
     // The objects are taken in the order the window lists them, by name.
@@ -549,6 +553,7 @@ pub fn convert(scene: &TdsScene, options: &TdsOptions) -> TdsImport {
                                     out.messages.push(format!(
                                         "Cannot find texture map file \"{file}\"."
                                     ));
+                                    out.missing_maps.push((file.clone(), m.clone()));
                                 }
                             }
                             out.materials.push(m.clone());

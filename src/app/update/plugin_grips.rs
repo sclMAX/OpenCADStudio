@@ -8,8 +8,11 @@
 //! out-of-process phase is issued WITHOUT waiting and collected at pump
 //! ticks, nested COMMAND frames are refused in the delivery context (they
 //! would need the message loop the blocked UI thread cannot pump), and a
-//! settle that outlives its deadline is abandoned — the plugin's connection
-//! is torn down, the drag ends as a cancel, an error line names the plugin.
+//! settle that outlives its deadline is struck: the first strike cancels
+//! the drag while keeping the plugin's connection, grips and session (a
+//! starved pump must not amputate a healthy plugin); the third missed
+//! delivery inside the strike window tears the connection down, ends the
+//! drag as a cancel, names the plugin and queues a grip re-declaration.
 //!
 //! v11.2 live geometry: a move/begin answer may carry `live_entities` —
 //! the plugin-directed visual phase (the plugin computes exactly what the
@@ -41,9 +44,16 @@ const PUMP_CADENCE: Duration = Duration::from_millis(10);
 /// land promptly after the callback returns.
 const SETTLING_CADENCE: Duration = Duration::from_millis(2);
 /// The watchdog floor for the settle phase (matches the transport's per-kind
-/// floor): beyond this the delivery is abandoned and the connection torn
-/// down rather than freezing the UI.
-const SETTLE_WATCHDOG: Duration = Duration::from_secs(10);
+/// floor): beyond this the delivery is struck — see
+/// [`strike_plugin_grip_settle`].
+pub(crate) const SETTLE_WATCHDOG: Duration = Duration::from_secs(10);
+/// The strike window: three missed deliveries inside it mean the plugin is
+/// genuinely wedged under a live pump, and the connection is torn down.
+/// A starved UI thread or one slow settle never accumulates that far
+/// because one strike only cancels the drag.
+const SETTLE_STRIKE_WINDOW: Duration = Duration::from_secs(600);
+/// Missed deliveries allowed before the teardown applies.
+const SETTLE_STRIKES_UNTIL_TEARDOWN: usize = 3;
 
 impl OpenCADStudio {
     /// Custom grips of tab `i` that are visible in the current view, with
@@ -253,11 +263,14 @@ impl OpenCADStudio {
         }
 
         // 4. The settle watchdog: a delivery that outlives its deadline is
-        //    abandoned — the connection is torn down, the drag ends as a
-        //    cancel, an error line names the plugin. The UI loop never waits.
+        //    struck. The first strike ends the drag as a cancel and keeps the
+        //    plugin's connection, grips and session alive (a starved pump
+        //    must not amputate a healthy plugin); the third missed delivery
+        //    inside the window tears the connection down. The UI loop never
+        //    waits.
         let now = std::time::Instant::now();
         if self.plugin_grip_deliveries.settle_timed_out(now) {
-            self.abandon_plugin_grip_settle(tab);
+            self.strike_plugin_grip_settle(tab);
             return Task::none();
         }
 
@@ -296,8 +309,10 @@ impl OpenCADStudio {
         );
         if let Some(event) = event {
             self.issue_phase(tab, ocs_plugin_api::host::CustomGripPhase::Settle, event);
-            self.plugin_grip_deliveries
-                .begin_settle_watch(SETTLE_WATCHDOG, std::time::Instant::now());
+            self.plugin_grip_deliveries.begin_settle_watch(
+                self.plugin_grip_settle_watchdog,
+                std::time::Instant::now(),
+            );
         } else {
             // The owner vanished mid-drag: end as a cancel.
             let _ = self.cancel_plugin_grip_drag();
@@ -571,28 +586,68 @@ impl OpenCADStudio {
 
     /// The settle landed: close the plugin-opened pending history (exactly
     /// one plugin-labeled undo step when it wrote, zero when it did not),
-    /// clear the drag, refresh.
+    /// clear the drag, refresh. A landed settle is recovery: the plugin's
+    /// strike count resets, so one missed deadline alone never accumulates
+    /// toward the teardown.
     fn finalize_plugin_grip_settle(&mut self, tab: usize) {
+        if let Some(active) = self.tabs[tab].active_plugin_grip.as_ref() {
+            self.plugin_grip_settle_strikes.remove(&active.plugin);
+        }
         self.finish_pending_history(tab);
         self.end_plugin_grip_drag(tab);
         self.refresh_properties();
     }
 
-    /// The watchdog fired: the plugin never answered its settle. Tear the
-    /// connection down, restore the visual phase, close any partially-open
-    /// scope (no dangling history), end the drag as a cancel, and name the
-    /// plugin in the error queue.
-    fn abandon_plugin_grip_settle(&mut self, tab: usize) {
+    /// The watchdog fired: the plugin never answered its settle within the
+    /// settle floor. Strike semantics keep a healthy plugin healthy: the
+    /// first strike ends the drag as a cancel (the live-geometry restore and
+    /// the pending history closed — no dangling undo scope) while the
+    /// plugin's connection, declared grips and session all stay; only the
+    /// third missed delivery inside the strike window tears the connection
+    /// down, because a plugin that misses three deadlines under a live pump
+    /// is genuinely wedged. A struck delivery's late answer is drained
+    /// gracefully by the pump's in-order poll: the nested requests it
+    /// carries (the plugin's own settle transaction) are served by the host
+    /// session exactly as they arrive, and the answer can never finalize a
+    /// drag — its request id is no longer tracked. After a teardown the
+    /// plugin is queued for a grip re-declaration the reap tick re-dispatches
+    /// once it is visible again. Every strike names the plugin, the budget
+    /// and the strike count in the error queue.
+    fn strike_plugin_grip_settle(&mut self, tab: usize) {
         let plugin = self.tabs[tab]
             .active_plugin_grip
             .as_ref()
             .map(|active| active.plugin.clone())
             .unwrap_or_default();
-        grip_points::abandon_grip_delivery(&plugin);
-        crate::plugin::push_guard_error(format!(
-            "custom-grip settle delivery to {plugin:?} exceeded its deadline; the delivery was \
-             abandoned, the connection torn down and the drag cancelled — the UI stays alive"
-        ));
+        let now = std::time::Instant::now();
+        let budget = self.plugin_grip_settle_watchdog;
+        let strikes = {
+            let ledger = self
+                .plugin_grip_settle_strikes
+                .entry(plugin.clone())
+                .or_default();
+            ledger.retain(|at| now.saturating_duration_since(*at) < SETTLE_STRIKE_WINDOW);
+            ledger.push(now);
+            ledger.len()
+        };
+        if strikes >= SETTLE_STRIKES_UNTIL_TEARDOWN {
+            grip_points::abandon_grip_delivery(&plugin);
+            crate::plugin::push_guard_error(format!(
+                "custom-grip settle delivery to {plugin:?} exceeded its {budget:?} deadline \
+                 (strike {strikes}/{}): the delivery was abandoned, the connection torn down \
+                 and the drag cancelled — a live pump is starved or the plugin is wedged",
+                SETTLE_STRIKES_UNTIL_TEARDOWN
+            ));
+            self.plugin_grip_settle_strikes.remove(&plugin);
+            self.pending_plugin_grips_rearm.insert(plugin);
+        } else {
+            crate::plugin::push_guard_error(format!(
+                "custom-grip settle delivery to {plugin:?} exceeded its {budget:?} deadline \
+                 (strike {strikes}/{}): the connection is kept and the drag cancelled — a live \
+                 pump is starved or the plugin is wedged",
+                SETTLE_STRIKES_UNTIL_TEARDOWN
+            ));
+        }
         self.restore_plugin_grip_live_geometry(tab);
         self.finish_pending_history(tab);
         self.end_plugin_grip_drag(tab);
@@ -652,6 +707,39 @@ impl OpenCADStudio {
         if dead_hover {
             self.plugin_grip_hover = None;
         }
+        // The visibility predicate borrows the disabled set; a copy lets the
+        // re-arm take `&mut self` after the borrow-heavy reap work above.
+        let disabled = self.disabled_plugins.clone();
+        let visible = grip_points::visibility(&disabled);
+        self.rearm_struck_plugin_grips(&visible);
+    }
+
+    /// The strike-teardown re-arm: a plugin whose connection the watchdog
+    /// tore down keeps its grip DECLARATIONS only as long as it is visible
+    /// (loaded, alive, not disabled). While a queued re-arm plugin is not
+    /// visible it stays queued and drops out when it is gone for good; once
+    /// it is visible again, the `SelectionChanged` fingerprint dedup is
+    /// cleared and the broadcast re-issues even for an unchanged selection,
+    /// so the plugin re-declares its grips without human intervention
+    /// (a mouse-only session never issues a dispatch of its own).
+    fn rearm_struck_plugin_grips(&mut self, visible: &impl Fn(&str) -> bool) {
+        if self.pending_plugin_grips_rearm.is_empty() {
+            return;
+        }
+        let back: Vec<String> = self
+            .pending_plugin_grips_rearm
+            .iter()
+            .filter(|plugin| visible(plugin))
+            .cloned()
+            .collect();
+        if back.is_empty() {
+            return;
+        }
+        for plugin in back {
+            self.pending_plugin_grips_rearm.remove(&plugin);
+        }
+        self.last_plugin_selection = None;
+        self.notify_plugins_selection_changed();
     }
 }
 

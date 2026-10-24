@@ -4,6 +4,7 @@
 //! a block dragged onto the drawing goes in where it is dropped.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::app::settings::{BlockInsertOptions, PaletteBlockRef};
 use crate::app::Message;
@@ -24,6 +25,35 @@ const TOOL_H: f32 = 22.0;
 /// Fixed single-line height of a card's label so every cell in a row
 /// shares the same height.
 const LABEL_LINE_H: f32 = 16.0;
+/// Padding inside a card of the icon views.
+const GRID_CARD_PAD: f32 = 6.0;
+/// Space between a card's thumbnail and its label.
+const GRID_LABEL_GAP: f32 = 4.0;
+/// Space between the list's rows.
+const LIST_SPACING: f32 = 4.0;
+/// Height of a row's content in Small Icons, Details and List (and of the
+/// Details header): the 16 px thumbnail, with the one-line name centred.
+const LIST_ROW_H: f32 = 16.0;
+/// Padding inside a card of Small Icons, Details and List.
+const LIST_CARD_PAD: f32 = 3.0;
+/// Rows built beyond each end of the visible ones, so a fast scroll doesn't
+/// show an empty row before the list catches up.
+const SPARE_ROWS: usize = 2;
+/// How tall the list is taken to be for its previews before it reports its
+/// viewport (it does on the first frame it is drawn).
+const FIRST_SCREEN_H: f32 = 1200.0;
+/// Cards in a row of the ribbon's block gallery.
+const GALLERY_PER_ROW: usize = 4;
+/// Height of a thumbnail in the ribbon's block gallery.
+const GALLERY_THUMB_H: f32 = 48.0;
+/// Padding inside a gallery card.
+const GALLERY_CARD_PAD: f32 = 3.0;
+/// Space between a gallery card's thumbnail and its label.
+const GALLERY_LABEL_GAP: f32 = 2.0;
+/// Space between the gallery's rows and cards.
+const GALLERY_SPACING: f32 = 4.0;
+/// The gallery's block list, so its scroll position can be reset.
+const GALLERY_SCROLL_ID: &str = "block_gallery_scroll";
 
 /// The palette's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,6 +123,19 @@ impl ViewMode {
             ViewMode::List => crate::t!("List"),
         }
         .into_owned()
+    }
+
+    /// How the list is laid out: cards per row, the height of a row, and
+    /// the height above the first row (the Details header and its gap).
+    /// Every row is exactly this tall, so only the rows in view are built.
+    fn rows(self) -> (usize, f32, f32) {
+        let list_row_h = LIST_ROW_H + 2.0 * LIST_CARD_PAD;
+        match (self.grid(), self) {
+            (Some((per_row, size)), _) => (per_row, grid_row_h(size), 0.0),
+            (None, ViewMode::Small) => (2, list_row_h, 0.0),
+            (None, ViewMode::Details) => (1, list_row_h, LIST_ROW_H + LIST_SPACING),
+            (None, _) => (1, list_row_h, 0.0),
+        }
     }
 
     /// Cards per row and thumbnail height for the icon views.
@@ -182,14 +225,101 @@ pub enum BlockPaletteMsg {
     Press(Item),
     Release(Item),
     Menu(Item, MenuAction),
+    /// The list scrolled to `offset` (from its top) in a viewport `height`
+    /// tall.
+    Scrolled {
+        offset: f32,
+        height: f32,
+    },
+    /// The ribbon gallery's list scrolled to this offset from its top.
+    GalleryScrolled(f32),
+    /// Thumbnails read in the background, by drawing path (`None` when the
+    /// drawing has none).
+    Thumbnails(Vec<(PathBuf, Option<image::Handle>)>),
+}
+
+/// What [`BlockPalette::shown_previews_changed`] compares.
+struct PreviewsShownFor {
+    scroll: (f32, f32),
+    view: ViewMode,
+    tab: Tab,
+    search: String,
+    recent: Vec<PaletteBlockRef>,
+    favorites: Vec<PaletteBlockRef>,
+}
+
+/// Which block definitions a change touched, as far as it is known.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub enum ChangeHint {
+    /// Nothing is known: a refresh rebuilds every preview.
+    #[default]
+    Unknown,
+    /// Only these blocks (upper-cased) of the drawing with this tab id
+    /// changed, and the palette was up to date before.
+    Blocks(u64, std::collections::HashSet<String>),
+    /// A change was made while the palette was already out of date, so
+    /// nothing else is known after all.
+    Spoiled,
 }
 
 /// One block of the current drawing with its cached preview.
 pub struct BlockEntry {
     pub name: String,
-    pub wires: Vec<WireModel>,
+    pub preview: Rc<BlockPreview>,
     pub annotative: bool,
     pub dynamic: bool,
+}
+
+/// A block's preview wires, with its thumbnail's tessellated geometry kept
+/// across frames: it is only drawn again when the thumbnail's size changes,
+/// and a refresh of the palette makes new previews. Shared between the
+/// Current Drawing list, the previews kept for Recent / Favorites and the
+/// ribbon gallery.
+///
+/// The gallery draws its smaller thumbnail through a cache of its own: a
+/// cache holds one size, so sharing it would draw both thumbnails again on
+/// every frame, and both would show whichever was uploaded last.
+///
+/// The wires are worked out only once the palette or the ribbon gallery is
+/// about to show the block ([`BlockPalette::shown_preview_names`],
+/// [`BlockPalette::gallery_shown`]); until then it draws as an empty
+/// thumbnail.
+pub struct BlockPreview {
+    wires: std::cell::OnceCell<Vec<WireModel>>,
+    cache: canvas::Cache,
+    gallery_cache: canvas::Cache,
+}
+
+impl BlockPreview {
+    /// A preview whose wires are not worked out yet.
+    pub fn pending() -> Self {
+        Self {
+            wires: std::cell::OnceCell::new(),
+            cache: canvas::Cache::new(),
+            gallery_cache: canvas::Cache::new(),
+        }
+    }
+
+    /// The wires, once worked out.
+    pub fn wires(&self) -> Option<&[WireModel]> {
+        self.wires.get().map(Vec::as_slice)
+    }
+
+    /// Set the wires of a pending preview (a built one keeps its own).
+    pub fn fill(&self, wires: Vec<WireModel>) {
+        if self.wires.set(wires).is_ok() {
+            // Whatever was drawn while pending is not the block.
+            self.cache.clear();
+            self.gallery_cache.clear();
+        }
+    }
+
+    /// Set the wires of a pending preview, working them out only then.
+    pub fn fill_with(&self, wires: impl FnOnce() -> Vec<WireModel>) {
+        if self.wires.get().is_none() {
+            self.fill(wires());
+        }
+    }
 }
 
 /// A library folder entry.
@@ -205,8 +335,12 @@ pub struct BlockPalette {
     pub tab: Tab,
     pub search: String,
     pub view: ViewMode,
-    /// Current drawing blocks, rebuilt on refresh.
+    /// Current drawing blocks, rebuilt on refresh (set with
+    /// [`BlockPalette::set_blocks`], which keeps `block_index` in step).
     pub blocks: Vec<BlockEntry>,
+    /// Position in `blocks` of each upper-cased block name (the first, when
+    /// two differ only in case), so a lookup doesn't scan the list.
+    block_index: std::collections::HashMap<String, usize>,
     /// Block name currently being placed, for the highlight.
     pub placing: Option<String>,
     pub cached_names: Vec<String>,
@@ -227,12 +361,31 @@ pub struct BlockPalette {
     pub options_collapsed: bool,
     /// The item a press started on (a drag until released on it).
     pub pressed: Option<Item>,
+    /// Where the list is scrolled to and how tall its viewport is (0 until
+    /// the list first reports it), so the icon views only build the rows
+    /// that can be seen.
+    pub scroll: (f32, f32),
+    /// What the message being handled is known to have changed, so the
+    /// refresh after it can keep the previews of the other blocks. Cleared
+    /// once the message is handled.
+    pub change_hint: ChangeHint,
+    /// Drawings whose thumbnails are wanted but not asked for yet; they are
+    /// read in the background once the message is handled.
+    pub thumb_requests: Vec<PathBuf>,
+    /// What the shown previews were last worked out for; `None` once the
+    /// blocks are replaced.
+    previews_shown_for: Option<PreviewsShownFor>,
+    /// How far the ribbon gallery's list is scrolled (0 when it opens).
+    pub gallery_offset: f32,
+    /// The gallery offset its previews were last worked out for; `None`
+    /// once the blocks are replaced or the gallery opens again.
+    gallery_previews_for: Option<f32>,
     /// Blocks brought in from drawings this session (upper name → file),
     /// so the Recent list remembers the drawing.
     pub file_sources: std::collections::HashMap<String, String>,
     /// Previews of blocks seen this session, keyed `source|NAME`, for
     /// recent / favorite blocks of other drawings.
-    pub ref_wires: std::collections::HashMap<String, Vec<WireModel>>,
+    pub ref_wires: std::collections::HashMap<String, Rc<BlockPreview>>,
 }
 
 impl BlockPalette {
@@ -285,10 +438,112 @@ impl BlockPalette {
         }
     }
 
-    fn current_entry(&self, name: &str) -> Option<&BlockEntry> {
-        self.blocks
+    /// The blocks whose previews the list shows with the current scroll
+    /// position: the rows in view (or the first screenful, before the list
+    /// reported its viewport), none in List, which has no thumbnails.
+    /// Blocks of the drawing and recent / favorite blocks that may be in it.
+    pub fn shown_preview_names(&self) -> Vec<String> {
+        if self.view == ViewMode::List {
+            return Vec::new();
+        }
+        let items = self.items();
+        let (per_row, row_h, lead) = self.view.rows();
+        let (offset, height) = self.scroll;
+        let height = if height > 0.0 { height } else { FIRST_SCREEN_H };
+        let rows = items.len().div_ceil(per_row);
+        let range = visible_rows(rows, row_h + LIST_SPACING, offset - lead, height);
+        let end = (range.end * per_row).min(items.len());
+        let shown = &items[(range.start * per_row).min(end)..end];
+        shown
             .iter()
-            .find(|b| b.name.eq_ignore_ascii_case(name))
+            .filter_map(|item| match item {
+                Item::Current(name) => Some(name.clone()),
+                Item::Ref(r) if !r.drawing => Some(r.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether what decides the shown previews (scroll position, view, tab,
+    /// filter, Recent / Favorites, the blocks themselves) changed since the
+    /// last call, which remembers it. Checked after every message, so it
+    /// copies nothing while nothing changed.
+    pub fn shown_previews_changed(&mut self) -> bool {
+        let same = self.previews_shown_for.as_ref().is_some_and(|last| {
+            last.scroll == self.scroll
+                && last.view == self.view
+                && last.tab == self.tab
+                && last.search == self.search
+                && last.recent == self.recent
+                && last.favorites == self.favorites
+        });
+        if !same {
+            self.previews_shown_for = Some(PreviewsShownFor {
+                scroll: self.scroll,
+                view: self.view,
+                tab: self.tab,
+                search: self.search.clone(),
+                recent: self.recent.clone(),
+                favorites: self.favorites.clone(),
+            });
+        }
+        !same
+    }
+
+    /// Replace the Current Drawing blocks.
+    pub fn set_blocks(&mut self, blocks: Vec<BlockEntry>) {
+        let mut index = std::collections::HashMap::with_capacity(blocks.len());
+        for (i, b) in blocks.iter().enumerate() {
+            index.entry(b.name.to_ascii_uppercase()).or_insert(i);
+        }
+        self.blocks = blocks;
+        self.block_index = index;
+        // New previews, all pending.
+        self.previews_shown_for = None;
+        self.gallery_previews_for = None;
+    }
+
+    /// The ribbon gallery opens: at the top of its list, with its previews
+    /// still to be worked out.
+    pub fn open_gallery(&mut self) -> iced::Task<Message> {
+        self.gallery_offset = 0.0;
+        self.gallery_previews_for = None;
+        iced::widget::operation::snap_to(
+            iced::widget::Id::new(GALLERY_SCROLL_ID),
+            scrollable::RelativeOffset::START,
+        )
+    }
+
+    /// The rows of the ribbon gallery in view, plus spare ones, and their
+    /// blocks: what it builds and whose previews it shows. Its height is set
+    /// by the number of blocks, so it is known before it is drawn.
+    pub fn gallery_shown(&self) -> (std::ops::Range<usize>, &[BlockEntry]) {
+        let n = self.blocks.len();
+        let rows = visible_rows(
+            n.div_ceil(GALLERY_PER_ROW),
+            gallery_pitch(),
+            self.gallery_offset,
+            gallery_list_h(n),
+        );
+        let end = (rows.end * GALLERY_PER_ROW).min(n);
+        let start = (rows.start * GALLERY_PER_ROW).min(end);
+        (rows, &self.blocks[start..end])
+    }
+
+    /// Whether the gallery's scroll position or blocks changed since the
+    /// last call, which remembers it.
+    pub fn gallery_previews_changed(&mut self) -> bool {
+        let changed = self.gallery_previews_for != Some(self.gallery_offset);
+        self.gallery_previews_for = Some(self.gallery_offset);
+        changed
+    }
+
+    /// The Current Drawing block named `name`, ignoring ASCII case.
+    pub(crate) fn current_entry(&self, name: &str) -> Option<&BlockEntry> {
+        self.block_index
+            .get(&name.to_ascii_uppercase())
+            .and_then(|&i| self.blocks.get(i))
+            .filter(|b| b.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -303,9 +558,31 @@ fn display_name(path: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// Canvas program that draws a block's wires fit-to-box inside its bounds.
+/// Canvas program that draws a block's wires fit-to-box inside its bounds,
+/// through `cache` when the preview has one.
 struct BlockPreviewCanvas<'a> {
     wires: &'a [WireModel],
+    cache: Option<&'a canvas::Cache>,
+}
+
+impl<'a> BlockPreviewCanvas<'a> {
+    /// The canvas of a palette preview, drawn through its cache (empty
+    /// while the preview is pending).
+    fn cached(preview: &'a BlockPreview) -> Self {
+        Self {
+            wires: preview.wires().unwrap_or_default(),
+            cache: Some(&preview.cache),
+        }
+    }
+
+    /// The canvas of a ribbon gallery preview, drawn through the gallery's
+    /// own cache.
+    fn gallery(preview: &'a BlockPreview) -> Self {
+        Self {
+            wires: preview.wires().unwrap_or_default(),
+            cache: Some(&preview.gallery_cache),
+        }
+    }
 }
 
 impl<'a> Program<Message> for BlockPreviewCanvas<'a> {
@@ -319,107 +596,119 @@ impl<'a> Program<Message> for BlockPreviewCanvas<'a> {
         bounds: iced::Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let pad = 4.0;
-        let inner_w = (bounds.width - 2.0 * pad).max(1.0);
-        let inner_h = (bounds.height - 2.0 * pad).max(1.0);
-        let (mut minx, mut miny, mut maxx, mut maxy) = (
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
+        let size = bounds.size();
+        match self.cache {
+            Some(cache) => vec![cache.draw(renderer, size, |frame| {
+                draw_preview(frame, self.wires, size)
+            })],
+            None => {
+                let mut frame = Frame::new(renderer, size);
+                draw_preview(&mut frame, self.wires, size);
+                vec![frame.into_geometry()]
+            }
+        }
+    }
+}
+
+/// Draw `wires` fit-to-box into `frame`, `bounds` in size.
+fn draw_preview(frame: &mut Frame, wires: &[WireModel], bounds: iced::Size) {
+    let pad = 4.0;
+    let inner_w = (bounds.width - 2.0 * pad).max(1.0);
+    let inner_h = (bounds.height - 2.0 * pad).max(1.0);
+    let (mut minx, mut miny, mut maxx, mut maxy) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    let mut any = false;
+    for w in wires {
+        for p in &w.points {
+            if p[0].is_finite() && p[1].is_finite() {
+                minx = minx.min(p[0]);
+                miny = miny.min(p[1]);
+                maxx = maxx.max(p[0]);
+                maxy = maxy.max(p[1]);
+                any = true;
+            }
+        }
+    }
+    if !any {
+        let rect = Path::rectangle(
+            iced::Point::new(pad, pad),
+            iced::Size::new(inner_w, inner_h),
         );
-        let mut any = false;
-        for w in self.wires {
-            for p in &w.points {
-                if p[0].is_finite() && p[1].is_finite() {
-                    minx = minx.min(p[0]);
-                    miny = miny.min(p[1]);
-                    maxx = maxx.max(p[0]);
-                    maxy = maxy.max(p[1]);
-                    any = true;
-                }
-            }
-        }
-        if !any {
-            let rect = Path::rectangle(
-                iced::Point::new(pad, pad),
-                iced::Size::new(inner_w, inner_h),
-            );
-            frame.fill(
-                &rect,
-                Color {
-                    r: 0.10,
-                    g: 0.10,
-                    b: 0.10,
-                    a: 1.0,
-                },
-            );
-            return vec![frame.into_geometry()];
-        }
-        let span_x = (maxx - minx).max(1e-6);
-        let span_y = (maxy - miny).max(1e-6);
-        let scale = (inner_w / span_x).min(inner_h / span_y);
-        let ox = (bounds.width - span_x * scale) * 0.5;
-        let oy = (bounds.height - span_y * scale) * 0.5;
-        let map =
-            |x: f32, y: f32| iced::Point::new(ox + (x - minx) * scale, oy + (maxy - y) * scale);
-        for w in self.wires {
-            let col = Color {
-                r: w.color[0],
-                g: w.color[1],
-                b: w.color[2],
-                a: 0.55,
-            };
-            for tri in w.fill_tris.chunks(3) {
-                if tri.len() == 3 {
-                    let path = Path::new(|p| {
-                        p.move_to(map(tri[0][0], tri[0][1]));
-                        p.line_to(map(tri[1][0], tri[1][1]));
-                        p.line_to(map(tri[2][0], tri[2][1]));
-                        p.close();
-                    });
-                    frame.fill(&path, col);
-                }
-            }
-        }
-        for w in self.wires {
-            let col = Color {
-                r: w.color[0],
-                g: w.color[1],
-                b: w.color[2],
+        frame.fill(
+            &rect,
+            Color {
+                r: 0.10,
+                g: 0.10,
+                b: 0.10,
                 a: 1.0,
-            };
-            let width = if w.line_weight_px > 1.5 { 2.0 } else { 1.0 };
-            let mut run: Vec<iced::Point> = Vec::new();
-            let flush = |frame: &mut Frame, run: &mut Vec<iced::Point>| {
-                if run.len() >= 2 {
-                    let path = Path::new(|p| {
-                        p.move_to(run[0]);
-                        for &pt in &run[1..] {
-                            p.line_to(pt);
-                        }
-                    });
-                    frame.stroke(&path, Stroke::default().with_color(col).with_width(width));
-                }
-                run.clear();
-            };
-            for p in &w.points {
-                if p[0].is_finite() && p[1].is_finite() {
-                    run.push(map(p[0], p[1]));
-                } else {
-                    flush(&mut frame, &mut run);
-                }
+            },
+        );
+        return;
+    }
+    let span_x = (maxx - minx).max(1e-6);
+    let span_y = (maxy - miny).max(1e-6);
+    let scale = (inner_w / span_x).min(inner_h / span_y);
+    let ox = (bounds.width - span_x * scale) * 0.5;
+    let oy = (bounds.height - span_y * scale) * 0.5;
+    let map = |x: f32, y: f32| iced::Point::new(ox + (x - minx) * scale, oy + (maxy - y) * scale);
+    for w in wires {
+        let col = Color {
+            r: w.color[0],
+            g: w.color[1],
+            b: w.color[2],
+            a: 0.55,
+        };
+        for tri in w.fill_tris.chunks(3) {
+            if tri.len() == 3 {
+                let path = Path::new(|p| {
+                    p.move_to(map(tri[0][0], tri[0][1]));
+                    p.line_to(map(tri[1][0], tri[1][1]));
+                    p.line_to(map(tri[2][0], tri[2][1]));
+                    p.close();
+                });
+                frame.fill(&path, col);
             }
-            flush(&mut frame, &mut run);
         }
-        vec![frame.into_geometry()]
+    }
+    for w in wires {
+        let col = Color {
+            r: w.color[0],
+            g: w.color[1],
+            b: w.color[2],
+            a: 1.0,
+        };
+        let width = if w.line_weight_px > 1.5 { 2.0 } else { 1.0 };
+        let mut run: Vec<iced::Point> = Vec::new();
+        let flush = |frame: &mut Frame, run: &mut Vec<iced::Point>| {
+            if run.len() >= 2 {
+                let path = Path::new(|p| {
+                    p.move_to(run[0]);
+                    for &pt in &run[1..] {
+                        p.line_to(pt);
+                    }
+                });
+                frame.stroke(&path, Stroke::default().with_color(col).with_width(width));
+            }
+            run.clear();
+        };
+        for p in &w.points {
+            if p[0].is_finite() && p[1].is_finite() {
+                run.push(map(p[0], p[1]));
+            } else {
+                flush(frame, &mut run);
+            }
+        }
+        flush(frame, &mut run);
     }
 }
 
 /// A block preview (the palette's canvas) for other dialogs.
 pub(crate) fn preview_canvas<'a>(wires: &'a [WireModel], height: f32) -> Element<'a, Message> {
-    canvas(BlockPreviewCanvas { wires })
+    canvas(BlockPreviewCanvas { wires, cache: None })
         .width(Fill)
         .height(Length::Fixed(height))
         .into()
@@ -441,11 +730,11 @@ fn thumb<'a>(palette: &'a BlockPalette, item: &Item, size: f32) -> Element<'a, M
             })
             .into()
     };
-    let wires = |name: &str| palette.current_entry(name).map(|e| &e.wires[..]);
+    let preview = |name: &str| palette.current_entry(name).map(|e| &*e.preview);
     let file_thumb = |path: &str| palette.file_thumbs.get(path).cloned().flatten();
     match item {
-        Item::Current(name) => match wires(name) {
-            Some(w) => canvas(BlockPreviewCanvas { wires: w })
+        Item::Current(name) => match preview(name) {
+            Some(p) => canvas(BlockPreviewCanvas::cached(p))
                 .width(Fill)
                 .height(Length::Fixed(size))
                 .into(),
@@ -457,8 +746,13 @@ fn thumb<'a>(palette: &'a BlockPalette, item: &Item, size: f32) -> Element<'a, M
                     palette
                         .ref_wires
                         .get(&format!("{}|{}", r.source, r.name.to_ascii_uppercase()));
-                if let Some(w) = seen.map(|w| &w[..]).or_else(|| wires(&r.name)) {
-                    return canvas(BlockPreviewCanvas { wires: w })
+                // A kept preview not built yet falls back to this drawing's.
+                if let Some(p) = seen
+                    .map(|p| &**p)
+                    .filter(|p| p.wires().is_some())
+                    .or_else(|| preview(&r.name))
+                {
+                    return canvas(BlockPreviewCanvas::cached(p))
                         .width(Fill)
                         .height(Length::Fixed(size))
                         .into();
@@ -599,14 +893,17 @@ fn item_view<'a>(palette: &'a BlockPalette, item: Item) -> Element<'a, Message> 
                 .height(Length::Fixed(LABEL_LINE_H))
                 .center(),
         ]
-        .spacing(4)
+        .spacing(GRID_LABEL_GAP)
         .into(),
+        // One line per name, cut with "…" where it runs out of room, so every
+        // row is exactly `LIST_ROW_H` tall.
         None => match palette.view {
             ViewMode::Small => row![
                 container(thumb(palette, &item, 16.0)).width(Length::Fixed(20.0)),
-                text(crate::ui::text_util::elide(&name, 16)).size(11),
+                one_line(text(crate::ui::text_util::elide(&name, 16)).size(11)),
             ]
             .spacing(4)
+            .height(Length::Fixed(LIST_ROW_H))
             .align_y(iced::Center)
             .into(),
             ViewMode::Details => {
@@ -617,20 +914,28 @@ fn item_view<'a>(palette: &'a BlockPalette, item: Item) -> Element<'a, Message> 
                     |v: bool| if v { crate::t!("Yes") } else { crate::t!("No") }.into_owned();
                 row![
                     container(thumb(palette, &item, 16.0)).width(Length::Fixed(40.0)),
-                    text(name.clone()).size(11).width(Fill),
+                    one_line(text(name.clone()).size(11)),
                     text(format!("{} / {}", yes_no(ann), yes_no(dynamic)))
                         .size(11)
                         .width(Length::Fixed(140.0)),
                 ]
                 .spacing(4)
+                .height(Length::Fixed(LIST_ROW_H))
                 .align_y(iced::Center)
                 .into()
             }
-            _ => text(name.clone()).size(11).width(Fill).into(),
+            _ => one_line(text(name.clone()).size(11))
+                .height(Length::Fixed(LIST_ROW_H))
+                .align_y(iced::alignment::Vertical::Center)
+                .into(),
         },
     };
     let card = container(body)
-        .padding(if palette.view.grid().is_some() { 6 } else { 3 })
+        .padding(if palette.view.grid().is_some() {
+            GRID_CARD_PAD
+        } else {
+            LIST_CARD_PAD
+        })
         .width(Fill)
         .style(move |theme: &Theme| {
             let (bg, fg) = block_card_colors(theme, placing, button::Status::Active);
@@ -936,56 +1241,51 @@ pub fn view(
             .height(Fill)
             .into()
     } else {
-        let mut col = column![].spacing(4);
-        match palette.view.grid() {
-            Some((per_row, _)) => {
-                for chunk in items.chunks(per_row) {
-                    let mut r = row![].spacing(6).width(Fill);
-                    for item in chunk {
-                        r = r.push(item_view(palette, item.clone()));
-                    }
-                    for _ in chunk.len()..per_row {
-                        r = r.push(Space::new().width(Fill));
-                    }
-                    col = col.push(r);
-                }
+        let mut col = column![].spacing(LIST_SPACING);
+        let (per_row, row_h, lead) = palette.view.rows();
+        if palette.view == ViewMode::Details {
+            col = col.push(
+                row![
+                    text(crate::t!("Icon"))
+                        .size(11)
+                        .style(muted_style)
+                        .width(Length::Fixed(40.0)),
+                    text(crate::t!("Name"))
+                        .size(11)
+                        .style(muted_style)
+                        .width(Fill),
+                    text(crate::t!("Annotative / Dynamic"))
+                        .size(11)
+                        .style(muted_style)
+                        .width(Length::Fixed(140.0)),
+                ]
+                .spacing(4)
+                .height(Length::Fixed(LIST_ROW_H)),
+            );
+        }
+        // Every row is equally tall, so only the rows in view (and a few
+        // spare) are built; spaces stand in for the others, keeping the
+        // list's height and scroll position.
+        let rows: Vec<&[Item]> = items.chunks(per_row).collect();
+        let pitch = row_h + LIST_SPACING;
+        let (offset, height) = palette.scroll;
+        let shown = visible_rows(rows.len(), pitch, offset - lead, height);
+        if shown.start > 0 {
+            col = col.push(Space::new().height(shown.start as f32 * pitch - LIST_SPACING));
+        }
+        for chunk in &rows[shown.clone()] {
+            let mut r = row![].spacing(6).width(Fill);
+            for item in chunk.iter() {
+                r = r.push(item_view(palette, item.clone()));
             }
-            None if palette.view == ViewMode::Small => {
-                for chunk in items.chunks(2) {
-                    let mut r = row![].spacing(6).width(Fill);
-                    for item in chunk {
-                        r = r.push(item_view(palette, item.clone()));
-                    }
-                    if chunk.len() < 2 {
-                        r = r.push(Space::new().width(Fill));
-                    }
-                    col = col.push(r);
-                }
+            for _ in chunk.len()..per_row {
+                r = r.push(Space::new().width(Fill));
             }
-            None => {
-                if palette.view == ViewMode::Details {
-                    col = col.push(
-                        row![
-                            text(crate::t!("Icon"))
-                                .size(11)
-                                .style(muted_style)
-                                .width(Length::Fixed(40.0)),
-                            text(crate::t!("Name"))
-                                .size(11)
-                                .style(muted_style)
-                                .width(Fill),
-                            text(crate::t!("Annotative / Dynamic"))
-                                .size(11)
-                                .style(muted_style)
-                                .width(Length::Fixed(140.0)),
-                        ]
-                        .spacing(4),
-                    );
-                }
-                for item in items {
-                    col = col.push(item_view(palette, item));
-                }
-            }
+            col = col.push(r);
+        }
+        let after = rows.len() - shown.end;
+        if after > 0 {
+            col = col.push(Space::new().height(after as f32 * pitch - LIST_SPACING));
         }
         scrollable(container(col).padding(iced::Padding {
             top: 0.0,
@@ -993,6 +1293,12 @@ pub fn view(
             bottom: 6.0,
             left: 0.0,
         }))
+        .on_scroll(|viewport| {
+            pm(BlockPaletteMsg::Scrolled {
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+            })
+        })
         .width(Fill)
         .height(Fill)
         .into()
@@ -1005,8 +1311,47 @@ pub fn view(
     )
 }
 
+/// `name` on one line the width of what is left, cut with "…" when it
+/// does not fit.
+fn one_line(name: iced::widget::Text<'_>) -> iced::widget::Text<'_> {
+    name.width(Fill)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .ellipsis(iced::advanced::text::Ellipsis::End)
+}
+
+/// Height of a row of cards in an icon view with `size` tall thumbnails.
+fn grid_row_h(size: f32) -> f32 {
+    2.0 * GRID_CARD_PAD + size + GRID_LABEL_GAP + LABEL_LINE_H
+}
+
+/// The rows of a `rows` long list, `pitch` apart, to build for a viewport
+/// `height` tall scrolled `offset` down from the first row (negative while
+/// something above the rows is in view): those in view plus [`SPARE_ROWS`]
+/// either side. All of them while the viewport's height is not known yet.
+fn visible_rows(rows: usize, pitch: f32, offset: f32, height: f32) -> std::ops::Range<usize> {
+    if height <= 0.0 || pitch <= 0.0 {
+        return 0..rows;
+    }
+    // The list scrolls no further than its end, whatever was reported for
+    // a longer list before.
+    let offset = offset.clamp(0.0, (rows as f32 * pitch - height).max(0.0));
+    let first = ((offset / pitch).floor() as usize).saturating_sub(SPARE_ROWS);
+    let end = ((offset + height) / pitch).ceil() as usize + SPARE_ROWS;
+    first.min(rows)..end.min(rows)
+}
+
 /// Width of the ribbon's block gallery.
 pub const GALLERY_W: f32 = 300.0;
+
+/// Distance between the tops of two rows of the ribbon gallery.
+fn gallery_pitch() -> f32 {
+    2.0 * GALLERY_CARD_PAD + GALLERY_THUMB_H + GALLERY_LABEL_GAP + LABEL_LINE_H + GALLERY_SPACING
+}
+
+/// Height of the ribbon gallery's list of `blocks` blocks.
+fn gallery_list_h(blocks: usize) -> f32 {
+    (blocks.div_ceil(GALLERY_PER_ROW) as f32 * 79.0).clamp(36.0, 260.0)
+}
 
 /// The ribbon Insert gallery: the drawing's blocks (a click inserts one),
 /// then the ways into the palette's other tabs.
@@ -1015,35 +1360,44 @@ pub fn gallery(palette: &BlockPalette) -> Element<'_, Message> {
         tool_id: "INSERT".to_string(),
         event: crate::modules::ModuleEvent::Command(cmd),
     };
-    let mut grid = column![].spacing(4);
-    for chunk in palette.blocks.chunks(4) {
-        let mut r = row![].spacing(4).width(Fill);
-        for block in chunk {
+    // Like the palette's lists, only the rows in view (and a few spare) are
+    // built; spaces stand in for the others.
+    let mut grid = column![].spacing(GALLERY_SPACING);
+    let (shown, shown_blocks) = palette.gallery_shown();
+    let pitch = gallery_pitch();
+    if shown.start > 0 {
+        grid = grid.push(Space::new().height(shown.start as f32 * pitch - GALLERY_SPACING));
+    }
+    for chunk in shown_blocks.chunks(GALLERY_PER_ROW) {
+        let mut r = row![].spacing(GALLERY_SPACING).width(Fill);
+        for block in chunk.iter() {
             let card = column![
-                canvas(BlockPreviewCanvas {
-                    wires: &block.wires
-                })
-                .width(Fill)
-                .height(Length::Fixed(48.0)),
+                canvas(BlockPreviewCanvas::gallery(&block.preview))
+                    .width(Fill)
+                    .height(Length::Fixed(GALLERY_THUMB_H)),
                 text(crate::ui::text_util::elide(&block.name, 10))
                     .size(10)
                     .width(Fill)
                     .height(Length::Fixed(LABEL_LINE_H))
                     .center(),
             ]
-            .spacing(2);
+            .spacing(GALLERY_LABEL_GAP);
             r = r.push(
                 button(card)
                     .on_press(ribbon_command(format!("_BLOCKINSERT {}", block.name)))
                     .style(crate::ui::ribbon::widgets::popup_row_style)
-                    .padding(3)
+                    .padding(GALLERY_CARD_PAD)
                     .width(Fill),
             );
         }
-        for _ in chunk.len()..4 {
+        for _ in chunk.len()..GALLERY_PER_ROW {
             r = r.push(Space::new().width(Fill));
         }
         grid = grid.push(r);
+    }
+    let after = palette.blocks.len().div_ceil(GALLERY_PER_ROW) - shown.end;
+    if after > 0 {
+        grid = grid.push(Space::new().height(after as f32 * pitch - GALLERY_SPACING));
     }
     let blocks: Element<'_, Message> = if palette.blocks.is_empty() {
         container(
@@ -1061,6 +1415,12 @@ pub fn gallery(palette: &BlockPalette) -> Element<'_, Message> {
             bottom: 0.0,
             left: 0.0,
         }))
+        .id(iced::widget::Id::new(GALLERY_SCROLL_ID))
+        .on_scroll(|viewport| {
+            pm(BlockPaletteMsg::GalleryScrolled(
+                viewport.absolute_offset().y,
+            ))
+        })
         .height(Length::Shrink)
         .into()
     };
@@ -1077,9 +1437,7 @@ pub fn gallery(palette: &BlockPalette) -> Element<'_, Message> {
             text(crate::t!("Current Drawing Blocks").to_uppercase())
                 .size(10)
                 .style(accent_text),
-            container(blocks).height(Length::Fixed(
-                ((palette.blocks.len().div_ceil(4)) as f32 * 79.0).clamp(36.0, 260.0)
-            )),
+            container(blocks).height(Length::Fixed(gallery_list_h(palette.blocks.len()))),
             container(Space::new())
                 .height(1)
                 .width(Fill)
@@ -1137,5 +1495,206 @@ pub(crate) fn block_icon_button_text_color(theme: &Theme, status: button::Status
     match status {
         button::Status::Hovered | button::Status::Pressed => palette.background.strong.text,
         _ => palette.background.base.text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> BlockEntry {
+        BlockEntry {
+            name: name.to_string(),
+            preview: Rc::new(BlockPreview::pending()),
+            annotative: false,
+            dynamic: false,
+        }
+    }
+
+    #[test]
+    fn current_entry_ignores_case_and_takes_the_first_match() {
+        let mut palette = BlockPalette::default();
+        palette.set_blocks(vec![entry("Door"), entry("DOOR"), entry("Window")]);
+        let door = palette.current_entry("door").unwrap();
+        assert!(std::ptr::eq(door, &palette.blocks[0]));
+        assert_eq!(palette.current_entry("WINDOW").unwrap().name, "Window");
+        assert!(palette.current_entry("Wall").is_none());
+        // A new list replaces the index with it.
+        palette.set_blocks(vec![entry("Wall")]);
+        assert!(palette.current_entry("door").is_none());
+        assert_eq!(palette.current_entry("wall").unwrap().name, "Wall");
+    }
+
+    #[test]
+    fn visible_rows_covers_the_viewport_with_spare_rows() {
+        // 100 rows, 50 px apart, a 200 px viewport.
+        assert_eq!(visible_rows(100, 50.0, 0.0, 200.0), 0..6);
+        assert_eq!(visible_rows(100, 50.0, 1000.0, 200.0), 18..26);
+        // Scrolled past the end (a longer list before): clamped to the end.
+        assert_eq!(visible_rows(100, 50.0, 1e6, 200.0), 94..100);
+        assert_eq!(visible_rows(3, 50.0, 1e6, 200.0), 0..3);
+        // The viewport is not known yet: everything.
+        assert_eq!(visible_rows(100, 50.0, 0.0, 0.0), 0..100);
+        assert_eq!(visible_rows(0, 50.0, 0.0, 200.0), 0..0);
+    }
+
+    /// Centre of text `label` in `palette`'s view laid out very tall, so
+    /// the whole list fits on screen.
+    fn label_at(palette: &BlockPalette, label: &str) -> Option<iced::Point> {
+        locate(view(palette, 300.0, Default::default()), label, true)
+    }
+
+    /// Centre of text `label` in `element` laid out very tall: where it is
+    /// in view (`visible`), or wherever it is laid out.
+    fn locate(element: Element<'_, Message>, label: &str, visible: bool) -> Option<iced::Point> {
+        use iced_test::core::widget;
+        use iced_test::runtime::user_interface::{Cache, UserInterface};
+        use iced_test::Selector;
+        let _one = crate::headless_ui_lock();
+        let mut renderer = iced_test::futures::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                None,
+            ),
+        )
+        .expect("headless renderer");
+        let size = iced::Size::new(300.0, 100_000.0);
+        let mut ui = UserInterface::build(
+            element,
+            size,
+            Cache::default(),
+            &mut renderer,
+        );
+        let mut find = Selector::find(label);
+        ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
+        match widget::Operation::finish(&find) {
+            widget::operation::Outcome::Some(Some(target)) if visible => {
+                target.visible_bounds().map(|b| b.center())
+            }
+            widget::operation::Outcome::Some(Some(target)) => Some(target.bounds().center()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_view_only_builds_the_rows_in_view_at_their_real_place() {
+        for mode in ViewMode::ALL {
+            let (per_row, row_h, lead) = mode.rows();
+            let pitch = row_h + LIST_SPACING;
+            // Row 1 starts with a name far too long for the list: it stays
+            // on one line, so its row is as tall as any other.
+            let long = "L".repeat(200);
+            let mut palette = BlockPalette {
+                view: mode,
+                ..Default::default()
+            };
+            palette.set_blocks(
+                (0..300)
+                    .map(|i| {
+                        if i == per_row {
+                            entry(&long)
+                        } else {
+                            entry(&format!("B{i:03}"))
+                        }
+                    })
+                    .collect(),
+            );
+            let label = |row: usize| format!("B{:03}", row * per_row);
+            // Everything built: the rows really are `pitch` apart.
+            palette.scroll = (0.0, 0.0);
+            let first = label_at(&palette, &label(0)).unwrap();
+            let third = label_at(&palette, &label(2)).unwrap();
+            assert!((third.y - first.y - 2.0 * pitch).abs() < 0.01, "{mode:?}");
+            let far = label_at(&palette, &label(30)).unwrap();
+            // Scrolled to row 30 of a 3-row viewport: rows far above are
+            // not built, and the ones in view sit where they always did.
+            palette.scroll = (lead + 30.0 * pitch, 3.0 * pitch);
+            assert!(label_at(&palette, &label(0)).is_none(), "{mode:?}");
+            assert!(label_at(&palette, &label(40)).is_none(), "{mode:?}");
+            assert_eq!(label_at(&palette, &label(30)), Some(far), "{mode:?}");
+            // Only the previews in view are worked out (List has none).
+            let shown = palette.shown_preview_names();
+            assert_eq!(
+                shown.contains(&label(30)),
+                mode != ViewMode::List,
+                "{mode:?}"
+            );
+            assert!(!shown.contains(&label(0)), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn gallery_only_builds_the_rows_in_view_at_their_real_place() {
+        let mut palette = BlockPalette::default();
+        palette.set_blocks((0..300).map(|i| entry(&format!("B{i:03}"))).collect());
+        let pitch = gallery_pitch();
+        let label = |row: usize| format!("B{:03}", row * GALLERY_PER_ROW);
+        let at = |palette: &BlockPalette, row: usize| locate(gallery(palette), &label(row), false);
+        // At the top: the first rows, `pitch` apart, and none far below.
+        let first = at(&palette, 0).unwrap();
+        let third = at(&palette, 2).unwrap();
+        assert!((third.y - first.y - 2.0 * pitch).abs() < 0.01);
+        assert!(at(&palette, 30).is_none());
+        // Scrolled to row 30: rows far above are not built, and row 30 sits
+        // where it would with every row built.
+        palette.gallery_offset = 30.0 * pitch;
+        assert!(at(&palette, 0).is_none());
+        assert!(at(&palette, 60).is_none());
+        let row30 = at(&palette, 30).unwrap();
+        assert!((row30.y - first.y - 30.0 * pitch).abs() < 0.01);
+        // Only the previews of those rows are worked out.
+        let (_, blocks) = palette.gallery_shown();
+        let shown: Vec<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
+        assert!(shown.contains(&label(30).as_str()));
+        assert!(!shown.contains(&label(0).as_str()));
+    }
+
+    #[test]
+    fn gallery_previews_are_worked_out_again_when_needed() {
+        let mut palette = BlockPalette::default();
+        palette.set_blocks(vec![entry("A")]);
+        assert!(palette.gallery_previews_changed());
+        assert!(!palette.gallery_previews_changed());
+        palette.gallery_offset = 10.0;
+        assert!(palette.gallery_previews_changed());
+        // New blocks have new, pending previews.
+        palette.set_blocks(vec![entry("A")]);
+        assert!(palette.gallery_previews_changed());
+        // Opening the gallery starts at the top, its previews to work out.
+        let _ = palette.open_gallery();
+        assert_eq!(palette.gallery_offset, 0.0);
+        assert!(palette.gallery_previews_changed());
+    }
+
+    #[test]
+    fn gallery_and_palette_thumbnails_keep_their_own_drawing() {
+        let _one = crate::headless_ui_lock();
+        let renderer = iced_test::futures::futures::executor::block_on(
+            <iced::Renderer as iced_test::core::renderer::Headless>::new(
+                iced_test::core::renderer::Settings::default(),
+                None,
+            ),
+        )
+        .expect("headless renderer");
+        let preview = BlockPreview::pending();
+        preview.fill(Vec::new());
+        let draw = |canvas: BlockPreviewCanvas<'_>, w: f32, h: f32| {
+            let _ = canvas.draw(
+                &(),
+                &renderer,
+                &Theme::Dark,
+                iced::Rectangle::with_size(iced::Size::new(w, h)),
+                iced::mouse::Cursor::Unavailable,
+            );
+        };
+        // Both sizes drawn in one frame: each cache keeps its own size, so
+        // neither is drawn again (or shows the other's thumbnail) next frame.
+        draw(BlockPreviewCanvas::cached(&preview), 101.0, 87.0);
+        draw(BlockPreviewCanvas::gallery(&preview), 63.0, GALLERY_THUMB_H);
+        let palette = format!("{:?}", preview.cache);
+        let gallery = format!("{:?}", preview.gallery_cache);
+        assert!(palette.contains("width: 101.0"), "{palette}");
+        assert!(!palette.contains("width: 63.0"), "{palette}");
+        assert!(gallery.contains("width: 63.0"), "{gallery}");
     }
 }

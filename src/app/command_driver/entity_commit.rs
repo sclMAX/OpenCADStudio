@@ -336,7 +336,14 @@ impl OpenCADStudio {
             return Some(Task::none());
         }
         // Projected points cannot use direct paper-space source inference.
-        let association_allowed = self.dimension_association_allowed(i);
+        // A source picked inside a block reference needs its INSERT path,
+        // which only the acquired snaps carry.
+        let association_allowed = self.dimension_association_allowed(i)
+            && !self.accepted_snaps().iter().any(|snap| {
+                snap.source
+                    .as_ref()
+                    .is_some_and(|source| !source.block_path.is_empty())
+            });
         let inherited_dimension = if preserve_base_style {
             match &entity {
                 codec::EntityType::Dimension(dimension) => Some((
@@ -788,8 +795,11 @@ impl OpenCADStudio {
                 .block_records
                 .get(&name)
                 .is_some();
+        let fresh = !self.block_palette_stale();
         match self.tabs[i].scene.create_block_with_options(*options) {
             Ok(insert_handle) => {
+                // Only this block's definition changed.
+                self.note_block_changes(fresh, [&name]);
                 self.tabs[i].dirty = true;
                 self.tabs[i].scene.deselect_all();
                 if !insert_handle.is_null() {

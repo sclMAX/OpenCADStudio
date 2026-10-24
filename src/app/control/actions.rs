@@ -114,8 +114,10 @@ pub(super) const NAMES: &[&str] = &[
     "dgn_import_dialog",
     "tds_import_dialog",
     "tds_material_dialog",
+    "tds_map_dialog",
     "refedit_dialog",
     "pdf_password_dialog",
+    "hyperlink_dialog",
     "pdf_shx_settings",
     "pdf_layer_toggle",
     "pc_manager_toggle",
@@ -721,6 +723,20 @@ impl OpenCADStudio {
                     }
                     if req.get("upside_down").is_some() {
                         page_dialog.upside_down = request.upside_down;
+                    }
+                    // Explicit output flags win over the stored page setup too,
+                    // like paper, scale and area above.
+                    if req["transparency"].is_boolean() {
+                        page_dialog.transparency = request.transparency;
+                    }
+                    if req["lineweights"].is_boolean() {
+                        page_dialog.lineweights = request.lineweights;
+                    }
+                    if req["merge_lines"].is_boolean() {
+                        page_dialog.merge_lines = request.merge_lines;
+                    }
+                    if req["stamp"].is_boolean() {
+                        page_dialog.stamp = request.stamp;
                     }
                     // The requested table wins over the layout's own, which
                     // the stored page setup just loaded (or failed to find).
@@ -2184,6 +2200,38 @@ impl OpenCADStudio {
                     })
                 }
             }
+            // The Insert / Edit Hyperlink window, one field per call:
+            // "address=<file, web address or file#location>", "text=<text>",
+            // "target=file|view", "view=<name>", "relative=0|1", "dwf=0|1",
+            // "browse", "ok", "remove" or "cancel".
+            "hyperlink_dialog" => {
+                use crate::ui::window::hyperlink_dialog::HyperlinkMsg as H;
+                if self.active_modal != Some(crate::app::ModalKind::Hyperlink) {
+                    return Err(failure("no_dialog", "The Hyperlink window is not open"));
+                }
+                let spec = string(req, "value")?;
+                let (key, value) = spec.split_once('=').unwrap_or((spec, ""));
+                let flag = || match value {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    _ => Err(failure("invalid_value", spec)),
+                };
+                match key {
+                    "address" => Message::HyperlinkUrlChanged(value.to_string()),
+                    "text" => Message::HyperlinkDescriptionChanged(value.to_string()),
+                    "target" => Message::HyperlinkDialog(H::ViewTarget(value == "view")),
+                    "view" => Message::HyperlinkDialog(H::View(value.to_string())),
+                    "relative" => Message::HyperlinkDialog(H::Relative(flag()?)),
+                    "dwf" => Message::HyperlinkDialog(H::Dwf(flag()?)),
+                    "browse" => Message::HyperlinkDialog(H::Browse),
+                    "ok" => Message::HyperlinkApply,
+                    "remove" => Message::HyperlinkRemove,
+                    "cancel" => Message::HyperlinkCancel,
+                    _ => {
+                        return Err(failure("invalid_value", "Unknown Hyperlink window field"))
+                    }
+                }
+            }
             // The Edit Reference dialog, one field per call: "level=<n>" (0 =
             // the picked reference), "nested=0|1" (pick the working set in the
             // drawing), "attributes=0|1", "lock=0|1", "unique=0|1", "ok" or
@@ -2475,6 +2523,18 @@ impl OpenCADStudio {
                     "cancel" => return Ok(Task::done(Message::CloseModal)),
                     _ => return Err(bad()),
                 })
+            }
+            // The missing texture map window of a 3D Studio import: "ok"
+            // (or "close") dismisses the shown map; the next one follows.
+            "tds_map_dialog" => {
+                if self.active_modal != Some(crate::app::ModalKind::TdsMissingMap) {
+                    return Err(failure("no_dialog", "The missing texture map window is not open"));
+                }
+                let spec = string(req, "value")?;
+                match spec {
+                    "ok" | "close" => Message::CloseModal,
+                    _ => return Err(failure("invalid_value", spec)),
+                }
             }
             // The DGN Import window, one field per call: "path=<file>" (as
             // Change… picks it), "model=<n>", "target=new|current",

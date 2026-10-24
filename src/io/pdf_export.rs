@@ -699,8 +699,27 @@ fn append_pdf_page(
         // Consecutive items on one drawing layer share a marked-content run,
         // so a viewer's layer panel can hide that layer.
         let mut open_layer: Option<&str> = None;
+        // Plot transparency: an object whose colour carries alpha gets its own
+        // graphics state with that alpha (constant fill and stroke alpha), so
+        // what lies beneath stays visible, as on screen and in SVG export.
+        // Opened before the object and closed before the next one, inside the
+        // object's marked-content layer run.
+        let mut alpha_states: std::collections::HashMap<u8, ExtendedGraphicsStateId> =
+            std::collections::HashMap::new();
+        let mut alpha_open = false;
 
         for (_, _, _, item) in draw_items {
+            if alpha_open {
+                ops.push(Op::RestoreGraphicsState);
+                alpha_open = false;
+                last_color = None;
+                last_lw = None;
+                // Q restores whatever was set before the q, not the page
+                // default: force the next object to state its own.
+                last_cap = None;
+                last_join = None;
+                last_dash = None;
+            }
             let layer = match &item {
                 DrawItem::WireFill(wire) | DrawItem::Wire(wire) | DrawItem::Text(wire) => {
                     layer_of(&wire.name)
@@ -724,6 +743,29 @@ fn append_pdf_page(
                     ops.push(Op::BeginLayer { layer_id });
                 }
                 open_layer = layer;
+            }
+            let alpha = match &item {
+                DrawItem::WireFill(w) | DrawItem::Wire(w) | DrawItem::Text(w) => Some(w.color[3]),
+                // Wipeouts mask with paper white and stay opaque.
+                DrawItem::Hatch(h) if h.name != "WIPEOUT_FILL" => Some(h.color[3]),
+                _ => None,
+            };
+            if let Some(alpha) = object_alpha(alpha, options) {
+                let gs = alpha_states
+                    .entry(alpha)
+                    .or_insert_with(|| {
+                        let a = alpha as f32 / 255.0;
+                        // printpdf 0.9.1 swaps the serialized CA/ca keys; set both.
+                        doc.add_graphics_state(
+                            ExtendedGraphicsState::default()
+                                .with_current_fill_alpha(a)
+                                .with_current_stroke_alpha(a),
+                        )
+                    })
+                    .clone();
+                ops.push(Op::SaveGraphicsState);
+                ops.push(Op::LoadGraphicsState { gs });
+                alpha_open = true;
             }
             let wire = match item {
                 DrawItem::WireFill(wire) => {
@@ -1092,6 +1134,9 @@ fn append_pdf_page(
             }
             flush_line(&mut ops, &segment, dot_radius);
         }
+        if alpha_open {
+            ops.push(Op::RestoreGraphicsState);
+        }
         if open_layer.is_some() {
             ops.push(Op::EndLayer);
         }
@@ -1348,13 +1393,23 @@ fn emit_round_dot(ops: &mut Vec<Op>, center: Point, radius: Pt) {
     });
 }
 
-fn plotted_color(rgb: [f32; 3], alpha: f32, screening: f32, options: PdfPlotOptions) -> [f32; 3] {
-    let amount = screening.clamp(0.0, 1.0)
-        * if options.transparency {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
+/// Quantised alpha (1..=254) for an object plotted with transparency, or
+/// `None` when it plots opaque: transparency off, alpha at or near 1, or
+/// fully transparent (such objects are skipped by the emitters).
+fn object_alpha(alpha: Option<f32>, options: PdfPlotOptions) -> Option<u8> {
+    let a = alpha?;
+    if !options.transparency || !a.is_finite() || a < 0.01 {
+        return None;
+    }
+    let q = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+    (q < 255).then_some(q.max(1))
+}
+
+/// Paper colour of an object: plot-style screening blends towards white.
+/// Object alpha is not folded in here; with transparency on it is plotted as
+/// a graphics-state alpha around the object (see the draw loop).
+fn plotted_color(rgb: [f32; 3], _alpha: f32, screening: f32, _options: PdfPlotOptions) -> [f32; 3] {
+    let amount = screening.clamp(0.0, 1.0);
     [
         1.0 - (1.0 - rgb[0]) * amount,
         1.0 - (1.0 - rgb[1]) * amount,
@@ -2791,6 +2846,50 @@ mod tests {
     }
 
     #[test]
+    fn plot_transparency_keeps_colour_and_plots_alpha() {
+        // A half-transparent red line: with plot transparency on it keeps its
+        // red and plots through a graphics-state alpha, so what lies beneath
+        // stays visible; with it off it plots opaque without any alpha state.
+        let make_page = |transparency: bool| {
+            let wire = PlotWire {
+                wire: WireModel::solid(
+                    "test".into(),
+                    vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]],
+                    [1.0, 0.0, 0.0, 0.5],
+                    false,
+                ),
+                draw_depth: 0.0,
+            };
+            let mut page = test_page(vec![wire]);
+            page.options.transparency = transparency;
+            page
+        };
+        let on = pdf_stream_text(&render_pdf_bytes(&[make_page(true)], None).unwrap());
+        assert!(on.contains("/ca 0.5") || on.contains("/CA 0.5"), "alpha state missing");
+        assert!(on.contains("1 0 0 RG"), "colour must not be blended towards white");
+        let off = pdf_stream_text(&render_pdf_bytes(&[make_page(false)], None).unwrap());
+        assert!(!off.contains("/ca ") && !off.contains("/CA "), "no alpha without transparency");
+        assert!(off.contains("1 0 0 RG"), "opaque red without transparency");
+    }
+
+    #[test]
+    fn fully_opaque_objects_get_no_alpha_state() {
+        let wire = PlotWire {
+            wire: WireModel::solid(
+                "test".into(),
+                vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]],
+                [0.0, 0.0, 1.0, 1.0],
+                false,
+            ),
+            draw_depth: 0.0,
+        };
+        let mut page = test_page(vec![wire]);
+        page.options.transparency = true;
+        let text = pdf_stream_text(&render_pdf_bytes(&[page], None).unwrap());
+        assert!(!text.contains("/ca ") && !text.contains("/CA "));
+    }
+
+    #[test]
     fn export_fallback_plot_style_recolors_wires() {
         // ACI 1 carrying pure device red: without a style it must export as an
         // RGB operator; the monochrome fallback must recolor it. Guards the
@@ -2990,6 +3089,12 @@ mod tests {
         assert!(
             stream.contains("Tr"),
             "searchable layer must be invisible (Tr rendering mode)"
+        );
+        // `Tr` outlives `ET`: unless the run restores the graphics state,
+        // every embedded TrueType glyph drawn after it is invisible (#2007).
+        assert!(
+            stream.contains("q\nBT") && stream.contains("ET\nQ"),
+            "searchable run must be wrapped in q/Q"
         );
     }
 

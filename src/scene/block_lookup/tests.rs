@@ -1,4 +1,7 @@
 use super::*;
+mod multiple_outputs;
+mod expressions;
+mod rename;
 use crate::scene::{block_basepoint, block_distance_parameter as distance, render_graph, Scene};
 use codec::{
     entities::{Insert, Line},
@@ -303,7 +306,13 @@ fn lookup_reverse_selection_evaluates_saved_reference_geometry() {
     let mut unsupported = document.clone();
     let (_, mut malformed) = table(&unsupported, definition, lookup).unwrap().unwrap();
     malformed.columns[0].connection_name = "UpdatedAngle".into();
-    apply_table(&mut unsupported, definition, lookup, malformed).unwrap();
+    let before = unsupported.clone();
+    assert!(apply_table(&mut unsupported, definition, lookup, malformed.clone()).is_err());
+    assert_eq!(unsupported, before);
+    // Simulate a retained imported binding without authoring it through Apply.
+    let (handle, _) = table(&unsupported, definition, lookup).unwrap().unwrap();
+    let ObjectType::DynamicBlock(object) = unsupported.objects.get_mut(&handle).unwrap() else { panic!() };
+    object.data = DynamicBlockData::LookupAction(malformed);
     let before = unsupported.clone();
     assert!(evaluate_reference_choice(&unsupported, insert, "Large").is_err());
     assert_eq!(unsupported, before);
@@ -439,6 +448,8 @@ fn lookup_existing_expressions_survive_row_reordering_and_output_edits() {
     edited.expressions[1] = "Renamed".into();
     assert!(validate(&edited, Some(&original)).is_ok());
     edited.expressions[0] = "[7,9]".into();
+    assert!(validate(&edited, Some(&original)).is_ok());
+    edited.expressions[0] = "{opaque}".into();
     assert!(validate(&edited, Some(&original)).is_err());
 }
 #[test]

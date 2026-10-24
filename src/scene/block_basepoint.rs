@@ -15,7 +15,7 @@ pub(crate) fn parameter(
 ) -> Option<(Handle, &BlockBasePointParameter)> {
     let ObjectType::Dictionary(dictionary) = document
         .objects
-        .get(&document.extension_dictionary_handle(definition)?)?
+        .get(&authoring::definition_dictionary(document, definition)?)?
     else {
         return None;
     };

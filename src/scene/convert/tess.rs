@@ -721,6 +721,10 @@ pub(crate) fn tessellate_entity(
         }
     }
 
+    if crate::scene::block_construction::is_construction(e.common()) {
+        crate::scene::block_construction::style_wires(&mut wires);
+    }
+
     wires
 }
 #[allow(clippy::too_many_arguments)]
@@ -1377,6 +1381,10 @@ fn tessellate_entity_inner(
         if let Some(mode) = frame_mode {
             b.display_visible = mode != 0;
             b.plot_visible = mode == 1;
+        }
+        // OLEFRAME 2 shows an OLE object's frame without plotting it.
+        if matches!(e, EntityType::Ole2Frame(_)) {
+            b.plot_visible = crate::entities::ole2frame::frame_mode(document) == 1;
         }
         if matches!(e, EntityType::Wipeout(_)) {
             b.depth_override = Some(0.5);

@@ -508,8 +508,10 @@ impl ActivePluginGrip {
 /// Coalescing: at most one move is in flight (`pending_move` keeps only the
 /// newest cursor point; superseded points are DROPPED). The begin, settle and
 /// cancel phases are never coalesced or dropped. The watchdog deadline
-/// guards the settle: a plugin that never answers has its delivery abandoned
-/// and its connection torn down — the drag ends as a cancel, never a freeze.
+/// guards the settle: a plugin that misses its deadline has its drag end as
+/// a cancel, never a freeze — the host's strike ledger keeps the connection
+/// on the first strike and tears it down on the third miss inside the
+/// window.
 #[derive(Default)]
 pub(crate) struct PluginGripDeliveries {
     /// Newest cursor point not yet sent (coalescing park).

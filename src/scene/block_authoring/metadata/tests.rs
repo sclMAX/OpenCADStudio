@@ -153,7 +153,7 @@ fn block_parameter_metadata_rejects_collisions_foreign_objects_and_invalid_field
         assert!(set_text(&mut doc, def, xy, Field::Name, invalid).is_err());
     }
     assert!(set_text(&mut doc, def, handles[5], Field::Description, "unsupported").is_err());
-    assert!(set_visible(&mut doc, def, xy, false).is_err());
+    assert!(set_visible(&mut doc, def, handles[5], false).is_err());
     assert!(set_text(
         &mut doc,
         Handle::from(0xFFFFFFu64),

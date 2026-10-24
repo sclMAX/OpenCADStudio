@@ -826,6 +826,30 @@ pub trait InteractiveCommand: Send {
     fn on_cursor_move(&mut self, _pt: [f64; 3]) -> Vec<PreviewWire> {
         Vec::new()
     }
+
+    /// When `true`, the host enters selection-gathering mode (as for `ssget`).
+    /// The user can pick objects or use window/crossing drag selection.
+    /// Handled selections trigger [`on_selection_complete`](Self::on_selection_complete).
+    fn is_selection_gathering(&self) -> bool {
+        false
+    }
+
+    /// When `true` (and `is_selection_gathering` is true), the host permits
+    /// window and crossing box drag selections to be completed.
+    fn accepts_drag_selection(&self) -> bool {
+        false
+    }
+
+    /// Called after a selection action completes while `is_selection_gathering` is true.
+    /// `handles` is the full set of currently selected entities.
+    fn on_selection_complete(&mut self, _handles: Vec<Handle>) -> CommandStep {
+        CommandStep::NeedPoint
+    }
+
+    /// Returns `true` when selection should reject entities on locked layers (e.g. ssget ":L").
+    fn selection_rejects_locked_layers(&self) -> bool {
+        false
+    }
 }
 
 /// A preview wire rendered in real-time during interactive commands.
@@ -1072,6 +1096,8 @@ pub enum CommandStep {
     CommitMany(Vec<EntityType>),
     /// Commit multiple entities to the document and end the command.
     CommitManyAndEnd(Vec<EntityType>),
+    /// End the command and dispatch a command string to the host command line.
+    Dispatch(String),
 }
 
 /// Export a `BuiltinPlugin` from a `cdylib` so the host can load it at runtime.

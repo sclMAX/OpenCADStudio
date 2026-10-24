@@ -865,6 +865,11 @@ impl super::OpenCADStudio {
         // catastrophic cancellation. Insertion is a pure translation, so zeroing
         // it keeps the layout's shape, wrapping and alignment identical.
         mt.insertion_point = Vector3::new(0.0, 0.0, 0.0);
+        // The preview reads upright: the glyph boxes the caret and the
+        // selection use are laid out unrotated, so the strokes must be too.
+        mt.rotation = 0.0;
+        mt.dwg_x_direction = None;
+        mt.normal = Vector3::new(0.0, 0.0, 1.0);
         let entity = EntityType::MText(Box::new(mt.clone()));
         let anno = 1.0;
         let bg = self.tabs[i].scene.bg_color;

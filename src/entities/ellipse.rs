@@ -393,10 +393,22 @@ fn apply_transform(ell: &mut Ellipse, t: &EntityTransform) {
     // The codec maps the whole ellipse — ratio, principal axes and arc
     // parameters — under rotate, scale, affine and mirror alike.
     crate::scene::view::transform::apply_standard_entity_transform(ell, t, |entity, p1, p2| {
+        let normal = entity.normal;
         codec::Entity::apply_mirror(
             entity,
             &crate::scene::view::transform::reflection_about_xy_line(p1, p2),
         );
+        // The codec turns the normal over with the reflection. MIRROR keeps it
+        // facing the way it did, which traces the same curve with the
+        // parameters negated and swapped.
+        if entity.normal.dot(&normal) < 0.0 {
+            entity.normal = -entity.normal;
+            if !entity.is_full() {
+                let start = (-entity.end_parameter).rem_euclid(std::f64::consts::TAU);
+                entity.end_parameter = start + (entity.end_parameter - entity.start_parameter);
+                entity.start_parameter = start;
+            }
+        }
     });
 }
 

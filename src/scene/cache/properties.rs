@@ -30,10 +30,9 @@ pub fn general_section(entity: &EntityType) -> PropSection {
         },
     );
 
-    let hyperlink = crate::scene::pe_url_description_of(entity)
-        .or_else(|| crate::scene::pe_url_of(entity))
-        .unwrap_or_default()
-        .to_owned();
+    let hyperlink = crate::scene::hyperlink::Link::of(entity)
+        .map(|link| link.label())
+        .unwrap_or_default();
 
     let section = PropSection {
         title: t!("General").into_owned(),
@@ -108,6 +107,8 @@ pub fn visualization_section(entity: &EntityType) -> Option<PropSection> {
             // The reference lists no 3D group for an underlay; a point
             // cloud's is its own (stylization and colour scheme).
             | EntityType::Underlay(_)
+            // Nor for an OLE object.
+            | EntityType::Ole2Frame(_)
             | EntityType::Unknown(_)
             // Non-plotting drawing-view border: never rendered, no properties.
             | EntityType::ViewBorder(_)

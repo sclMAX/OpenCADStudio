@@ -884,6 +884,10 @@ impl OpenCADStudio {
             "text_search" => self.automation_text_search(&req),
             "text_audit" => self.automation_text_audit(&req),
             "text_replace" => self.automation_text_replace(&req),
+            "blocks"
+            | "block_instances"
+            | "cad_get_blocks"
+            | "cad_extract_block_instances" => self.automation_blocks(&req),
             "records" => self.record_query(&req),
             "record_schema" => self.record_schema(&req),
             "capabilities" => self.record_capabilities(),

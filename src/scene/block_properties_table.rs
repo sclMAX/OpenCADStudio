@@ -31,7 +31,7 @@ pub(crate) struct TableView {
 pub(crate) type Grid = (Handle, Vec<Column>, Vec<Vec<String>>);
 
 pub(crate) fn graph_handle(document: &CadDocument, definition: Handle) -> Option<Handle> {
-    let xdict = document.extension_dictionary_handle(definition)?;
+    let xdict = super::block_authoring::definition_dictionary(document, definition)?;
     let ObjectType::Dictionary(dictionary) = document.objects.get(&xdict)? else {
         return None;
     };

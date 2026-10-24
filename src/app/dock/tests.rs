@@ -38,10 +38,7 @@ fn blockpalette_pin_toggles_autocollapse_and_close_hides() {
 /// building and driving the real view is deeper than a default test thread.
 /// One at a time: two headless renderers made in parallel crash the process.
 fn with_stack(f: impl FnOnce() + Send + 'static) {
-    static REAL_VIEW: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = REAL_VIEW
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _one = crate::headless_ui_lock();
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(f)
@@ -250,7 +247,8 @@ fn dock_drop_over_the_viewport_floats_the_panel() {
         target,
         Some(DropTarget::Float {
             x: f.x + 100.0,
-            y: f.y + 50.0
+            y: f.y + 50.0,
+            bar: crate::app::config::DockSide::Right,
         })
     );
     // Opening a floating panel must not re-dock it.
@@ -430,7 +428,7 @@ fn dock_auto_hide_waits_for_an_open_layer_color_dropdown() {
 
 #[test]
 fn dock_float_resize_grows_the_panel() {
-    use crate::ui::dock::{DockMsg, FloatPanel, PanelId};
+    use crate::ui::dock::{DockMsg, FloatEdge, FloatPanel, PanelId};
     let mut app = dock_app();
     app.dock.float(FloatPanel::new(
         PanelId::BlockPalette,
@@ -439,19 +437,318 @@ fn dock_float_resize_grows_the_panel() {
         260.0,
         300.0,
     ));
-    let _ = app.on_dock(DockMsg::FloatResizeGrab(PanelId::BlockPalette, false));
-    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(360.0, 400.0)));
-    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(400.0, 450.0)));
+    let resize = |app: &mut OpenCADStudio, edge: FloatEdge, from: (f32, f32), to: (f32, f32)| {
+        let _ = app.on_dock(DockMsg::FloatResizeGrab(PanelId::BlockPalette, edge));
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(from.0, from.1)));
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(to.0, to.1)));
+        let _ = app.on_dock(DockMsg::DragRelease);
+        app.dock.float_rect(PanelId::BlockPalette).unwrap()
+    };
+    let f = resize(&mut app, FloatEdge::SE, (360.0, 400.0), (400.0, 450.0));
+    assert_eq!((f.x, f.y, f.w, f.h), (100.0, 100.0, 300.0, 350.0));
+    // The bottom-left corner grows the panel leftward, keeping its right edge.
+    let f = resize(&mut app, FloatEdge::SW, (100.0, 450.0), (60.0, 450.0));
+    assert_eq!((f.x, f.w, f.h), (60.0, 340.0, 350.0));
+    // The top side grows it upward, keeping its bottom edge.
+    let f = resize(&mut app, FloatEdge::N, (200.0, 100.0), (200.0, 70.0));
+    assert_eq!((f.y, f.h), (70.0, 380.0));
+    // The right side only changes the width.
+    let f = resize(&mut app, FloatEdge::E, (428.0, 200.0), (408.0, 260.0));
+    assert_eq!((f.x, f.y, f.w, f.h), (60.0, 70.0, 320.0, 380.0));
+    // Past the minimum the size stops, and going back resumes from the
+    // pointer, not from where the panel stopped.
+    let _ = app.on_dock(DockMsg::FloatResizeGrab(
+        PanelId::BlockPalette,
+        FloatEdge::E,
+    ));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(408.0, 200.0)));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(100.0, 200.0)));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(398.0, 200.0)));
     let _ = app.on_dock(DockMsg::DragRelease);
     let f = app.dock.float_rect(PanelId::BlockPalette).unwrap();
-    assert_eq!((f.w, f.h), (300.0, 350.0));
-    // The bottom-left grip grows the panel leftward, keeping its right edge.
-    let _ = app.on_dock(DockMsg::FloatResizeGrab(PanelId::BlockPalette, true));
-    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(100.0, 450.0)));
-    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(60.0, 450.0)));
+    assert_eq!(f.w, 310.0);
+}
+
+#[test]
+fn dock_and_window_changes_set_the_viewport_size_before_layout() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockMsg, PanelId};
+    let mut app = dock_app();
+    let i = app.active_tab;
+    let vp = |app: &OpenCADStudio| app.tabs[i].scene.selection.borrow().view.vp_size;
+    let room = |app: &OpenCADStudio| {
+        let (l, r) = app.dock_edge_insets();
+        l + r
+    };
+    let _ = app.update(Message::Dock(DockMsg::HoverExit));
+    // Sizing a docked group's width: the viewport loses what the group gains.
+    let (w0, h0) = vp(&app);
+    let room0 = room(&app);
+    let _ = app.update(Message::Dock(DockMsg::ResizeGrab(PanelId::BlockPalette)));
+    let _ = app.update(Message::Dock(DockMsg::DragMove(iced::Point::new(
+        1300.0, 300.0,
+    ))));
+    let _ = app.update(Message::Dock(DockMsg::DragMove(iced::Point::new(
+        1240.0, 300.0,
+    ))));
+    assert_eq!(room(&app) - room0, 60.0);
+    assert_eq!(vp(&app), (w0 - 60.0, h0));
+    let _ = app.update(Message::Dock(DockMsg::DragRelease));
+    // Auto-hide on the left: the viewport gains the group's width.
+    let (w1, _) = vp(&app);
+    let room1 = room(&app);
+    let _ = app.update(Message::Dock(DockMsg::AutoCollapseToggle(
+        PanelId::Properties,
+    )));
+    assert!(app.dock.edge_auto_hide(DockSide::Left));
+    assert_eq!(vp(&app), (w1 + room1 - room(&app), h0));
+    // A window resize changes it by as much as the window (no pan there).
+    let (w2, h2) = vp(&app);
+    let target = app.tabs[i].scene.camera.borrow().target;
+    let _ = app.update(Message::WindowResized(1500.0, 850.0));
+    assert_eq!(vp(&app), (w2 - 100.0, h2 - 50.0));
+    assert_eq!(app.tabs[i].scene.camera.borrow().target, target);
+}
+
+#[test]
+fn floating_title_bar_starts_on_the_docked_side() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockMsg, PanelId};
+    let mut app = dock_app();
+    let _ = app.on_dock(DockMsg::FloatOut(PanelId::Properties));
+    let _ = app.on_dock(DockMsg::FloatOut(PanelId::BlockPalette));
+    let left = app.dock.float_rect(PanelId::Properties).unwrap();
+    let right = app.dock.float_rect(PanelId::BlockPalette).unwrap();
+    assert_eq!(left.bar, DockSide::Left);
+    assert_eq!(right.bar, DockSide::Right);
+}
+
+#[test]
+fn floating_title_bar_only_flips_against_docked_pallets() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockMsg, PanelId};
+    let mut app = dock_app();
+    // Float the block palette out of the right edge: its bar is on the right.
+    let _ = app.on_dock(DockMsg::FloatOut(PanelId::BlockPalette));
+    let f = app.dock.float_rect(PanelId::BlockPalette).unwrap();
+    assert_eq!(f.bar, DockSide::Right);
+    // Across the middle of the screen it keeps its side.
+    let grab = iced::Point::new(f.x + 100.0, f.y + 10.0);
+    drag_panel(
+        &mut app,
+        PanelId::BlockPalette,
+        grab,
+        iced::Point::new(500.0, 300.0),
+    );
+    let f = app.dock.float_rect(PanelId::BlockPalette).unwrap();
+    assert!(f.x + f.w < 800.0, "moved left of the middle");
+    assert_eq!(f.bar, DockSide::Right);
+    // Against the docked Properties column (strip + 250 px) it flips.
+    let grab = iced::Point::new(f.x + 100.0, f.y + 10.0);
+    drag_panel(
+        &mut app,
+        PanelId::BlockPalette,
+        grab,
+        iced::Point::new(380.0, 300.0),
+    );
+    let f = app.dock.float_rect(PanelId::BlockPalette).unwrap();
+    assert!(f.x <= 290.0, "frame touches the docked column: {}", f.x);
+    assert_eq!(f.bar, DockSide::Left);
+    // Back in the open it stays on the left.
+    let grab = iced::Point::new(f.x + 100.0, f.y + 10.0);
+    drag_panel(
+        &mut app,
+        PanelId::BlockPalette,
+        grab,
+        iced::Point::new(1000.0, 300.0),
+    );
+    assert_eq!(
+        app.dock.float_rect(PanelId::BlockPalette).unwrap().bar,
+        DockSide::Left
+    );
+}
+
+#[test]
+fn floating_title_bar_without_docked_pallets_flips_at_the_screen_edge() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockMsg, DropTarget, FloatPanel, PanelId};
+    let mut app = dock_app();
+    let _ = app.on_dock(DockMsg::FloatOut(PanelId::Properties));
+    // Nothing is docked on the left any more.
+    assert!(app.dock_shown_group(DockSide::Left).is_none());
+    app.dock.float(FloatPanel {
+        bar: DockSide::Right,
+        ..FloatPanel::new(PanelId::Properties, 400.0, 100.0, 250.0, 300.0)
+    });
+    // Near the left edge, not touching it: no flip.
+    let target = drag_panel(
+        &mut app,
+        PanelId::Properties,
+        iced::Point::new(500.0, 110.0),
+        iced::Point::new(150.0, 110.0),
+    );
+    assert!(
+        matches!(target, Some(DropTarget::Float { x, bar: DockSide::Right, .. }) if x == 50.0),
+        "{target:?}"
+    );
+    // The frame touching the screen's left edge flips it, before the
+    // pointer reaches the edge zone (no drop preview yet).
+    let target = drag_panel(
+        &mut app,
+        PanelId::Properties,
+        iced::Point::new(150.0, 110.0),
+        iced::Point::new(90.0, 110.0),
+    );
+    assert!(
+        matches!(target, Some(DropTarget::Float { x, bar: DockSide::Left, .. }) if x == 0.0),
+        "{target:?}"
+    );
+    // Against the right edge's docked pallets it flips back.
+    let target = drag_panel(
+        &mut app,
+        PanelId::Properties,
+        iced::Point::new(100.0, 110.0),
+        iced::Point::new(1150.0, 110.0),
+    );
+    assert!(
+        matches!(
+            target,
+            Some(DropTarget::Float {
+                bar: DockSide::Right,
+                ..
+            })
+        ),
+        "{target:?}"
+    );
+    app.dock.float(FloatPanel {
+        bar: DockSide::Right,
+        ..FloatPanel::new(PanelId::Properties, 0.0, 100.0, 250.0, 300.0)
+    });
+    // The pointer in the edge zone shows the preview; backing out of it
+    // keeps the flipped side.
+    let _ = app.on_dock(DockMsg::DockGrab(PanelId::Properties));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(100.0, 110.0)));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(20.0, 110.0)));
+    assert!(matches!(
+        drag_target(&app),
+        Some(DropTarget::Edge {
+            side: DockSide::Left,
+            ..
+        })
+    ));
+    let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(300.0, 110.0)));
+    assert!(matches!(
+        drag_target(&app),
+        Some(DropTarget::Float {
+            bar: DockSide::Left,
+            ..
+        })
+    ));
     let _ = app.on_dock(DockMsg::DragRelease);
-    let g = app.dock.float_rect(PanelId::BlockPalette).unwrap();
-    assert_eq!((g.x, g.w, g.h), (f.x - 40.0, 340.0, 350.0));
+    assert_eq!(
+        app.dock.float_rect(PanelId::Properties).unwrap().bar,
+        DockSide::Left
+    );
+}
+
+#[test]
+fn floating_title_bar_without_docking_flips_at_the_screen_edge() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{FloatPanel, PanelId};
+    let mut app = dock_app();
+    app.dock.float(FloatPanel {
+        docking: false,
+        ..FloatPanel::new(PanelId::Count, 600.0, 100.0, 280.0, 300.0)
+    });
+    app.count_palette.show = true;
+    // Against the docked Properties column it does not flip...
+    drag_panel(
+        &mut app,
+        PanelId::Count,
+        iced::Point::new(700.0, 110.0),
+        iced::Point::new(350.0, 110.0),
+    );
+    let f = app.dock.float_rect(PanelId::Count).unwrap();
+    assert!(f.x > 0.0 && f.x < 290.0);
+    assert_eq!(f.bar, DockSide::Left);
+    // ...nor at the right docked column; only at the screen edge.
+    drag_panel(
+        &mut app,
+        PanelId::Count,
+        iced::Point::new(f.x + 100.0, 110.0),
+        iced::Point::new(1300.0, 110.0),
+    );
+    let f = app.dock.float_rect(PanelId::Count).unwrap();
+    assert!(f.x + f.w + crate::ui::dock::DOCK_FLOAT_BAR_W < 1600.0);
+    assert_eq!(f.bar, DockSide::Left);
+    drag_panel(
+        &mut app,
+        PanelId::Count,
+        iced::Point::new(f.x + 100.0, 110.0),
+        iced::Point::new(1590.0, 110.0),
+    );
+    assert_eq!(
+        app.dock.float_rect(PanelId::Count).unwrap().bar,
+        DockSide::Right
+    );
+}
+
+/// The screen x (in the window) of the model camera's target, measured
+/// against the current docked edges.
+fn target_screen_x(app: &OpenCADStudio, probe: glam::DVec3) -> f64 {
+    let i = app.active_tab;
+    let cam = app.tabs[i].scene.camera.borrow();
+    let (left, right) = app.dock_edge_insets();
+    let vw = f64::from(app.win_size.0 - left - right);
+    let wpp = f64::from(2.0 * cam.ortho_size()) / 900.0;
+    let cam_right = (cam.rotation * glam::Vec3::X).as_dvec3();
+    f64::from(left) + vw * 0.5 + (probe - cam.target).dot(cam_right) / wpp
+}
+
+#[test]
+fn docking_or_auto_hiding_keeps_the_drawing_in_place() {
+    use crate::app::config::DockSide;
+    use crate::ui::dock::{DockMsg, PanelId};
+    let mut app = dock_app();
+    let _ = app.update(Message::Dock(DockMsg::HoverExit));
+    let probe =
+        app.tabs[app.active_tab].scene.camera.borrow().target + glam::DVec3::new(3.0, 0.0, 0.0);
+    let at = target_screen_x(&app, probe);
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-3;
+    // Auto-hide on the left: the edge shrinks to its strip.
+    let before = app.dock_edge_insets();
+    let _ = app.update(Message::Dock(DockMsg::AutoCollapseToggle(
+        PanelId::Properties,
+    )));
+    assert!(app.dock.edge_auto_hide(DockSide::Left));
+    assert_ne!(app.dock_edge_insets(), before);
+    assert!(close(target_screen_x(&app, probe), at));
+    // Revealing the auto-hidden group draws over the drawing: no change.
+    let insets = app.dock_edge_insets();
+    let _ = app.update(Message::Dock(DockMsg::Hover(PanelId::Properties)));
+    let _ = app.update(Message::Dock(DockMsg::HoverSettled(app.dock_hover_gen)));
+    assert!(app.dock_edge_expanded(DockSide::Left));
+    assert_eq!(app.dock_edge_insets(), insets);
+    // Floating and docking the right pallet.
+    let _ = app.update(Message::Dock(DockMsg::FloatOut(PanelId::BlockPalette)));
+    assert_eq!(app.dock_edge_insets().1, 0.0);
+    assert!(close(target_screen_x(&app, probe), at));
+    let _ = app.update(Message::Dock(DockMsg::DockTo(
+        PanelId::BlockPalette,
+        DockSide::Right,
+    )));
+    assert!(app.dock_edge_insets().1 > 0.0);
+    assert!(close(target_screen_x(&app, probe), at));
+    // Sizing a docked group's width.
+    let _ = app.update(Message::Dock(DockMsg::ResizeGrab(PanelId::BlockPalette)));
+    let _ = app.update(Message::Dock(DockMsg::DragMove(iced::Point::new(
+        1300.0, 300.0,
+    ))));
+    let _ = app.update(Message::Dock(DockMsg::DragMove(iced::Point::new(
+        1250.0, 300.0,
+    ))));
+    let _ = app.update(Message::Dock(DockMsg::DragRelease));
+    assert!(close(target_screen_x(&app, probe), at));
 }
 
 #[test]
@@ -548,6 +845,11 @@ const VIEW_SIZE: iced::Size = iced::Size::new(1600.0, 900.0);
 
 /// Centre of the first text `label` in the real view.
 fn find_in_view(app: &OpenCADStudio, label: &str) -> iced::Point {
+    try_find_in_view(app, label).unwrap_or_else(|| panic!("{label} not found"))
+}
+
+/// Centre of the first text `label` in the real view, if it is there.
+fn try_find_in_view(app: &OpenCADStudio, label: &str) -> Option<iced::Point> {
     use iced_test::core::widget;
     use iced_test::runtime::user_interface::{Cache, UserInterface};
     use iced_test::Selector;
@@ -557,9 +859,9 @@ fn find_in_view(app: &OpenCADStudio, label: &str) -> iced::Point {
     ui.operate(&renderer, &mut widget::operation::black_box(&mut find));
     match widget::Operation::finish(&find) {
         widget::operation::Outcome::Some(Some(target)) => {
-            target.visible_bounds().expect("visible").center()
+            target.visible_bounds().map(|b| b.center())
         }
-        _ => panic!("{label} not found"),
+        _ => None,
     }
 }
 
@@ -750,6 +1052,73 @@ fn docked_title_bar_double_click_floats_the_pallet_in_the_real_view() {
             app.dock.float_rect(PanelId::BlockPalette).is_some(),
             "a double-click on a docked title bar floats the pallet"
         );
+    });
+}
+
+#[test]
+fn dragging_a_floating_pallet_moves_the_real_window_in_the_real_view() {
+    // Building the real view is deeper than a default test thread's stack.
+    with_stack(|| {
+        use crate::app::config::DockSide;
+        use crate::ui::dock::{DockMsg, DropTarget, FloatPanel, PanelId};
+        let mut app = dock_app();
+        app.dock.float(FloatPanel::new(
+            PanelId::BlockPalette,
+            500.0,
+            200.0,
+            260.0,
+            400.0,
+        ));
+        let saved = app.dock.float_rect(PanelId::BlockPalette).unwrap();
+        // Some text inside the pallet marks where its window is drawn.
+        let label = "Current Drawing";
+        let before = find_in_view(&app, label);
+        let _ = app.on_dock(DockMsg::DockGrab(PanelId::BlockPalette));
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(510.0, 210.0)));
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(610.0, 260.0)));
+        assert!(matches!(
+            drag_target(&app),
+            Some(DropTarget::Float { x, y, .. }) if x == 600.0 && y == 250.0
+        ));
+        // The window itself follows the pointer; no ghost with its title.
+        let during = find_in_view(&app, label);
+        assert_eq!(
+            (during.x - before.x, during.y - before.y),
+            (100.0, 50.0),
+            "the real window moves with the pointer"
+        );
+        assert!(
+            try_find_in_view(&app, "Block Palette").is_none(),
+            "no drop ghost for a pallet that already floats"
+        );
+        // The layout only changes on release.
+        assert_eq!(app.dock.float_rect(PanelId::BlockPalette), Some(saved));
+        // Over a dock zone the window hides and the column preview shows.
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(20.0, 300.0)));
+        assert!(matches!(
+            drag_target(&app),
+            Some(
+                DropTarget::Join {
+                    side: DockSide::Left,
+                    ..
+                } | DropTarget::Edge {
+                    side: DockSide::Left,
+                    ..
+                }
+            )
+        ));
+        assert!(try_find_in_view(&app, label).is_none());
+        assert!(
+            try_find_in_view(&app, "Block Palette").is_some(),
+            "column ghost"
+        );
+        // Back in the open it shows again, and lands where it was drawn.
+        let _ = app.on_dock(DockMsg::DragMove(iced::Point::new(610.0, 260.0)));
+        let during = find_in_view(&app, label);
+        let _ = app.on_dock(DockMsg::DragRelease);
+        assert_eq!(find_in_view(&app, label), during);
+        let f = app.dock.float_rect(PanelId::BlockPalette).unwrap();
+        assert_eq!((f.x, f.y), (600.0, 250.0));
     });
 }
 

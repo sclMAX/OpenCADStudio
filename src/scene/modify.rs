@@ -265,8 +265,19 @@ impl Scene {
         // block, and the render draws those sub-entities directly (not the
         // definition points). Transform them with the dimension, or it would
         // stay drawn in place while only its def points move.
+        // Turning or mirroring a dimension lays its text out again (it keeps
+        // reading upright), which moving the baked picture can't do: those
+        // detach the picture, so the dimension draws from its definition and
+        // the next save bakes it anew.
+        let relayout = matches!(
+            t,
+            EntityTransform::Rotate { .. }
+                | EntityTransform::Mirror { .. }
+                | EntityTransform::Affine(_)
+        );
         let dim_block_subs: Vec<(Handle, Option<EntityTransform>)> = handles
             .iter()
+            .filter(|_| !relayout)
             .filter_map(|&h| match self.document.get_entity(h) {
                 Some(entity @ EntityType::Dimension(d)) => {
                     let bn = d.base().block_name.clone();
@@ -304,6 +315,13 @@ impl Scene {
                 render_graph::clear_dim_picture_placement(entity);
                 if mirror_true {
                     mirror_true_text_flags(entity);
+                }
+            }
+            // Only the reference goes: the old picture stays a block of its
+            // own, which an undo points back to, and is not saved again.
+            if relayout {
+                if let Some(EntityType::Dimension(d)) = self.document.get_entity_mut(h) {
+                    d.base_mut().block_name.clear();
                 }
             }
             let rebuilt_history = self.transform_solid_history(h, t);
@@ -591,22 +609,44 @@ impl Scene {
     }
 
     /// Give a freshly-cloned entity brand-new handles for every *inline*
-    /// sub-entity that stores one (INSERT attributes, 3D-polyline vertices).
-    /// `document.add_entity` only assigns the top-level handle, so without this
-    /// a copy keeps its source's sub-handles — duplicate handles that corrupt
-    /// the saved DWG (file won't reopen in other CAD apps). Vertices that don't
-    /// store a handle (LwPolyline / heavy 2D polyline) get one from the writer,
-    /// so they need no fix-up here. (#129)
-    pub(super) fn reset_clone_subhandles(doc: &mut codec::CadDocument, entity: &mut EntityType) {
+    /// sub-entity that stores one (INSERT attributes and SEQEND, 3D-polyline
+    /// vertices, polyface vertices / faces / SEQEND, polygon-mesh vertices).
+    /// `document.add_entity` only assigns the top-level handle, and the DWG
+    /// writer reuses every non-null stored sub-handle, so without this a copy
+    /// writes its source's sub-handles again — duplicate handles that corrupt
+    /// the saved DWG (other CAD apps attach the copies to the source's
+    /// vertices, or drop them). Vertices that don't store a handle
+    /// (LwPolyline / heavy 2D polyline) get one from the writer, so they need
+    /// no fix-up here. Shared with the clipboard paste path. (#129)
+    pub(crate) fn reset_clone_subhandles(doc: &mut codec::CadDocument, entity: &mut EntityType) {
         match entity {
             EntityType::Insert(ins) => {
                 for att in ins.attributes.iter_mut() {
                     att.common.handle = doc.allocate_handle();
                 }
+                if ins.seqend_handle.is_some() {
+                    ins.seqend_handle = Some(doc.allocate_handle());
+                }
             }
             EntityType::Polyline3D(p) => {
                 for v in p.vertices.iter_mut() {
                     v.handle = doc.allocate_handle();
+                }
+            }
+            EntityType::PolyfaceMesh(m) => {
+                for v in m.vertices.iter_mut() {
+                    v.common.handle = doc.allocate_handle();
+                }
+                for f in m.faces.iter_mut() {
+                    f.common.handle = doc.allocate_handle();
+                }
+                if m.seqend_handle.is_some() {
+                    m.seqend_handle = Some(doc.allocate_handle());
+                }
+            }
+            EntityType::PolygonMesh(m) => {
+                for v in m.vertices.iter_mut() {
+                    v.common.handle = doc.allocate_handle();
                 }
             }
             _ => {}
@@ -848,6 +888,9 @@ impl Scene {
         br.handle = br_handle;
         br.block_entity_handle = block_handle;
         br.block_end_handle = end_handle;
+        // The DWG writer takes the anonymous bit from the flag alone; without
+        // it AutoCAD's audit reports `Invalid anonymous block "*D<n>"`.
+        br.flags.anonymous = true;
         self.document.block_records.add(br).ok()?;
         let mut block = Block::new(&new_name, codec::types::Vector3::ZERO);
         block.common.handle = block_handle;
@@ -2728,6 +2771,24 @@ mod define_transformed_block_xdict_tests {
         );
     }
 
+    #[test]
+    fn clone_block_is_flagged_anonymous() {
+        let mut scene = Scene::new();
+        let line = scene
+            .document
+            .add_entity(codec::EntityType::Line(codec::entities::Line::new()))
+            .unwrap();
+        let subs = vec![scene.document.get_entity(line).unwrap().clone()];
+        let name = scene
+            .define_transformed_block(
+                &subs,
+                &crate::command::EntityTransform::Translate(glam::DVec3::ZERO),
+            )
+            .expect("clone block must be created");
+        let record = scene.document.block_records.get(&name).unwrap();
+        assert!(record.flags.anonymous);
+    }
+
     /// Cloned sub-entities must not share the source's extension dictionary.
     /// `define_transformed_block` clones each sub wholesale; without clearing
     /// `xdictionary_handle` the clone claims the source's dictionary and
@@ -3594,5 +3655,130 @@ mod copy_entities_xdict_tests {
             panic!("source B root must still exist");
         };
         assert_eq!(b_d.get("SUB"), Some(b_sub));
+    }
+}
+
+#[cfg(test)]
+mod copy_entities_subhandle_tests {
+    use super::*;
+    use crate::command::EntityTransform;
+    use codec::entities::{
+        AttributeEntity, Insert, PolyfaceFace, PolyfaceMesh, PolyfaceVertex, PolygonMeshEntity,
+        PolygonMeshVertex,
+    };
+    use codec::types::Vector3;
+    use glam::DVec3;
+
+    /// A polyface mesh as the DWG reader returns it: every vertex, face and
+    /// the SEQEND carry their own handle.
+    fn loaded_polyface(doc: &mut codec::CadDocument) -> PolyfaceMesh {
+        let mut mesh = PolyfaceMesh::new();
+        for (x, y) in [(20.0, 0.0), (30.0, 0.0), (30.0, 10.0), (20.0, 10.0)] {
+            let mut v = PolyfaceVertex::new(Vector3::new(x, y, 0.0));
+            v.common.handle = doc.allocate_handle();
+            mesh.add_vertex(v);
+        }
+        let mut face = PolyfaceFace::quad(1, 2, 3, 4);
+        face.common.handle = doc.allocate_handle();
+        mesh.add_face(face);
+        mesh.seqend_handle = Some(doc.allocate_handle());
+        mesh
+    }
+
+    fn sub_handles(e: &EntityType) -> Vec<codec::Handle> {
+        match e {
+            EntityType::Insert(ins) => ins
+                .attributes
+                .iter()
+                .map(|a| a.common.handle)
+                .chain(ins.seqend_handle)
+                .collect(),
+            EntityType::PolyfaceMesh(m) => m
+                .vertices
+                .iter()
+                .map(|v| v.common.handle)
+                .chain(m.faces.iter().map(|f| f.common.handle))
+                .chain(m.seqend_handle)
+                .collect(),
+            EntityType::PolygonMesh(m) => m.vertices.iter().map(|v| v.common.handle).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// COPY must give every stored sub-entity handle of the copy a new value.
+    /// The DWG writer reuses non-null sub-handles, so a shared one makes the
+    /// copy point at the source's vertices / SEQEND in the saved file.
+    #[test]
+    fn copy_gives_complex_entities_fresh_sub_handles() {
+        let mut scene = Scene::new();
+        let doc = &mut scene.document;
+
+        let mesh = loaded_polyface(doc);
+        let mut grid = PolygonMeshEntity::new();
+        grid.m_vertex_count = 2;
+        grid.n_vertex_count = 2;
+        for (x, y) in [(40.0, 0.0), (40.0, 10.0), (50.0, 0.0), (50.0, 10.0)] {
+            let mut v = PolygonMeshVertex::at(Vector3::new(x, y, 0.0));
+            v.common.handle = doc.allocate_handle();
+            grid.vertices.push(v);
+        }
+        let mut ins = Insert::new("B", Vector3::new(0.0, 0.0, 0.0));
+        let mut att = AttributeEntity::new("TAG1".into(), "val".into());
+        att.common.handle = doc.allocate_handle();
+        ins.attributes.push(att);
+        ins.seqend_handle = Some(doc.allocate_handle());
+
+        let sources: Vec<codec::Handle> = [
+            EntityType::PolyfaceMesh(mesh),
+            EntityType::PolygonMesh(grid),
+            EntityType::Insert(ins),
+        ]
+        .into_iter()
+        .map(|e| doc.add_entity(e).unwrap())
+        .collect();
+
+        let copies =
+            scene.copy_entities(&sources, &EntityTransform::Translate(DVec3::new(100.0, 0.0, 0.0)));
+        assert_eq!(copies.len(), sources.len());
+
+        let mut seen = std::collections::HashSet::new();
+        for h in sources.iter().chain(copies.iter()) {
+            let subs = sub_handles(scene.document.get_entity(*h).unwrap());
+            assert!(!subs.is_empty());
+            for s in subs {
+                assert!(!s.is_null(), "sub-handle of {h:?} must be set");
+                assert!(seen.insert(s), "sub-handle {s:?} is shared between entities");
+            }
+        }
+    }
+
+    /// End to end through DWG: two copies of a polyface each read back with
+    /// their own four vertices and face, at their own position.
+    #[test]
+    fn copied_polyfaces_keep_their_vertices_through_a_dwg_roundtrip() {
+        let mut scene = Scene::new();
+        let mesh = loaded_polyface(&mut scene.document);
+        let src = scene.document.add_entity(EntityType::PolyfaceMesh(mesh)).unwrap();
+        for dx in [100.0, 200.0] {
+            scene.copy_entities(&[src], &EntityTransform::Translate(DVec3::new(dx, 0.0, 0.0)));
+        }
+
+        let bytes = codec::DwgWriter::write_to_vec(&scene.document).unwrap();
+        let reopened = codec::DwgReader::from_stream(std::io::Cursor::new(bytes))
+            .read()
+            .unwrap();
+        let mut first_x: Vec<f64> = reopened
+            .entities()
+            .filter_map(|e| match e {
+                EntityType::PolyfaceMesh(m) => {
+                    assert_eq!(m.vertices.len(), 4, "every polyface keeps its vertices");
+                    assert_eq!(m.faces.len(), 1, "every polyface keeps its face");
+                    Some(m.vertices[0].location.x)
+                }
+                _ => None,
+            })
+            .collect();
+        first_x.sort_by(f64::total_cmp);
+        assert_eq!(first_x, vec![20.0, 120.0, 220.0]);
     }
 }

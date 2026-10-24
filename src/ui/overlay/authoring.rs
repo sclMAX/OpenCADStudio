@@ -1,7 +1,7 @@
 use iced::{widget::canvas, Color, Point, Size};
 
 #[derive(Default)]
-pub(crate) struct AuthoringFeedback {
+pub struct AuthoringFeedback {
     pub dependencies: Vec<[Point; 2]>,
     pub markers: Vec<Point>,
     pub clip: iced::Rectangle,
@@ -9,7 +9,7 @@ pub(crate) struct AuthoringFeedback {
 
 /// Display-only settings; no geometry or drawing history depends on these values.
 #[derive(Clone, Debug)]
-pub(crate) struct AuthoringVisualOptions {
+pub struct AuthoringVisualOptions {
     pub action: Color,
     pub parameter: Color,
     pub grip: Color,

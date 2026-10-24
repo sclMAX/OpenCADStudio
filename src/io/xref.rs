@@ -1001,6 +1001,9 @@ fn import_xref_symbols(
                     let new_h = doc.allocate_handle();
                     cloned.handle = new_h;
                     cloned.owner = Handle::NULL;
+                    // The source drawing's reactors; the bound images
+                    // drop their reactor links too.
+                    cloned.reactors.clear();
                     doc.objects
                         .insert(new_h, ObjectType::ImageDefinition(cloned));
                     maps.image_defs.insert(*handle, new_h);
@@ -1615,16 +1618,20 @@ pub fn collect_entries_with_prev(
             }
         }
     }
-    let mut nested_cache: HashMap<String, CadDocument> = HashMap::default();
+    // Cached nested documents are shared via `Arc`: the enumeration below is
+    // strictly read-only, so a hit clones the pointer instead of deep-copying
+    // the whole document (entities, objects, block records) per access.
+    let mut nested_cache: HashMap<String, Arc<CadDocument>> = HashMap::default();
     while let Some((parent_key, parent_path)) = work.pop() {
         let cache_key = normalize_lexical(&parent_path.to_string_lossy());
         let nested_doc = if let Some(cached) = nested_cache.get(&cache_key) {
-            cached.clone()
+            Arc::clone(cached)
         } else {
             match super::load_file(&parent_path) {
                 Ok(nested) => {
-                    nested_cache.insert(cache_key, nested.clone());
-                    nested
+                    let shared = Arc::new(nested);
+                    nested_cache.insert(cache_key, Arc::clone(&shared));
+                    shared
                 }
                 Err(_) => continue,
             }

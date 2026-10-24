@@ -19,11 +19,14 @@ use codec::entities::{
     LwPolyline, LwVertex, MText, Point, Polyline3D, Spline, Text, TextHorizontalAlignment,
     TextVerticalAlignment,
 };
+use codec::tables::DimStyle;
 use codec::types::{Color, LineWeight, Vector2, Vector3};
 use codec::EntityType;
 
 use crate::command::{CadCommand, CmdOption, CmdResult, InputKind};
-use crate::scene::model::underlay_vector::{By, DgnElement, DgnGeom, DgnImport, P3};
+use crate::scene::model::underlay_vector::{
+    By, DgnDimLook, DgnDimStyle, DgnElement, DgnGeom, DgnImport, P3,
+};
 
 /// What one import reads and where it goes.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,8 +77,9 @@ pub struct Converted {
     /// Layers that come in turned off.
     pub layers_off: Vec<String>,
     pub styles: Vec<(String, String)>,
-    /// Dimension styles, by name, in the file's table order.
-    pub dim_styles: Vec<String>,
+    /// Dimension styles, by name, in the file's table order, with the
+    /// values the file gives them (none: the drawing's style of the name).
+    pub dim_styles: Vec<(String, Option<DimStyle>)>,
     pub blocks: Vec<(String, Vec<EntityType>)>,
     pub entities: Vec<EntityType>,
 }
@@ -213,6 +217,30 @@ fn ocs_angle(normal: P3, d: P3) -> f64 {
 /// A point in the entity coordinate system of `normal`.
 fn to_ocs(normal: P3, p: P3) -> Vector3 {
     codec::types::Matrix3::arbitrary_axis(v3(normal)).transpose() * v3(p)
+}
+
+/// The unit normal of the plane the points lie in (Newell's, turned to
+/// +z), `None` when they leave it by more than a millionth of their span.
+/// Points on one line lie in the XY plane's parallel.
+fn plane_normal(points: &[P3]) -> Option<P3> {
+    let mut n = [0.0; 3];
+    for (k, p) in points.iter().enumerate() {
+        let q = points[(k + 1) % points.len()];
+        n[0] += (p[1] - q[1]) * (p[2] + q[2]);
+        n[1] += (p[2] - q[2]) * (p[0] + q[0]);
+        n[2] += (p[0] - q[0]) * (p[1] + q[1]);
+    }
+    let len = norm(n);
+    let span = points.iter().map(|p| norm(sub(*p, points[0]))).fold(0.0, f64::max);
+    if !(len > 1e-12 * span * span) {
+        return flat(points).then_some([0.0, 0.0, 1.0]);
+    }
+    let mut n = [n[0] / len, n[1] / len, n[2] / len];
+    if n[2] < 0.0 || (n[2] == 0.0 && (n[1] < 0.0 || (n[1] == 0.0 && n[0] < 0.0))) {
+        n = [-n[0], -n[1], -n[2]];
+    }
+    let off = |p: &P3| dot(sub(*p, points[0]), n).abs();
+    points.iter().all(|p| off(p) <= 1e-6 * span.max(1e-12)).then_some(n)
 }
 
 /// True when every point is at the first one's z.
@@ -727,9 +755,72 @@ fn dim_style_name(import: &DgnImport, id: u32) -> String {
     import
         .dim_styles
         .iter()
-        .find(|(i, _)| *i == id)
-        .map(|(_, name)| symbol_name(name))
+        .find(|s| s.id == id)
+        .map(|s| symbol_name(&s.name))
         .unwrap_or_else(|| "Standard".to_string())
+}
+
+/// A V8 font (number, kind) as its name and the font file it imports with.
+fn dgn_font(import: &DgnImport, font: (u8, u8)) -> Option<(&str, &str)> {
+    import
+        .fonts
+        .iter()
+        .find(|f| (f.0, f.1) == font)
+        .map(|f| (f.2.as_str(), f.3.as_str()))
+}
+
+/// The text style a V8 dimension style's text takes: "Style" and its
+/// font's name, with that font's file.
+fn dim_text_style(import: &DgnImport, ds: &DgnDimStyle) -> (String, String) {
+    match dgn_font(import, ds.font) {
+        Some((name, file)) => (format!("Style{name}"), file.to_string()),
+        None => ("Standard".to_string(), "txt.shx".to_string()),
+    }
+}
+
+/// A V8 dimension style as a dimension style: its values over the
+/// defaults (lengths times `k`), its text in [`dim_text_style`], closed
+/// arrows and text beside the first extension line, as the reference
+/// import gives every such style. Decimal accuracy reads as engineering
+/// units in a feet and inches file, a fractional one as architectural.
+fn dim_style_values(import: &DgnImport, ds: &DgnDimStyle, k: f64, name: &str) -> DimStyle {
+    let mut s = DimStyle::dxf_defaults(name);
+    s.dimtxt = ds.text_height * k;
+    s.dimasz = ds.arrow * k;
+    s.dimexo = ds.ext_offset * k;
+    s.dimexe = ds.ext_extension * k;
+    s.dimgap = ds.gap * k;
+    s.dimdli = ds.stack_offset * k;
+    s.dimcen = ds.center * k;
+    s.dimscale = ds.scale;
+    let bits = ds.accuracy & 0x7f;
+    let places = if bits == 0 { 0 } else { bits.trailing_zeros() as i16 + 1 };
+    s.dimdec = places;
+    s.dimtdec = places;
+    s.dimadec = i16::from(ds.angle_places);
+    s.dimlunit = if ds.accuracy & 0x80 == 0 && bits != 0 {
+        4
+    } else if ds.two_units {
+        3
+    } else {
+        2
+    };
+    s.dimzin = if ds.trailing_zeros { 3 } else { 11 };
+    s.dimtad = if ds.inline_text { 0 } else { 1 };
+    s.dimtih = ds.horizontal_text;
+    s.dimtoh = ds.horizontal_text;
+    s.dimtofl = ds.line_inside;
+    s.dimsah = true;
+    s.dimblk1_name = "_Closed".to_string();
+    s.dimblk2_name = "_Closed".to_string();
+    // ponytail: text beside the first extension line on every imported style,
+    // as every exported sample read; the record bit for it is not known.
+    s.dimjust = 1;
+    s.dimaltd = 3;
+    s.dimalttd = 3;
+    s.dimaltf = 1.0 / 25.4 / if ds.two_units { 12.0 } else { 1.0 };
+    s.dimtxsty = dim_text_style(import, ds).0;
+    s
 }
 
 /// A V8 dimension as a dimension object, in the dimension's own style:
@@ -738,12 +829,17 @@ fn dim_style_name(import: &DgnImport, id: u32) -> String {
 /// three-point angle (vertex, first, second point) with its arc through the
 /// first point; radius (11) and diameter (12) from the centre and a point
 /// on the circle, the text at the third point.
+/// It takes `text` and the variable `overrides` the reference import gives.
+/// An angle's arc point follows from its text `layout`.
 fn dimension_entity(
     kind: u8,
     points: &[P3],
     offset: f64,
     axes: &[[f64; 2]; 2],
     style: &str,
+    text: String,
+    overrides: &[(i16, codec::xdata::XDataValue)],
+    layout: &DimTextLayout,
 ) -> Option<EntityType> {
     use codec::entities::{Dimension, DimensionDiameter, DimensionLinear, DimensionRadius};
     let at = |k: usize| points.get(k).copied();
@@ -765,11 +861,9 @@ fn dimension_entity(
             }
             let x = [x[0] / length, x[1] / length];
             let line = along(p1, y, offset);
-            let t = |p: P3| (p[0] - line[0]) * x[0] + (p[1] - line[1]) * x[1];
             let mut d = DimensionLinear::rotated(v3(p0), v3(p1), x[1].atan2(x[0]));
             d.definition_point = v3(line);
             d.base.actual_measurement = d.measurement();
-            d.base.text_middle_point = v3(along(line, x, 0.5 * (t(p0) + t(p1))));
             EntityType::Dimension(Box::new(Dimension::Linear(d)))
         }
         5 => {
@@ -780,8 +874,27 @@ fn dimension_entity(
                 sweep += std::f64::consts::TAU;
             }
             let radius = norm(sub(first, vertex));
-            // The arc's point a third of the way round from the first line.
-            let mid = a0 + sweep / 3.0;
+            // The arc's point a third of the way round from the first line;
+            // two thirds when the text, laid beside the second extension line
+            // (a terminator, three gaps when it breaks the arc, one when it
+            // does not, and half its width along the arc), fits between the
+            // lines and reaches past the middle.
+            let label = format!("{:.*}\u{b0}", layout.angle_places, sweep.to_degrees());
+            let width = crate::entities::text_support::text_local_bounds(
+                &layout.font,
+                &label,
+                layout.height as f32,
+                1.0,
+                0.0,
+            )
+            .map(|b| f64::from(b.ink_max[0] - b.ink_min[0]))
+            .unwrap_or(0.0);
+            let length = radius * sweep;
+            let gaps = if layout.in_line { 3.0 } else { 1.0 };
+            let beside = layout.arrow + gaps * layout.gap + width / 2.0;
+            let fits = length >= layout.arrow + gaps * layout.gap + width;
+            let third = if fits && beside > length / 2.0 { 2.0 } else { 1.0 };
+            let mid = a0 + sweep * third / 3.0;
             let arc = [vertex[0] + radius * mid.cos(), vertex[1] + radius * mid.sin(), vertex[2]];
             let dvec = |p: P3| glam::DVec3::from_array(p);
             crate::modules::annotate::angular_dim::angular_three_point_entity(
@@ -806,24 +919,96 @@ fn dimension_entity(
                 d.leader_length = norm(sub(text, point));
                 Dimension::Diameter(d)
             };
-            let base = d.base_mut();
-            base.text_middle_point = v3(text);
-            base.insertion_point = v3(text);
-            base.text_user_positioned = true;
+            // A diameter's text stays where the file has it; a radius's text
+            // is laid out by its style along its arc point's direction.
+            if kind == 12 {
+                let base = d.base_mut();
+                base.text_middle_point = v3(text);
+                base.insertion_point = v3(text);
+                base.text_user_positioned = true;
+            }
             EntityType::Dimension(Box::new(d))
         }
         _ => return None,
     };
     if let EntityType::Dimension(d) = &mut entity {
         d.base_mut().style_name = style.to_string();
+        crate::entities::dimension::set_dimension_text_override(d.base_mut(), Some(text));
     }
-    // An imported dimension draws no centre mark (DIMCEN 0 on the object).
-    crate::entities::dim_override::set_on_entity(
-        &mut entity,
-        crate::entities::dim_override::DIMCEN,
-        Some(codec::xdata::XDataValue::Real(0.0)),
-    );
+    for (code, value) in overrides {
+        crate::entities::dim_override::set_on_entity(&mut entity, *code, Some(value.clone()));
+    }
     Some(entity)
+}
+
+/// What lays out an imported dimension's text: its height, terminator,
+/// gap and font, and whether it sits in the dimension line.
+struct DimTextLayout {
+    height: f64,
+    arrow: f64,
+    gap: f64,
+    font: String,
+    in_line: bool,
+    angle_places: usize,
+}
+
+/// The text, the variable overrides and the text layout an imported
+/// dimension takes: its text carries its colour and, when its font is not
+/// its style's text font, that font; it draws no centre mark, fits text
+/// and arrows best, and takes its own text height, terminator, extension
+/// line offset and extension (each over its style's scale squared, as the
+/// reference reads them), horizontal text as its style and, linear or
+/// angular, text beside the first extension line. Text in its line takes
+/// the margin as its gap; text off the line sits outside it at its own gap.
+fn dimension_settings(
+    import: &DgnImport,
+    kind: u8,
+    look: &DgnDimLook,
+    style: Option<&DgnDimStyle>,
+    color: u16,
+) -> (String, Vec<(i16, codec::xdata::XDataValue)>, DimTextLayout) {
+    use crate::entities::dim_override as ov;
+    use codec::xdata::XDataValue::{Integer16, Real};
+    let own = dgn_font(import, look.font);
+    let style_font = style.and_then(|s| dgn_font(import, s.font));
+    let differs = |file: &str| style_font.is_some_and(|(_, f)| !f.eq_ignore_ascii_case(file));
+    let font = match own {
+        Some((name, file)) if differs(file) && look.font.1 == 4 => {
+            format!(r"\F{name}|b0|i0|c0;")
+        }
+        Some((name, file)) if differs(file) => format!(r"\F{name}|c0;"),
+        _ => String::new(),
+    };
+    let text = format!(r"{{{font}\C{color};<>}}");
+    let scale = style.map(|s| s.scale).filter(|s| *s > 0.0).unwrap_or(1.0);
+    let length = |v: f64| v / (scale * scale);
+    let gap = length(if look.text_outside { look.gap } else { look.margin });
+    let horizontal = i16::from(style.is_some_and(|s| s.horizontal_text));
+    let mut overrides = vec![
+        (ov::DIMCEN, Real(0.0)),
+        (ov::DIMATFIT, Integer16(3)),
+        (ov::DIMSCALE, Real(scale)),
+        (ov::DIMTXT, Real(length(look.text_height))),
+        (ov::DIMASZ, Real(length(look.arrow))),
+        (ov::DIMEXO, Real(length(look.ext_offset))),
+        (ov::DIMEXE, Real(length(look.ext_extension))),
+        (ov::DIMGAP, Real(gap)),
+        (ov::DIMTAD, Integer16(if look.text_outside { 2 } else { 0 })),
+        (ov::DIMTIH, Integer16(horizontal)),
+        (ov::DIMTOH, Integer16(horizontal)),
+    ];
+    if matches!(kind, 1 | 5) {
+        overrides.push((ov::DIMJUST, Integer16(1)));
+    }
+    let layout = DimTextLayout {
+        height: length(look.text_height),
+        arrow: length(look.arrow),
+        gap,
+        font: own.or(style_font).map_or("txt", |f| f.0).to_string(),
+        in_line: !look.text_outside,
+        angle_places: style.map_or(0, |s| usize::from(s.angle_places)),
+    };
+    (text, overrides, layout)
 }
 
 /// A mesh's face loops (1-based point numbers, a negative one hiding the
@@ -1072,7 +1257,15 @@ impl<'a> Converter<'a> {
                 let mut s = Spline::new();
                 s.degree = 3;
                 s.fit_points = fit.iter().map(|p| v3(*p)).collect();
-                s.flags.planar = true;
+                // A curve through points in one plane is planar about that
+                // plane's normal; a 3D curve off any plane is not.
+                match plane_normal(&fit) {
+                    Some(n) => {
+                        s.flags.planar = true;
+                        s.normal = v3(n);
+                    }
+                    None => s.flags.planar = false,
+                }
                 vec![EntityType::Spline(s)]
             }
             DgnGeom::Dimension {
@@ -1081,9 +1274,15 @@ impl<'a> Converter<'a> {
                 offset,
                 axes,
                 style,
+                look,
             } => {
+                let record = self.import.dim_styles.iter().find(|s| s.id == *style);
+                let (text, overrides, layout) =
+                    dimension_settings(self.import, *kind, look, record, color_code(element.color));
                 let style = dim_style_name(self.import, *style);
-                dimension_entity(*kind, points, *offset, axes, &style).into_iter().collect()
+                dimension_entity(*kind, points, *offset, axes, &style, text, &overrides, &layout)
+                    .into_iter()
+                    .collect()
             }
             DgnGeom::Mesh { points, loops } => polyfaces(points, loops),
             DgnGeom::Leader { points, style } => {
@@ -1394,11 +1593,17 @@ pub fn convert(import: &DgnImport, sub_units: bool, explode_text_nodes: bool) ->
             c.layer(&element, false);
         }
     }
-    // Every dimension style of the file's table comes in, used or not.
-    for (_, name) in &import.dim_styles {
-        let name = symbol_name(name);
-        if !c.out.dim_styles.contains(&name) {
-            c.out.dim_styles.push(name);
+    // Every dimension style of the file's table comes in, used or not, with
+    // its values and its text style.
+    for ds in &import.dim_styles {
+        let name = symbol_name(&ds.name);
+        if !c.out.dim_styles.iter().any(|s| s.0 == name) {
+            let (style, font) = dim_text_style(import, ds);
+            if style != "Standard" && !c.out.styles.iter().any(|s| s.0 == style) {
+                c.out.styles.push((style, font));
+            }
+            let values = dim_style_values(import, ds, k, &name);
+            c.out.dim_styles.push((name, Some(values)));
         }
     }
     // Every text style of the file's table comes in, used or not.

@@ -241,6 +241,9 @@ pub(crate) fn request_kind(req: &HostRequest) -> &'static str {
         HostRequest::InteractiveEvent { .. } => "InteractiveEvent",
         HostRequest::GetPrompt { .. } => "GetPrompt",
         HostRequest::NeedsEntityPick { .. } => "NeedsEntityPick",
+        HostRequest::IsSelectionGathering { .. } => "IsSelectionGathering",
+        HostRequest::AcceptsDragSelection { .. } => "AcceptsDragSelection",
+        HostRequest::SelectionRejectsLockedLayers { .. } => "SelectionRejectsLockedLayers",
         HostRequest::ExecuteCode { .. } => "ExecuteCode",
         HostRequest::DropInteractive { .. } => "DropInteractive",
         HostRequest::CursorMove { .. } => "CursorMove",
@@ -767,6 +770,81 @@ impl PluginProcess {
                 HostRequest::NeedsEntityPick { command_id },
                 "NeedsEntityPick",
                 "needs_entity_pick",
+                |resp| match resp {
+                    HostResponse::Bool(b) => Ok(b),
+                    other => Err(Box::new(other)),
+                },
+            )
+        }
+    }
+
+    /// Ask the plugin process whether an interactive command is in selection-gathering mode.
+    pub fn is_selection_gathering(&self, command_id: u64) -> Result<bool, PluginError> {
+        if let Some(v4) = &self.v4 {
+            let resp = v4.call(
+                &mut NullHost,
+                HostRequest::IsSelectionGathering { command_id },
+                &mut |_| {},
+            )?;
+            match resp {
+                HostResponse::Bool(b) => Ok(b),
+                other => Err(PluginError::UnexpectedResponse(Box::new(other))),
+            }
+        } else {
+            self.call_simple(
+                HostRequest::IsSelectionGathering { command_id },
+                "IsSelectionGathering",
+                "is_selection_gathering",
+                |resp| match resp {
+                    HostResponse::Bool(b) => Ok(b),
+                    other => Err(Box::new(other)),
+                },
+            )
+        }
+    }
+
+    /// Ask the plugin process whether an interactive command accepts drag selections.
+    pub fn accepts_drag_selection(&self, command_id: u64) -> Result<bool, PluginError> {
+        if let Some(v4) = &self.v4 {
+            let resp = v4.call(
+                &mut NullHost,
+                HostRequest::AcceptsDragSelection { command_id },
+                &mut |_| {},
+            )?;
+            match resp {
+                HostResponse::Bool(b) => Ok(b),
+                other => Err(PluginError::UnexpectedResponse(Box::new(other))),
+            }
+        } else {
+            self.call_simple(
+                HostRequest::AcceptsDragSelection { command_id },
+                "AcceptsDragSelection",
+                "accepts_drag_selection",
+                |resp| match resp {
+                    HostResponse::Bool(b) => Ok(b),
+                    other => Err(Box::new(other)),
+                },
+            )
+        }
+    }
+
+    /// Ask the plugin process whether an interactive command rejects locked layers during selection.
+    pub fn selection_rejects_locked_layers(&self, command_id: u64) -> Result<bool, PluginError> {
+        if let Some(v4) = &self.v4 {
+            let resp = v4.call(
+                &mut NullHost,
+                HostRequest::SelectionRejectsLockedLayers { command_id },
+                &mut |_| {},
+            )?;
+            match resp {
+                HostResponse::Bool(b) => Ok(b),
+                other => Err(PluginError::UnexpectedResponse(Box::new(other))),
+            }
+        } else {
+            self.call_simple(
+                HostRequest::SelectionRejectsLockedLayers { command_id },
+                "SelectionRejectsLockedLayers",
+                "selection_rejects_locked_layers",
                 |resp| match resp {
                     HostResponse::Bool(b) => Ok(b),
                     other => Err(Box::new(other)),

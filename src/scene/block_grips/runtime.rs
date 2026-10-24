@@ -70,6 +70,40 @@ pub fn grips(doc: &CadDocument, definition: Handle, p: &Parameter, value: Value)
         .collect()
 }
 
+/// Configured grip locations filtered by native action key-point association.
+pub fn action_grips(
+    doc: &CadDocument,
+    definition: Handle,
+    parameter: &Parameter,
+    value: Value,
+) -> Vec<Grip> {
+    let mask = actions::grip_roles::mask(doc, definition, parameter);
+    grips(doc, definition, parameter, value)
+        .into_iter()
+        .filter(|grip| mask & (1 << grip.role) != 0)
+        .collect()
+}
+
+pub(crate) fn action_grip_available(
+    doc: &CadDocument,
+    definition: Handle,
+    parameter: Handle,
+    id: usize,
+) -> bool {
+    let Some((node, role)) = decode(id) else {
+        return false;
+    };
+    let Some(p) = actions::all_parameters(doc, definition)
+        .into_iter()
+        .find(|p| p.handle == parameter && p.id == node)
+    else {
+        return false;
+    };
+    actions::grip_roles::mask(doc, definition, &p) & (1 << role) != 0
+        && config::locations(doc, definition, parameter)
+            .is_ok_and(|grips| grips.iter().any(|grip| grip.role == role))
+}
+
 pub struct Input {
     pub id: usize,
     pub role: usize,

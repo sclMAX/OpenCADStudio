@@ -331,8 +331,15 @@ impl CadCommand for HatcheditCommand {
     fn needs_entity_pick(&self) -> bool {
         matches!(self.step, HatcheditStep::PickHatch)
     }
+    /// A hatch has no boundary wire, so picking one must hit-test fills.
+    fn entity_pick_includes_fills(&self) -> bool {
+        matches!(self.step, HatcheditStep::PickHatch)
+    }
     fn is_selection_gathering(&self) -> bool {
         self.input == Some("associate-select")
+    }
+    fn wants_raw_point(&self) -> bool {
+        self.input == Some("associate-point")
     }
     fn on_selection_complete(&mut self, handles: Vec<Handle>) -> CmdResult {
         if let Some((_, sources)) = &self.association_sources {

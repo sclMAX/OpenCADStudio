@@ -801,6 +801,25 @@ fn table_history_owner(doc: &CadDocument, insert: Handle) -> Result<Option<Handl
     Ok(Some(owner))
 }
 
+pub(crate) fn table_history_row(
+    doc: &CadDocument,
+    insert: Handle,
+    view: &crate::scene::block_properties_table::TableView,
+) -> Option<usize> {
+    let owner = table_history_owner(doc, insert).ok()??;
+    let handle = entry(doc, owner, "ACAD_ENHANCEDBLOCKHISTORY").ok()??;
+    let ObjectType::XRecord(record) = doc.objects.get(&handle)? else { return None };
+    let entries = &record.entries;
+    if entries.first()?.code != 1070 || entries[0].value != XRecordValue::Int16(3)
+        || entries.get(1)?.code != 1071
+        || entries[1].value != XRecordValue::Int32(view.table.parameter.parameter.element.eval.node_id)
+        || entries.get(3)?.code != 70 {
+        return None;
+    }
+    let XRecordValue::Int16(row) = entries[3].value else { return None };
+    usize::try_from(row).ok().filter(|row| *row < view.rows.len())
+}
+
 pub(crate) fn evaluate_table_row(
     doc: &CadDocument,
     insert: Handle,
@@ -841,15 +860,17 @@ fn evaluate_table_row_context(
             .into_iter()
             .find(|p| p.handle == column.handle)
             .ok_or("The table parameter is unavailable.")?;
-        let base = if baseline.is_some() {
-            test_frame(&staged, insert, &p)?.base
+        let current_frame = if baseline.is_some() {
+            test_frame(&staged, insert, &p)?
         } else {
-            frame(&staged, insert, &p)?.base
+            frame(&staged, insert, &p)?
         };
+        let base = current_frame.base;
         let input = if column.connection_name.eq_ignore_ascii_case("UpdatedAngle") {
-            Value::Point(base + DVec3::new(value.cos(), value.sin(), 0.0) * p.end.distance(p.base))
+            Value::Point(base + DVec3::new(value.cos(), value.sin(), 0.0) * current_frame.end.distance(base))
         } else {
-            let axis = (p.end - p.base).normalize();
+            let axis = if p.polar { (current_frame.end - base).normalize() }
+                else { (p.end - p.base).normalize() };
             Value::Point(base + axis * *value)
         };
         let next = if let Some(baseline) = baseline {

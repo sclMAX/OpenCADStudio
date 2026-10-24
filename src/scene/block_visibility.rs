@@ -25,6 +25,9 @@ use super::block_authoring::*;
 impl Scene {
     /// BVMODE and BVSHOW picking reveal only state-controlled members of BEDIT.
     pub(crate) fn visibility_revealed(&self, handle: Handle) -> bool {
+        if self.document.get_entity(handle).is_some_and(|entity| super::block_construction::is_construction(entity.common())) {
+            return self.construction_revealed(handle);
+        }
         self.block_visibility_reveal
             && self.block_edit_block.is_some_and(|definition| {
                 self.document.get_entity(handle).is_some_and(|entity| {
@@ -35,7 +38,7 @@ impl Scene {
     }
 
     pub(crate) fn visibility_reveal_handles(&self) -> rustc_hash::FxHashSet<Handle> {
-        self.block_edit_block
+        let mut handles: rustc_hash::FxHashSet<Handle> = self.block_edit_block
             .and_then(|definition| parameter(&self.document, definition))
             .filter(|_| self.block_visibility_reveal)
             .map(|parameter| {
@@ -46,10 +49,17 @@ impl Scene {
                     .filter(|handle| self.visibility_revealed(*handle))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(definition) = self.block_edit_block {
+            if let Some(record) = self.document.block_records.iter().find(|record| record.handle == definition) {
+                handles.extend(record.entity_handles.iter().copied().filter(|handle| self.construction_revealed(*handle)));
+            }
+        }
+        handles
     }
 
     pub(crate) fn display_entity_invisible(&self, common: &codec::entities::EntityCommon) -> bool {
+        if super::block_construction::is_construction(common) { return !self.construction_revealed(common.handle); }
         common.invisible && !self.visibility_revealed(common.handle)
     }
 
@@ -419,7 +429,7 @@ pub fn apply_state(document: &mut CadDocument, parameter: Handle, index: usize) 
         .collect();
     for (handle, visible) in shown {
         if let Some(entity) = document.get_entity_mut(handle) {
-            entity.common_mut().invisible = !visible;
+            entity.common_mut().invisible = !visible || super::block_construction::is_construction(entity.common());
         }
     }
 }
@@ -438,6 +448,7 @@ pub fn shown_state(document: &CadDocument, parameter: Handle) -> usize {
                 let shown = document
                     .get_entity(*handle)
                     .is_some_and(|entity| !entity.common().invisible);
+                if document.get_entity(*handle).is_some_and(|entity| super::block_construction::is_construction(entity.common())) { return true; }
                 shown == state.visible_blocks.contains(handle)
             })
         })

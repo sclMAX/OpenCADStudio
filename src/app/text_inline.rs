@@ -52,7 +52,12 @@ pub fn read_text_field(entity: &EntityType) -> Option<(String, TextEntityField)>
         EntityType::AttributeEntity(a) => {
             Some((a.get_value().to_string(), TextEntityField::AttEnt))
         }
-        EntityType::Dimension(d) => Some((d.base().text.clone(), TextEntityField::Dim)),
+        EntityType::Dimension(d) => Some((
+            crate::entities::dimension::dimension_text_override(d.base())
+                .unwrap_or_default()
+                .to_string(),
+            TextEntityField::Dim,
+        )),
         EntityType::Tolerance(t) => Some((t.text.clone(), TextEntityField::Tolerance)),
         EntityType::MultiLeader(ml) => {
             Some((ml.context.text_string.clone(), TextEntityField::MLeader))
@@ -68,7 +73,14 @@ pub fn write_text_field(entity: &mut EntityType, field: TextEntityField, value: 
         (EntityType::MText(m), TextEntityField::MText) => m.value = value,
         (EntityType::AttributeDefinition(a), TextEntityField::AttDef) => a.default_value = value,
         (EntityType::AttributeEntity(a), TextEntityField::AttEnt) => a.set_value(value),
-        (EntityType::Dimension(d), TextEntityField::Dim) => d.base_mut().text = value,
+        (EntityType::Dimension(d), TextEntityField::Dim) => {
+            // Both override slots, as the Properties row writes them: a stale
+            // `user_text` would otherwise keep winning over the new text.
+            crate::entities::dimension::set_dimension_text_override(
+                d.base_mut(),
+                (!value.trim().is_empty()).then_some(value),
+            );
+        }
         (EntityType::Tolerance(t), TextEntityField::Tolerance) => t.text = value,
         (EntityType::MultiLeader(ml), TextEntityField::MLeader) => {
             ml.context.text_string = value;
@@ -243,6 +255,11 @@ impl super::OpenCADStudio {
             self.push_undo_snapshot(i, "TEXT");
             if let Some(entity) = self.tabs[i].scene.document.get_entity_mut(h) {
                 write_text_field(entity, ed.field, ed.value.clone());
+            }
+            if ed.field == TextEntityField::Dim {
+                // The dimension draws from its baked block; drop it so the
+                // new text is drawn (and re-baked on save).
+                self.tabs[i].scene.invalidate_dim_block_recorded(h);
             }
             self.tabs[i]
                 .scene

@@ -273,27 +273,17 @@ fn z_axis_normal(normal: codec::types::Vector3) -> bool {
     normal.x == 0.0 && normal.y == 0.0 && normal.z != 0.0
 }
 
-/// Selection-or-all candidate handles: every entity in the active space that
-/// sits on an unlocked layer (verbatim from the FLATTEN command arm).
+/// The selected entities FLATTEN works on: those in the active space on an
+/// unlocked layer.
 pub fn collect_flatten_handles(scene: &Scene) -> Vec<Handle> {
-    let sel = scene.selected_entities();
-    if sel.is_empty() {
-        let mut out = Vec::with_capacity(scene.document.entities().size_hint().0);
-        for handle in scene.document.entities().map(|e| e.common().handle) {
-            if scene.entity_belongs_to_active_space(handle) && !scene.is_layer_locked(handle) {
-                out.push(handle);
-            }
-        }
-        out
-    } else {
-        let mut out = Vec::with_capacity(sel.len());
-        for (handle, _) in sel {
-            if scene.entity_belongs_to_active_space(handle) && !scene.is_layer_locked(handle) {
-                out.push(handle);
-            }
-        }
-        out
-    }
+    scene
+        .selected_entities()
+        .into_iter()
+        .map(|(handle, _)| handle)
+        .filter(|&handle| {
+            scene.entity_belongs_to_active_space(handle) && !scene.is_layer_locked(handle)
+        })
+        .collect()
 }
 
 /// The replacement entities for candidates that actually move (None for

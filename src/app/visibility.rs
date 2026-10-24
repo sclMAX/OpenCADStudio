@@ -90,7 +90,7 @@ impl OpenCADStudio {
                 self.tabs[i].scene.bump_geometry();
                 self.tabs[i].dirty = true;
                 self.finish_pending_history(i);
-                self.refresh_selected_grips();
+                self.refresh_properties();
             }
             Ok(None) => {}
             Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
@@ -192,50 +192,9 @@ impl OpenCADStudio {
             })
             .unwrap_or(view.table.parameter.definition_point);
         let wp = crate::scene::render_graph::insert_transform(doc, ins).apply(point);
-        let mut values = Vec::new();
-        let mut valid = true;
-        for column in &view.columns {
-            let params = crate::scene::block_actions::all_parameters(doc, def);
-            let Some(p) = params.iter().find(|p| p.handle == column.handle) else {
-                valid = false;
-                continue;
-            };
-            let frame = if self.tabs[i].block_test.is_some() {
-                crate::scene::block_actions::instance::test_frame(doc, handle, p)
-            } else { crate::scene::block_actions::instance::frame(doc, handle, p) };
-            match frame {
-                Ok(frame) => values.push(
-                    if column.connection_name.eq_ignore_ascii_case("UpdatedAngle") {
-                        (frame.end.y - frame.base.y).atan2(frame.end.x - frame.base.x).rem_euclid(std::f64::consts::TAU)
-                    } else { frame.end.distance(frame.base) },
-                ),
-                _ => {
-                    values.push(f64::NAN);
-                    valid = false;
-                }
-            }
-        }
-        let current = valid
-            .then(|| {
-                view.rows
-                    .iter()
-                    .position(|row| {
-                        row.iter().zip(&values).zip(&view.columns).all(
-                            |((row_value, value), column)| {
-                                let difference = if column
-                                    .connection_name
-                                    .eq_ignore_ascii_case("UpdatedAngle")
-                                {
-                                    crate::scene::block_actions::angle_distance(*row_value, *value)
-                                } else {
-                                    (row_value - value).abs()
-                                };
-                                difference <= 1e-9
-                            },
-                        )
-                    })
-            })
-            .flatten();
+        let baseline = self.tabs[i].block_test.as_ref().filter(|test| test.insert == handle)
+            .map(|test| test.baseline.as_ref());
+        let current = crate::scene::block_parameter_properties::current_table_row(doc, baseline, handle);
         self.tabs[i].selected_grips.push(GripDef {
             id: TABLE_GRIP_ID,
             world: glam::DVec3::new(wp.x - wo[0], wp.y - wo[1], wp.z - wo[2]),
@@ -340,11 +299,12 @@ impl OpenCADStudio {
         Some(crate::scene::model::object::Property {
             label,
             field: "dyn_visibility",
-            value: crate::scene::model::object::PropValue::Choice {
+            value: crate::scene::model::object::PropValue::ChoiceWithTooltip {
                 selected: current
                     .and_then(|c| options.get(c).cloned())
                     .unwrap_or_default(),
                 options,
+                tooltip: param.description.clone(),
             },
         })
     }

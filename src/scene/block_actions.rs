@@ -8,12 +8,14 @@ use codec::objects::{
 use codec::types::{Transform, Vector3};
 use codec::{CadDocument, EntityType, Handle};
 use glam::DVec3;
+pub(crate) mod grip_roles;
 pub(crate) mod instance;
 pub(crate) mod feedback;
 pub(crate) mod association;
 mod representation;
 mod stretch;
 mod targets;
+mod array;
 pub(crate) mod options;
 
 /// Smallest signed distance between two angles in radians, accounting for the
@@ -125,6 +127,12 @@ pub(crate) fn all_parameters(doc: &CadDocument, definition: Handle) -> Vec<Param
     result.extend(parameters(doc, definition, Kind::Flip));
     result.sort_by_key(|p| p.id);
     result
+}
+
+/// Resolve native action association for runtime grip interaction.
+pub(crate) fn has_action(doc: &CadDocument, definition: Handle, parameter: Handle) -> bool {
+    let Some(p) = all_parameters(doc, definition).into_iter().find(|p| p.handle == parameter) else { return false; };
+    actions(doc, definition).iter().any(|(_, _, _, node)| *node == p.id)
 }
 
 pub(crate) fn compatible(p: &Parameter, kind: Kind) -> bool {
@@ -1374,6 +1382,8 @@ fn evaluate_impl(
     let mut affected = std::collections::BTreeSet::new();
     let mut geometric_targets = std::collections::BTreeMap::new();
     let mut prepared = std::collections::BTreeMap::new();
+    let mut array_plans = std::collections::BTreeMap::new();
+    let mut remaining_array_entities = array::MAX_GENERATED_ENTITIES;
     for (action_handle, a, kind, id) in &all {
         if *kind == Kind::Stretch {
             let ObjectType::DynamicBlock(o) = &baseline.objects[action_handle] else {
@@ -1394,8 +1404,33 @@ fn evaluate_impl(
         }
         let geometric = targets::geometry(baseline, definition, *kind, *id, &a.dependencies)?;
         affected.extend(geometric.iter().copied());
+        let target_count = geometric.len();
         geometric_targets.insert(*action_handle, geometric);
-        if *kind == Kind::Array || a.dependencies.is_empty() { continue; }
+        if *kind == Kind::Array {
+            let ObjectType::DynamicBlock(object) = &baseline.objects[action_handle] else { unreachable!() };
+            let DynamicBlockData::ArrayAction(arr) = &object.data else { unreachable!() };
+            let q = parameters(baseline, definition, Kind::Array)
+                .into_iter().find(|p| p.id == *id)
+                .ok_or("An action has an unsupported parameter binding.")?;
+            if !supported_parameter(baseline, q.handle) {
+                return Err("This parameter uses value constraints or chaining not supported yet.");
+            }
+            if arr.column_offset <= 1e-6 || !arr.column_offset.is_finite()
+                || (q.xy && (arr.row_offset <= 1e-6 || !arr.row_offset.is_finite()))
+                || grip_roles::scalar_mask(&q, &object.data) == Some(0)
+            {
+                return Err("This Array action uses options not supported yet.");
+            }
+            if !a.action_ids.is_empty() {
+                return Err("Chained actions are not supported yet.");
+            }
+            array_plans.insert(*action_handle, array::Plan::new(
+                &q, base_for(&q), current(&staged, &q), arr, target_count,
+                &mut remaining_array_entities,
+            )?);
+            continue;
+        }
+        if a.dependencies.is_empty() { continue; }
         let q = parameters(baseline, definition, *kind)
             .into_iter()
             .find(|p| p.id == *id)
@@ -1471,44 +1506,16 @@ fn evaluate_impl(
             {
                 return Err("This Move action uses options not supported yet.");
             }
-            DynamicBlockData::FlipAction(f)
-                if f.connections
-                    != ["Flip", "UpdatedFlip", "UpdatedBase", "UpdatedEnd"].map(|name| {
-                        BlockConnection {
-                            code: q.id,
-                            name: name.into(),
-                        }
-                    }) =>
+            DynamicBlockData::FlipAction(_)
+            | DynamicBlockData::RotateAction(_)
+            | DynamicBlockData::ScaleAction(_)
+                if grip_roles::scalar_mask(&q, &o.data) == Some(0) =>
             {
-                return Err("This Flip action uses options not supported yet.");
-            }
-            DynamicBlockData::RotateAction(r)
-                if r.connections
-                        != vec![BlockConnection {
-                            code: q.id,
-                            name: "AngleDelta".into(),
-                        }]
-                    || r.action.connections
-                        != ["UpdatedBaseX", "UpdatedBaseY"].map(|name| BlockConnection {
-                            code: q.id,
-                            name: name.into(),
-                        }) =>
-            {
-                return Err("This Rotate action uses options not supported yet.");
-            }
-            DynamicBlockData::ScaleAction(s)
-                if s.connections
-                        != ["Scale", "XScale", "YScale"].map(|name| BlockConnection {
-                            code: q.id,
-                            name: name.into(),
-                        })
-                    || s.action.connections
-                        != ["UpdatedBaseX", "UpdatedBaseY"].map(|name| BlockConnection {
-                            code: q.id,
-                            name: name.into(),
-                        }) =>
-            {
-                return Err("This Scale action uses options not supported yet.");
+                return Err(match &o.data {
+                    DynamicBlockData::FlipAction(_) => "This Flip action uses options not supported yet.",
+                    DynamicBlockData::RotateAction(_) => "This Rotate action uses options not supported yet.",
+                    _ => "This Scale action uses options not supported yet.",
+                });
             }
             _ => {}
         }
@@ -1569,84 +1576,11 @@ fn evaluate_impl(
             .get_entity_mut(h)
             .ok_or("An action target was removed.")? = entity;
     }
-    for (action_handle, a, kind, id) in &all {
+    for (action_handle, _, kind, _) in &all {
         if *kind != Kind::Array {
             continue;
         }
-        let ObjectType::DynamicBlock(o) = &baseline.objects[action_handle] else {
-            unreachable!()
-        };
-        let DynamicBlockData::ArrayAction(arr) = &o.data else {
-            unreachable!()
-        };
-        let q = parameters(baseline, definition, Kind::Array)
-            .into_iter()
-            .find(|p| p.id == *id)
-            .ok_or("An action has an unsupported parameter binding.")?;
-        if !supported_parameter(baseline, q.handle) {
-            return Err("This parameter uses value constraints or chaining not supported yet.");
-        }
-        if arr.column_offset <= 1e-6
-            || !arr.column_offset.is_finite()
-            || (q.xy && (arr.row_offset <= 1e-6 || !arr.row_offset.is_finite()))
-            || arr.connections
-                != ["Base", "End", "UpdatedBase", "UpdatedEnd"].map(|name| BlockConnection {
-                    code: q.id,
-                    name: name.into(),
-                })
-        {
-            return Err("This Array action uses options not supported yet.");
-        }
-        if !a.action_ids.is_empty() {
-            return Err("Chained actions are not supported yet.");
-        }
-        let end = current(&staged, &q);
-        let base = base_for(&q);
-        let displacements: Vec<(usize, DVec3)> = if q.xy {
-            let dx = (end.x - base.x).abs();
-            let dy = (end.y - base.y).abs();
-            let nx = ((dx + 1e-9) / arr.column_offset).floor() as usize + 1;
-            let ny = ((dy + 1e-9) / arr.row_offset).floor() as usize + 1;
-            let dir_x = if end.x >= base.x { 1.0 } else { -1.0 };
-            let dir_y = if end.y >= base.y { 1.0 } else { -1.0 };
-            let mut list = vec![];
-            let mut idx = 1;
-            for row in 0..ny {
-                for col in 0..nx {
-                    if col == 0 && row == 0 {
-                        continue;
-                    }
-                    let disp = DVec3::new(
-                        (col as f64) * arr.column_offset * dir_x,
-                        (row as f64) * arr.row_offset * dir_y,
-                        0.0,
-                    );
-                    list.push((idx, disp));
-                    idx += 1;
-                }
-            }
-            list
-        } else if q.linear {
-            let axis = (q.end - q.base).normalize();
-            let length = (end - base).dot(axis);
-            let n = ((length.max(0.0) + 1e-9) / arr.column_offset).floor() as usize + 1;
-            (1..n)
-                .map(|k| (k, (k as f64) * arr.column_offset * axis))
-                .collect()
-        } else {
-            let delta = end - base;
-            let dist = delta.length();
-            let axis = if dist > 1e-9 {
-                delta / dist
-            } else {
-                (q.end - q.base).normalize()
-            };
-            let n = ((dist + 1e-9) / arr.column_offset).floor() as usize + 1;
-            (1..n)
-                .map(|k| (k, (k as f64) * arr.column_offset * axis))
-                .collect()
-        };
-        for (k, disp) in displacements {
+        for (k, disp) in array_plans[action_handle].displacements() {
             for target_h in &geometric_targets[action_handle] {
                 let mut clone = staged
                     .get_entity(*target_h)
@@ -1672,7 +1606,7 @@ fn evaluate_impl(
                     .add_entity(clone)
                     .map_err(|_| "Could not add array item.")?;
                 if let Some(base_id) = base_id {
-                    let clone_id = base_id.wrapping_add((k as i32) * 100_000);
+                    let clone_id = base_id.wrapping_add((k as i32).wrapping_mul(100_000));
                     authoring::set_entity_tag(
                         &mut staged,
                         new_h,
@@ -1784,7 +1718,7 @@ pub(crate) fn constrain_angle(value: f64, set: &codec::objects::BlockParameterVa
     constrain_value_set(angle, set)
 }
 
-fn constrain_parameter_position(
+pub(super) fn constrain_parameter_position(
     doc: &CadDocument,
     p: &Parameter,
     mut position: DVec3,

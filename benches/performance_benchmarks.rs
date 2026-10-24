@@ -1532,6 +1532,9 @@ fn build_selection_overlay_element(
             is_hot: false,
             is_hovered: false,
             dir: None,
+            is_plugin: false,
+            is_authoring: false,
+            is_dynamic: false,
         })
         .collect();
     let ucs_icons = vec![UcsIconParams {
@@ -1552,6 +1555,7 @@ fn build_selection_overlay_element(
     selection_overlay(
         selection,
         Some((Point::new(400.0, 300.0), SnapType::Endpoint)),
+        None,
         None,
         None,
         grips,
@@ -1584,6 +1588,7 @@ fn build_selection_overlay_element(
             matchprop_source_pick: false,
             matchprop_pickbox: false,
             hide_arms: false,
+            short_arms: false,
             snap_color: None,
             snap_size: Default::default(),
         },
@@ -1593,6 +1598,19 @@ fn build_selection_overlay_element(
         empty_selected,
         None,
         None,
+        None,
+        vec![],
+        vec![],
+        OpenCADStudio::ui::overlay::authoring::AuthoringVisualOptions {
+            action: iced::Color::WHITE,
+            parameter: iced::Color::WHITE,
+            grip: iced::Color::WHITE,
+            grip_size: 8.0,
+            text_size: 12.0,
+            font: String::new(),
+            horizontal: true,
+        },
+        Default::default(),
     )
 }
 

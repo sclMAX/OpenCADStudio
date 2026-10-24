@@ -2,7 +2,7 @@
 //! AP203/AP214/AP242 file, as kernel bodies, with the product's name and the
 //! file's length unit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kernel::brep::{
     Circle3, Cone, Curve3, Cylinder, EdgeKey, Ellipse3, Line3, Sphere, Surface, Torus, VertexKey,
@@ -63,6 +63,10 @@ struct Cursor<'a> {
     i: usize,
     /// How many parameter lists deep the cursor is.
     depth: usize,
+    /// Scratch shared by every number token of the file: a `.` that needs
+    /// a `0` after it is normalized here instead of allocating a fresh
+    /// String per number.
+    buf: Vec<u8>,
 }
 
 impl Cursor<'_> {
@@ -88,7 +92,9 @@ impl Cursor<'_> {
     fn eat(&mut self, c: u8) -> Option<()> {
         (self.peek()? == c).then(|| self.i += 1)
     }
-    fn word(&mut self) -> String {
+    /// The bytes of the next word, without materializing them: they run to
+    /// the first byte that is not alphanumeric, `_` or `-`.
+    fn word_span(&mut self) -> std::ops::Range<usize> {
         self.skip();
         let start = self.i;
         while self
@@ -98,13 +104,61 @@ impl Cursor<'_> {
         {
             self.i += 1;
         }
-        String::from_utf8_lossy(&self.s[start..self.i]).to_ascii_uppercase()
+        start..self.i
+    }
+    /// The next word, uppercased for keyword matching — one allocation,
+    /// only for the words that are actually stored (entity names, enum
+    /// values). Callers that just parse or check the word use
+    /// [`Cursor::word_span`] / [`Cursor::word_id`] and allocate nothing.
+    fn word(&mut self) -> String {
+        let span = self.word_span();
+        String::from_utf8_lossy(&self.s[span]).to_ascii_uppercase()
+    }
+    /// The next word read as an instance id (`#12`, `#345`). Digits are
+    /// untouched by the uppercasing [`Cursor::word`] would apply, so the
+    /// copy could never change the parse.
+    fn word_id(&mut self) -> Option<u64> {
+        let span = self.word_span();
+        std::str::from_utf8(&self.s[span]).ok()?.parse().ok()
+    }
+    /// Whether Rust's float parser needs a `0` written after the `.` at
+    /// `i`: it takes `1.E-3` as nothing (it wants `1.0E-3`), while a dot
+    /// with no digit anywhere before it — the malformed `+.` — is a
+    /// rejection the reader has always passed straight through.
+    fn dot_needs_zero(raw: &[u8], i: usize) -> bool {
+        let next = raw.get(i + 1);
+        !next.is_some_and(|n| n.is_ascii_digit())
+            && (matches!(next, Some(b'e' | b'E')) || raw[..i].iter().any(u8::is_ascii_digit))
+    }
+    /// One number token, parsed in place: a `.` that needs a `0` after it
+    /// (per [`Cursor::dot_needs_zero`]) is normalized into the scratch
+    /// `buf` this cursor shares across every token of the file, and
+    /// tokens needing no `0` parse straight out of the file's bytes —
+    /// where two `str::replace` calls used to allocate two Strings for
+    /// every number in every file.
+    fn number(&mut self, start: usize, end: usize) -> Option<f64> {
+        let raw = &self.s[start..end];
+        if !raw
+            .iter()
+            .enumerate()
+            .any(|(i, &c)| c == b'.' && Self::dot_needs_zero(raw, i))
+        {
+            return std::str::from_utf8(raw).ok()?.parse().ok();
+        }
+        self.buf.clear();
+        for (i, &c) in raw.iter().enumerate() {
+            self.buf.push(c);
+            if c == b'.' && Self::dot_needs_zero(raw, i) {
+                self.buf.push(b'0');
+            }
+        }
+        std::str::from_utf8(&self.buf).ok()?.parse().ok()
     }
     fn param(&mut self) -> Option<P> {
         Some(match self.peek()? {
             b'#' => {
                 self.i += 1;
-                P::Ref(self.word().parse().ok()?)
+                P::Ref(self.word_id()?)
             }
             b'\'' => {
                 self.i += 1;
@@ -143,11 +197,10 @@ impl Cursor<'_> {
                 {
                     self.i += 1;
                 }
-                let raw = String::from_utf8_lossy(&self.s[start..self.i]).replace(".E", ".0E");
-                P::Num(raw.replace(".e", ".0e").parse().ok()?)
+                P::Num(self.number(start, self.i)?)
             }
             _ => {
-                if self.word().is_empty() {
+                if self.word_span().is_empty() {
                     return None;
                 }
                 P::Typed(self.params()?)
@@ -186,7 +239,7 @@ impl Cursor<'_> {
     /// `#id = TYPE(...)` or `#id = (A(...) B(...))`, up to its `;`.
     fn instance(&mut self) -> Option<(u64, Instance)> {
         self.eat(b'#')?;
-        let id = self.word().parse().ok()?;
+        let id = self.word_id()?;
         self.eat(b'=')?;
         let mut parts = Vec::new();
         if self.eat(b'(').is_some() {
@@ -793,6 +846,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         s: &text.as_bytes()[data..],
         i: 0,
         depth: 0,
+        buf: Vec::new(),
     };
     let mut instances = HashMap::new();
     while cursor.peek() == Some(b'#') {
@@ -933,7 +987,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
 
     let mut index: HashMap<u64, usize> = HashMap::new();
     let mut products: Vec<StepProduct> = Vec::new();
-    let mut used_items: Vec<u64> = Vec::new();
+    let mut used_items: HashSet<u64> = HashSet::new();
     for &definition in &definitions {
         let mut bodies = Vec::new();
         for rep in shape_of.get(&definition).and_then(|pds| reps_of_shape.get(pds)).into_iter().flatten() {
@@ -941,7 +995,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
                 if !used_items.contains(&item) {
                     let found = item_bodies(&doc, item);
                     if !found.is_empty() {
-                        used_items.push(item);
+                        used_items.insert(item);
                     }
                     bodies.extend(found);
                 }
@@ -958,6 +1012,16 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
     }
 
     // Components, placed by the transformation of their occurrence.
+    // The first context-dependent shape representation of each product
+    // definition shape, by entity number — the one the placement lookup
+    // below picks; indexed here so each occurrence is found in O(1)
+    // instead of a scan over every id in the file.
+    let mut cdsr_of_shape: HashMap<u64, u64> = HashMap::new();
+    for cdsr in of_kind("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION") {
+        if let Some(pds) = param(cdsr, 1) {
+            cdsr_of_shape.entry(pds).or_insert(cdsr);
+        }
+    }
     let mut component = vec![false; products.len()];
     for occurrence in of_kind("NEXT_ASSEMBLY_USAGE_OCCURRENCE") {
         let (Some(&parent), Some(&child)) = (
@@ -968,11 +1032,7 @@ pub fn read(bytes: &[u8]) -> Option<StepModel> {
         };
         let placement = shape_of
             .get(&occurrence)
-            .and_then(|pds| {
-                ids.iter().copied().find(|&id| {
-                    doc.kind(id) == "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION" && param(id, 1) == Some(*pds)
-                })
-            })
+            .and_then(|pds| cdsr_of_shape.get(pds).copied())
             .and_then(|cdsr| param(cdsr, 0))
             .and_then(|relation| doc.part(relation, "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION"))
             .and_then(|p| p.first()?.reference())

@@ -37,10 +37,10 @@ rfd = "0.17"
 clap = { version = "4", features = ["derive", "string"] }
 env_logger = "0.11"
 log = "0.4"
-codec = { package = "acadrust", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "ff75fdd", features = ["serde"] }
-kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "b0a2429", features = ["acis", "offset"] }
-kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "b0a2429" }
-graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "bfce854" }
+codec = { package = "acadrust", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "e6c9982", features = ["serde"] }
+kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "293b31e", features = ["acis", "offset"] }
+kernel-constraints = { package = "opencadkernel-constraints", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "293b31e" }
+graph = { package = "opencadgraph", git = "https://github.com/HakanSeven12/opencadgraph.git", rev = "b82aea9" }
 dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
 # Shared SAVE serialization dispatch + web-worker wire format: one
 # implementation for the inline (fallback/native) path and the worker path.
@@ -95,7 +95,7 @@ naga = { version = "27", features = ["wgsl-in"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 libloading = "0.8"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Globalization", "Win32_Security_Authentication_Identity", "Win32_UI_Controls_Dialogs"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Printing", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_Globalization", "Win32_Security_Authentication_Identity", "Win32_UI_Controls_Dialogs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "settings", "wayland"] }
@@ -114,6 +114,7 @@ objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString"
 [patch.crates-io]
 iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
 iced_widget = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
+
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.3"
@@ -226,10 +227,71 @@ harness = false
 name = "command_benchmarks"
 harness = false
 
+[[bench]]
+name = "grip_drag_otrack_candidates"
+harness = false
+
+[[bench]]
+name = "grid_segments_rebuild"
+harness = false
+
+[[bench]]
+name = "parametric_preview_solve"
+harness = false
+
+[[bench]]
+name = "step_assembly_cdsr_lookup"
+harness = false
+
+[[bench]]
+name = "xref_nested_document_cache"
+harness = false
+
+[[bench]]
+name = "parametric_constraint_refresh"
+harness = false
+
+[[bench]]
+name = "step_tokenizer"
+harness = false
+
+[[bench]]
+name = "properties_selection_aggregation"
+harness = false
+
+[[bench]]
+name = "native_constraint_graph_sync"
+harness = false
+
+[[bench]]
+name = "overlay_interaction_candidates"
+harness = false
+
+[[bench]]
+name = "snap_intersection_sweep"
+harness = false
+
+[[bench]]
+name = "selection_overlay_frame"
+harness = false
+
+[[bench]]
+name = "model_space_handle_lookup"
+harness = false
+
+[[bench]]
+name = "parametric_presolve_fixpoint"
+harness = false
+
+[[bench]]
+name = "transform_entities_dedup"
+harness = false
+
+[[bench]]
+name = "tds_material_groups"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
 
-# Keep direct and transitive codec users on the two verified fork fixes.
-[patch."https://github.com/HakanSeven12/opencadcodec.git"]
-acadrust = { git = "https://github.com/sclMAX/opencadcodec.git", rev = "cb96711852f97db10811a4e8d632824c940a1134" }

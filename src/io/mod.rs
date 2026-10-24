@@ -797,6 +797,7 @@ async fn load_web_bytes(
         fix_dxf_layout_plot_settings(&mut doc);
     }
     fix_viewport_status_flags(&mut doc);
+    fix_double_placed_dimension_pictures(&mut doc);
     fix_current_style_names(&mut doc);
     crate::entities::field::local_header_dates(&mut doc);
     // Opening is a field evaluation event (FIELDEVAL bit 1), as on the
@@ -838,6 +839,7 @@ async fn parse_web_document(name: &str, bytes: &[u8]) -> Result<CadDocument, Str
         fix_dxf_layout_plot_settings(&mut doc);
     }
     fix_viewport_status_flags(&mut doc);
+    fix_double_placed_dimension_pictures(&mut doc);
     fix_current_style_names(&mut doc);
     Ok(doc)
 }
@@ -969,6 +971,7 @@ pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
                 .read()
                 .map_err(|e| e.to_string())?;
             fix_viewport_status_flags(&mut doc);
+            fix_double_placed_dimension_pictures(&mut doc);
             fix_current_style_names(&mut doc);
             crate::entities::field::local_header_dates(&mut doc);
             Ok(doc)
@@ -981,6 +984,7 @@ pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
             fix_dxf_dimension_rotations(&mut doc);
             fix_dxf_layout_plot_settings(&mut doc);
             fix_viewport_status_flags(&mut doc);
+            fix_double_placed_dimension_pictures(&mut doc);
             fix_current_style_names(&mut doc);
             crate::entities::field::local_header_dates(&mut doc);
             Ok(doc)
@@ -1050,13 +1054,21 @@ pub fn load_file(_path: &Path) -> Result<CadDocument, String> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_file_with_progress(
     path: &Path,
-    _progress: Option<Arc<dyn Fn(u16) + Send + Sync>>,
+    progress: Option<Arc<dyn Fn(u16) + Send + Sync>>,
 ) -> Result<codec::ReadOutcome, String> {
-    let outcome = read_file_attempt(path, _progress, false).map_err(|failure| failure.message)?;
-    if !outcome.stats.has_usable_drawing_data() {
-        return Err("initial read returned no source drawing records".to_string());
+    // Headless reads (--export, xrefs, imports) have no recovery prompt:
+    // fall back to the recovery read as soon as the strict one fails.
+    match load_file_for_open(path, progress.clone(), &OpenAttempt::Strict) {
+        Ok(outcome) => Ok(outcome),
+        Err(failure) if failure.recoverable => {
+            let attempt = OpenAttempt::Recovery(failure.message, failure.read_stats);
+            let mut outcome =
+                load_file_for_open(path, progress, &attempt).map_err(|failure| failure.message)?;
+            repair_drawing(&mut outcome.document);
+            Ok(outcome)
+        }
+        Err(failure) => Err(failure.message),
     }
-    finalize_loaded_outcome(path, outcome)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1253,6 +1265,7 @@ fn finalize_loaded_outcome(
         fix_dxf_layout_plot_settings(doc);
     }
     fix_viewport_status_flags(doc);
+    fix_double_placed_dimension_pictures(doc);
     fix_current_style_names(doc);
     crate::entities::field::local_header_dates(doc);
     resolve_raster_image_paths(doc, path.parent());
@@ -2103,6 +2116,31 @@ pub async fn pick_image_file() -> Result<(PathBuf, u32, u32), String> {
     Ok((path, decoded.source_width, decoded.source_height))
 }
 
+/// INSERTOBJ: the system Insert Object window, then the file it names is
+/// prepared for embedding. A picture from a file is what can be embedded;
+/// elsewhere than Windows the file picker stands in for the window.
+pub async fn pick_insert_object() -> Result<ole_embed::EmbeddedImage, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let (tx, rx) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ole_embed::insert_object_dialog());
+        });
+        let path = rx.await.map_err(|_| "Cancelled".to_string())??;
+        ole_embed::EmbeddedImage::from_file(&path).map_err(|_| {
+            format!(
+                "\"{}\" {}",
+                path.display(),
+                crate::tr!("ole-props", "not-embeddable")
+            )
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        pick_embedded_image_file().await
+    }
+}
+
 /// Pick an image file and prepare it for embedding (IMAGEEMBED). The bytes
 /// are read before returning so the OLE2FRAME payload is ready to place.
 pub async fn pick_embedded_image_file() -> Result<ole_embed::EmbeddedImage, String> {
@@ -2699,6 +2737,69 @@ pub(crate) fn repair_drawing(doc: &mut CadDocument) {
             codec::notification::NotificationType::Warning,
             format!("Recovery left unresolved: {}", issue.message),
         );
+    }
+}
+
+/// Dimensions an older build rotated kept the rotation twice: in their
+/// picture block's geometry and again as the picture's insertion rotation
+/// (DXF 54), so the picture drew turned about the origin, away from the
+/// dimension. A picture that lies at the definition point as stored, and
+/// far from it once placed, drops its placement.
+fn fix_double_placed_dimension_pictures(doc: &mut CadDocument) {
+    let mut doubled = Vec::new();
+    for entity in doc.entities() {
+        let EntityType::Dimension(dimension) = entity else {
+            continue;
+        };
+        let base = dimension.base();
+        let Some(placement) = crate::scene::render_graph::dimension_picture_placement(base)
+        else {
+            continue;
+        };
+        let Some(record) = doc.block_records.get(&base.block_name) else {
+            continue;
+        };
+        let target = base.definition_point;
+        // The picture's lines (a point as a zero-length one).
+        let segments: Vec<[codec::types::Vector3; 2]> = record
+            .entity_handles
+            .iter()
+            .filter_map(|handle| match doc.get_entity(*handle) {
+                Some(EntityType::Line(line)) => Some([line.start, line.end]),
+                Some(EntityType::Point(point)) => Some([point.location, point.location]),
+                _ => None,
+            })
+            .collect();
+        // The picture's nearest approach to the definition point.
+        let gap = |placed: bool| {
+            segments
+                .iter()
+                .map(|[a, b]| {
+                    let (a, b) = if placed {
+                        (placement.apply(*a), placement.apply(*b))
+                    } else {
+                        (*a, *b)
+                    };
+                    let along = b - a;
+                    let length = along.dot(&along);
+                    let t = if length > 0.0 {
+                        ((target - a).dot(&along) / length).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    (a + along * t).distance(&target)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (stored, placed) = (gap(false), gap(true));
+        if stored.is_finite() && stored * 10.0 < placed {
+            doubled.push(base.common.handle);
+        }
+    }
+    for handle in doubled {
+        if let Some(entity) = doc.get_entity_mut(handle) {
+            crate::scene::render_graph::clear_dim_picture_placement(entity);
+        }
     }
 }
 

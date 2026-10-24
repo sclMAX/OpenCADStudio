@@ -8,6 +8,8 @@ pub(crate) enum Field {
     Description,
     SecondaryName,
     SecondaryDescription,
+    BaseStateLabel,
+    FlippedStateLabel,
 }
 impl Field {
     pub(crate) fn key(self) -> &'static str {
@@ -16,6 +18,8 @@ impl Field {
             Self::Description => "authoring_description",
             Self::SecondaryName => "authoring_secondary_name",
             Self::SecondaryDescription => "authoring_secondary_description",
+            Self::BaseStateLabel => "authoring_base_state_label",
+            Self::FlippedStateLabel => "authoring_flipped_state_label",
         }
     }
     pub(crate) fn from_key(key: &str) -> Option<Self> {
@@ -24,6 +28,8 @@ impl Field {
             Self::Description,
             Self::SecondaryName,
             Self::SecondaryDescription,
+            Self::BaseStateLabel,
+            Self::FlippedStateLabel,
         ]
         .into_iter()
         .find(|field| field.key() == key)
@@ -89,6 +95,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
         }
         ObjectType::DynamicBlock(object) => match &object.data {
             Data::PointParameter(p) => {
+                visible = Some(p.parameter.parameter.show_properties);
                 text.push(Text {
                     field: Name,
                     label: "Parameter name",
@@ -101,6 +108,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
                 });
             }
             Data::LinearParameter(p) => {
+                visible = Some(p.parameter.parameter.show_properties);
                 text.push(Text {
                     field: Name,
                     label: "Distance name",
@@ -113,6 +121,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
                 });
             }
             Data::PolarParameter(p) => {
+                visible = Some(p.parameter.parameter.show_properties);
                 text.push(Text {
                     field: Name,
                     label: "Distance name",
@@ -135,6 +144,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
                 });
             }
             Data::XYParameter(p) => {
+                visible = Some(p.parameter.parameter.show_properties);
                 text.push(Text {
                     field: Name,
                     label: "X name",
@@ -157,6 +167,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
                 });
             }
             Data::RotationParameter(p) => {
+                visible = Some(p.parameter.parameter.show_properties);
                 text.push(Text {
                     field: Name,
                     label: "Angle name",
@@ -169,6 +180,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
                 });
             }
             Data::FlipParameter(p) => {
+                visible = Some(p.parameter.parameter.show_properties);
                 text.push(Text {
                     field: Name,
                     label: "Parameter name",
@@ -178,6 +190,16 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
                     field: Description,
                     label: "Description",
                     value: &p.flip_label_description,
+                });
+                text.push(Text {
+                    field: BaseStateLabel,
+                    label: "Base state label",
+                    value: &p.base_state_label,
+                });
+                text.push(Text {
+                    field: FlippedStateLabel,
+                    label: "Flipped state label",
+                    value: &p.flipped_state_label,
                 });
             }
             Data::LookupParameter(p) => {
@@ -245,6 +267,8 @@ fn text_mut(object: &mut ObjectType, field: Field) -> Option<&mut String> {
             (Data::RotationParameter(p), Description) => Some(&mut p.angle_description),
             (Data::FlipParameter(p), Name) => Some(&mut p.flip_label),
             (Data::FlipParameter(p), Description) => Some(&mut p.flip_label_description),
+            (Data::FlipParameter(p), BaseStateLabel) => Some(&mut p.base_state_label),
+            (Data::FlipParameter(p), FlippedStateLabel) => Some(&mut p.flipped_state_label),
             (Data::LookupParameter(p), Name) => Some(&mut p.lookup_name),
             (Data::LookupParameter(p), Description) => Some(&mut p.lookup_description),
             (Data::AlignmentParameter(p), Name) => Some(&mut p.parameter.parameter.element.name),
@@ -302,7 +326,20 @@ pub(crate) fn set_text(
             }
         }
     }
+    let tables = if field.is_name() {
+        crate::scene::block_lookup::renamed_input_tables(
+            document, definition, handle, field, old.value, value,
+        )?
+    } else {
+        vec![]
+    };
     *text_mut(document.objects.get_mut(&handle).unwrap(), field).unwrap() = value.to_owned();
+    for (table, edited) in tables {
+        let ObjectType::DynamicBlock(object) = document.objects.get_mut(&table).unwrap() else {
+            unreachable!()
+        };
+        object.data = Data::LookupAction(edited);
+    }
     sync_visibility(document, handle);
     Ok(true)
 }
@@ -321,6 +358,12 @@ pub(crate) fn set_visible(
     match document.objects.get_mut(&handle).unwrap() {
         ObjectType::BlockVisibilityParameter(p) => p.show_properties = value,
         ObjectType::DynamicBlock(object) => match &mut object.data {
+            Data::PointParameter(p) => p.parameter.parameter.show_properties = value,
+            Data::LinearParameter(p) => p.parameter.parameter.show_properties = value,
+            Data::PolarParameter(p) => p.parameter.parameter.show_properties = value,
+            Data::XYParameter(p) => p.parameter.parameter.show_properties = value,
+            Data::RotationParameter(p) => p.parameter.parameter.show_properties = value,
+            Data::FlipParameter(p) => p.parameter.parameter.show_properties = value,
             Data::LookupParameter(p) => p.parameter.parameter.show_properties = value,
             _ => unreachable!(),
         },

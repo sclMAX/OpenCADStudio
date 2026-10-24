@@ -239,10 +239,13 @@ jobs:
         shell: pwsh
         run: |
           # DWG/DXF Explorer file icons, from the single-source mimetype SVGs.
-          magick assets/mimetypes/image-vnd.dwg.svg `
+          # The SVGs are 48x48; rasterize them at 16x that (-density) before
+          # auto-resize, otherwise the 64..256 sizes are upscaled from 48px
+          # and look blurry in Explorer.
+          magick -background none -density 1536 assets/mimetypes/image-vnd.dwg.svg `
             -define icon:auto-resize=16,24,32,48,64,128,256 `
             packaging/windows/dwg.ico
-          magick assets/mimetypes/image-vnd.dxf.svg `
+          magick -background none -density 1536 assets/mimetypes/image-vnd.dxf.svg `
             -define icon:auto-resize=16,24,32,48,64,128,256 `
             packaging/windows/dxf.ico
 

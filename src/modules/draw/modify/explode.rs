@@ -101,9 +101,14 @@ pub fn explode_entity(entity: &EntityType, document: &CadDocument) -> Vec<Entity
         {
             vec![]
         }
+        // The codec's explode_from_document refuses a MINSERT; expand it cell
+        // by cell from the block's entities instead.
         EntityType::Insert(ins) => ins
-            .explode_from_document(document)
+            .block_entities_from_document(document)
+            .map(|entities| ins.explode(&entities))
+            .unwrap_or_default()
             .into_iter()
+            .filter(|entity| !crate::scene::block_construction::is_construction(entity.common()))
             .map(normalize_insert_entity)
             .collect(),
         EntityType::MLine(ml) => explode_mline(ml),
@@ -997,16 +1002,25 @@ fn dim_terminator(
                 out.push(dim_seg(r, tip, common));
             }
         }
-        A::Tick { size } => {
+        A::Tick { size, width } => {
             let s = *size as f64;
             let (ox, oy) = (dx + px, dy + py);
             let m = (ox * ox + oy * oy).sqrt().max(1e-9);
-            let (ox, oy) = (ox / m * s, oy / m * s);
-            out.push(dim_seg(
+            let (ux, uy) = (ox / m, oy / m);
+            let (ox, oy) = (ux * s, uy * s);
+            let (a, b) = (
                 Vector3::new(tip.x - ox, tip.y - oy, tip.z),
                 Vector3::new(tip.x + ox, tip.y + oy, tip.z),
-                common,
-            ));
+            );
+            out.push(dim_seg(a, b, common));
+            if *width > 0.0 {
+                // The architectural tick's band, as filled triangles.
+                let h = *width as f64 * 0.5;
+                let side =
+                    |p: Vector3, k: f64| Vector3::new(p.x - uy * h * k, p.y + ux * h * k, p.z);
+                tri(side(a, -1.0), side(a, 1.0), side(b, 1.0), &mut out);
+                tri(side(a, -1.0), side(b, 1.0), side(b, -1.0), &mut out);
+            }
         }
         A::Open { size, half_angle } => {
             let size = *size as f64;
@@ -1018,10 +1032,16 @@ fn dim_terminator(
             let r = *size as f64 * 0.5;
             terminator_circle(tip, r, *filled, common, &mut out);
         }
-        A::Origin { size } => {
-            terminator_circle(tip, *size as f64 * 0.25, true, common, &mut out);
-            let half = *size as f64 * 0.5;
-            out.push(dim_seg(pt(0.0, -half), pt(0.0, half), common));
+        A::Origin { size, inner } => {
+            // Same geometry as the "_Origin" / "_Origin2" blocks; see
+            // `ArrowKind::Origin`.
+            let size = *size as f64;
+            terminator_circle(tip, size * 0.5, false, common, &mut out);
+            if *inner {
+                terminator_circle(tip, size * 0.25, false, common, &mut out);
+            }
+            let start = if *inner { size * 0.5 } else { 0.0 };
+            out.push(dim_seg(pt(start, 0.0), pt(size, 0.0), common));
         }
         A::Box_ { size, filled } => {
             let h = *size as f64 * 0.5;
@@ -1259,6 +1279,7 @@ fn dim_metrics(dim: &Dimension, doc: &CadDocument) -> DimMetrics {
     let (arrow1, arrow2) = if dimtsz > 1e-9 {
         let t = ArrowKind::Tick {
             size: dimtsz as f32,
+            width: 0.0,
         };
         (t.clone(), t)
     } else if let Some(s) = style {
@@ -1948,6 +1969,47 @@ fn sync_dimension_base_points_and_collect_pending(doc: &mut CadDocument) -> Vec<
     pending
 }
 
+/// Remove `*D` pictures no dimension or insert names any more: a rotated
+/// or mirrored dimension detaches its old one (kept in the open drawing so an
+/// undo can point back to it), which a saved file should not carry.
+fn drop_detached_dimension_blocks(doc: &mut CadDocument) {
+    let named: std::collections::HashSet<String> = doc
+        .entities()
+        .chain(
+            doc.block_records
+                .iter()
+                .flat_map(|record| record.entity_handles.iter())
+                .filter_map(|handle| doc.get_entity(*handle)),
+        )
+        .filter_map(|entity| match entity {
+            EntityType::Dimension(d) => Some(d.base().block_name.to_ascii_uppercase()),
+            EntityType::Insert(insert) => Some(insert.block_name.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect();
+    let detached: Vec<String> = doc
+        .block_records
+        .iter()
+        .map(|record| record.name.clone())
+        .filter(|name| {
+            let upper = name.to_ascii_uppercase();
+            upper.starts_with("*D") && !named.contains(&upper)
+        })
+        .collect();
+    for name in detached {
+        if let Some(record) = doc.block_records.remove(&name) {
+            let mut owned = record.entity_handles.clone();
+            owned.push(record.block_entity_handle);
+            owned.push(record.block_end_handle);
+            for handle in owned {
+                if !handle.is_null() {
+                    doc.remove_entity(handle);
+                }
+            }
+        }
+    }
+}
+
 /// Smallest free `*D<n>` anonymous block name in `doc`.
 fn next_dimension_block_name(doc: &CadDocument, next: &mut u64) -> String {
     loop {
@@ -1962,6 +2024,7 @@ fn next_dimension_block_name(doc: &CadDocument, next: &mut u64) -> String {
 
 /// Build missing anonymous dimension geometry blocks before writing.
 pub fn bake_dimension_blocks(doc: &mut CadDocument) {
+    drop_detached_dimension_blocks(doc);
     // Keep group-10 in step and find missing blocks in one entity pass. Existing
     // `*D` blocks are the save cache: only invalidated/new dimensions enter the
     // relatively expensive geometry generation below.

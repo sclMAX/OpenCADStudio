@@ -445,6 +445,9 @@ impl ImageModel {
     /// the frame is degenerate or nothing in the blob decodes, so the caller
     /// falls back to the frame placeholder.
     pub fn from_ole2frame(ole: &codec::entities::Ole2Frame) -> Option<Self> {
+        if crate::entities::ole2frame::hidden(ole) {
+            return None;
+        }
         let payload = ole.encoded_payload();
         let (pixels, width, height) = super::ole_pres::decode(&payload)?;
 

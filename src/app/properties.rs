@@ -13,6 +13,17 @@ use codec::{Entity, EntityType, Handle};
 /// shows a count-only summary instead. Bulk edits still go through the ribbon.
 const MAX_PROP_AGGREGATE: usize = 2_000;
 
+/// Below this many selected entities the rayon hop plus the per-worker
+/// thread-state transplant cost more than the parallel build saves, so the
+/// fold stays sequential (byte-for-byte the pre-parallel behavior).
+const PARALLEL_AGGREGATE_MIN: usize = 32;
+
+/// Entities built per parallel wave. Chunking keeps the "nothing in common
+/// left to narrow" early-exit effective: once the intersection empties, at
+/// most one wave of builds is ever wasted.
+const PARALLEL_AGGREGATE_CHUNK: usize = 256;
+
+
 fn property_choice_combos(
     sections: &[crate::scene::model::object::PropSection],
 ) -> rustc_hash::FxHashMap<String, iced::widget::combo_box::State<ui::properties::LocalizedChoice>>
@@ -21,7 +32,7 @@ fn property_choice_combos(
         .iter()
         .flat_map(|section| section.props.iter())
         .filter_map(|prop| match &prop.value {
-            PropValue::Choice { options, .. } => Some((
+            PropValue::Choice { options, .. } | PropValue::ChoiceWithTooltip { options, .. } => Some((
                 prop.field.to_string(),
                 iced::widget::combo_box::State::new(
                     options
@@ -432,9 +443,14 @@ impl OpenCADStudio {
         {
             use crate::entities::common::ro_prop;
             let xd = &source_entity.common().extended_data;
-            if !xd.is_empty() {
+            if !xd.is_empty() && !matches!(source_entity, codec::EntityType::Ole2Frame(_)) {
                 let mut xd_props = Vec::new();
-                for rec in xd.records() {
+                // A hyperlink shows on its own row.
+                for rec in xd
+                    .records()
+                    .iter()
+                    .filter(|rec| rec.application_name != crate::scene::hyperlink::APP)
+                {
                     let value_text = rec
                         .values
                         .iter()
@@ -447,10 +463,12 @@ impl OpenCADStudio {
                         format!("{}: {value_text}", rec.application_name),
                     ));
                 }
-                sections.push(crate::scene::model::object::PropSection {
-                    title: t!("Extended Data").into_owned(),
-                    props: xd_props,
-                });
+                if !xd_props.is_empty() {
+                    sections.push(crate::scene::model::object::PropSection {
+                        title: t!("Extended Data").into_owned(),
+                        props: xd_props,
+                    });
+                }
             }
         }
 
@@ -938,11 +956,18 @@ impl OpenCADStudio {
                     xref_rows(&mut sections, ins, &br.xref_path, factor, overrides);
                 }
                 // A dynamic block's visibility states, picked like its grip.
-                let mut custom_properties = Vec::new();
-                custom_properties.extend(Self::visibility_property(doc, handle));
-                if let Some(row) = crate::scene::block_lookup::reference_property(doc, handle) {
-                    custom_properties.push(row);
+                let baseline = self.tabs[i].block_test.as_ref().filter(|test| test.insert == handle).map(|test| test.baseline.as_ref());
+                let mut custom_properties = crate::scene::block_parameter_properties::properties(doc, baseline, self.tabs[i].id, handle);
+                if self.tabs[i].active_block_edit_session().is_some() {
+                    for property in &mut custom_properties {
+                        property.value = match &property.value {
+                            crate::scene::model::object::PropValue::BlockNumber { value, description, .. } => crate::scene::model::object::PropValue::ReadOnlyWithTooltip { value: value.clone(), tooltip: description.clone() },
+                            crate::scene::model::object::PropValue::BlockChoice { selected, options, description, .. } => crate::scene::model::object::PropValue::ReadOnlyWithTooltip { value: options.get(*selected).cloned().unwrap_or_else(|| t!("Custom").into_owned()), tooltip: description.clone() },
+                            value => value.clone(),
+                        };
+                    }
                 }
+                custom_properties.extend(Self::visibility_property(doc, handle));
                 if !custom_properties.is_empty() {
                     sections.push(crate::scene::model::object::PropSection {
                         title: t!("Custom").into_owned(),
@@ -1698,6 +1723,9 @@ impl OpenCADStudio {
         if compact_solid {
             retain_compact_solid_sections(&mut sections);
         }
+        if let codec::EntityType::Ole2Frame(ole) = entity {
+            self.fill_ole_rows(i, handle, ole, &mut sections);
+        }
         let title = match entity {
             codec::EntityType::Insert(ins) => {
                 let is_xref = self.tabs[i]
@@ -1742,6 +1770,7 @@ impl OpenCADStudio {
                 codec::entities::UnderlayType::Dgn => t!("DGN Underlay"),
             }
             .into_owned(),
+            codec::EntityType::Ole2Frame(_) => "OLE".to_string(),
             _ => entity_type_label(entity),
         };
         // A dynamic dimension shows only its constraint and text
@@ -2328,7 +2357,7 @@ impl OpenCADStudio {
                 }
                 1 => {
                     let (handle, source_entity) = selected[0];
-                    let (sections, title) = self.entity_property_sections(
+                    let (mut sections, title) = self.entity_property_sections(
                         i,
                         handle,
                         source_entity,
@@ -2336,6 +2365,18 @@ impl OpenCADStudio {
                         annotation_scale_handle,
                         prop_vertex,
                     );
+                    if let Some(definition) = self.tabs[i].active_block_edit_session().map(|s| s.br_handle) {
+                        if source_entity.common().owner_handle == definition {
+                            let status = self.tabs[i].scene.block_constraint_entity_status(definition, handle);
+                            sections.push(crate::scene::model::object::PropSection {
+                                title: crate::t!("Constraints").into_owned(),
+                                props: vec![crate::scene::model::object::Property {
+                                    label: crate::t!("Constraint status").into_owned(), field: "block_constraint_status",
+                                    value: PropValue::ReadOnly(crate::t!(status.label()).into_owned()),
+                                }],
+                            });
+                        }
+                    }
                     ui::PropertiesPanel {
                         choice_combos: property_choice_combos(&sections),
                         sections,
@@ -2430,7 +2471,10 @@ impl OpenCADStudio {
                                 )
                                 .0
                             })
-                            .reduce(|merged, next| merge_sections(&merged, &next))
+                            .reduce(|mut merged, next| {
+                                intersect_into(&mut merged, &next);
+                                merged
+                            })
                             .unwrap_or_default();
                     }
                     if let (Some(t), Some(groups_ms), Some(filter_ms), Some(local_ms)) =
@@ -2501,9 +2545,14 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                         props: self.tabs[i].active_block_edit_session()
                             .and_then(|session| crate::scene::block_authoring::metadata::read(&self.tabs[i].scene.document, session.br_handle, item.handle).ok())
                             .map(|metadata| {
-                                let mut props: Vec<Property> = metadata.text.into_iter().map(|text| Property {
-                                    label: crate::t!(text.label).into_owned(), field: text.field.key(),
-                                    value: PropValue::PlainText(text.value.to_owned()),
+                                let mut props: Vec<Property> = metadata.text.into_iter().map(|text| {
+                                    use crate::scene::block_authoring::metadata::Field;
+                                    let label = match text.field {
+                                        Field::BaseStateLabel => crate::tr!("block-flip", "base-state-label"),
+                                        Field::FlippedStateLabel => crate::tr!("block-flip", "flipped-state-label"),
+                                        _ => crate::t!(text.label).into_owned(),
+                                    };
+                                    Property { label, field: text.field.key(), value: PropValue::PlainText(text.value.to_owned()) }
                                 }).collect();
                                 if let Some(visible) = metadata.visible {
                                     props.push(Property { label: crate::t!("Show in Properties").into_owned(), field: "authoring_show_properties", value: PropValue::BoolToggle { field: "authoring_show_properties", value: visible } });
@@ -2797,6 +2846,13 @@ filter={:.1} local={:.1} aggregate={:.1} entities={}",
                 && property_handles
                     .iter()
                     .all(|handle| self.tabs[i].scene.is_layer_locked(*handle));
+            if property_handles.iter().any(|handle| self.tabs[i].scene.document.get_entity(*handle)
+                .is_some_and(|entity| crate::scene::block_construction::is_construction(entity.common()))) {
+                set_row(&mut panel.sections, "color", crate::t!("Construction geometry").into_owned());
+                set_row(&mut panel.sections, "layer", crate::t!("Construction geometry").into_owned());
+                set_row(&mut panel.sections, "linetype", crate::t!("Dashed").into_owned());
+                panel.field_key_by_id = crate::ui::properties::build_field_key_map(&panel.sections);
+            }
             if locked_only {
                 // A point cloud locked on its own (not by its layer) still
                 // takes its Locked row, the way it is unlocked.
@@ -3681,6 +3737,23 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         if tracks_dimension_chain {
             self.tabs[i].scene.last_created_dimension = new_handle;
         }
+        // An OLE object placed now is at 100 % of the size it is given and
+        // takes OLEQUALITY (automatic: high graphics for a picture).
+        if let Some(handle) = new_handle {
+            if let Some(codec::EntityType::Ole2Frame(ole)) =
+                self.tabs[i].scene.document.get_entity_mut(handle)
+            {
+                ole.lock_aspect = super::commands::ole_quality().min(2) as u8;
+                let (_, w, h) = crate::entities::ole2frame::frame_box(ole);
+                self.tabs[i].ole_frames.insert(
+                    handle.value(),
+                    crate::entities::ole2frame::FrameState {
+                        base: Some((w, h)),
+                        lock_aspect: true,
+                    },
+                );
+            }
+        }
         self.sync_registered_layers(i);
         new_handle
     }
@@ -3706,7 +3779,9 @@ fn make_sections_read_only(
             | PropValue::LayerChoice(value)
             | PropValue::LinetypeChoice(value)
             | PropValue::HatchPatternChoice(value) => value.clone(),
-            PropValue::Choice { selected, .. } => selected.clone(),
+            PropValue::BlockNumber { value, .. } => value.clone(),
+            PropValue::BlockChoice { selected, options, .. } => options.get(*selected).cloned().unwrap_or_default(),
+            PropValue::Choice { selected, .. } | PropValue::ChoiceWithTooltip { selected, .. } => selected.clone(),
             PropValue::EditChoice { value, .. } => value.clone(),
             PropValue::ColorChoice(color) => match color {
                 codec::types::Color::None => "None".to_string(),
@@ -3742,7 +3817,11 @@ fn make_sections_read_only(
             }
         };
         property.field = "locked_read_only";
-        property.value = PropValue::ReadOnly(text);
+        property.value = if let PropValue::ChoiceWithTooltip { tooltip, .. } = &property.value {
+            PropValue::ReadOnlyWithTooltip { value: text, tooltip: tooltip.clone() }
+        } else {
+            PropValue::ReadOnly(text)
+        };
     }
 }
 
@@ -3783,27 +3862,111 @@ pub(super) fn build_selection_groups(
     groups
 }
 
+impl crate::scene::model::object::PropSection {
+    /// `pub` so the external `cargo bench` harness
+    /// (`benches/properties_selection_aggregation.rs`, a separate crate) can
+    /// time the real selection-rebuild aggregation entry. The
+    /// `app::properties` module is private and `OpenCADStudio` itself is
+    /// `pub(super)`, so neither the free `aggregate_sections` function nor an
+    /// inherent app method is reachable externally; this bridge rides on the
+    /// publicly reachable `PropSection` type instead (`#[doc(hidden)]` so it
+    /// stays out of the public API docs).
+    /// Calls the exact function the selection-rebuild block invokes, so the
+    /// bench measures production semantics unchanged.
+    #[doc(hidden)]
+    pub fn aggregate_selection(
+        selected: &[(Handle, &EntityType)],
+        text_style_names: &[String],
+    ) -> Vec<Self> {
+        aggregate_sections(selected, text_style_names)
+    }
+}
+
+/// Entity builders that read document-seeded per-thread state with no
+/// transplantable getter: the text-style height/font caches
+/// (`entities::common::FIXED_TEXT_HEIGHTS` / `STYLE_FONTS`, written by
+/// `set_fixed_text_heights(&document)` — setter-only from here) and, for
+/// tables, the table-cell stepper (`entities::table`, getter private to that
+/// module). Selections containing any of these aggregate on the calling
+/// thread, exactly as before parallelization; every other builder reads only
+/// the unit context and the focused-vertex cell, both captured below and
+/// replayed on each worker so rows match the calling thread's output.
+fn builds_on_calling_thread(entity: &EntityType) -> bool {
+    matches!(
+        entity,
+        EntityType::Text(_)
+            | EntityType::MText(_)
+            | EntityType::AttributeDefinition(_)
+            | EntityType::AttributeEntity(_)
+            | EntityType::Table(_)
+    )
+}
+
+/// Per-entity row build for one chunk of the selection, on rayon workers when
+/// available (`crate::par::prelude` degrades to plain sequential iteration on
+/// wasm32). Each build replays the calling thread's captured unit context and
+/// focused vertex first, so a worker produces byte-for-byte the rows the
+/// calling thread would — those two thread-locals are the only ones the
+/// parallel-eligible builders read (see [`builds_on_calling_thread`]).
+fn build_section_wave(
+    wave: &[(Handle, &EntityType)],
+    text_style_names: &[String],
+    seeds: (crate::entities::common::UnitContext, usize),
+) -> Vec<Vec<crate::scene::model::object::PropSection>> {
+    use crate::par::prelude::*;
+
+    wave.par_iter()
+        .map(|&(handle, entity)| {
+            crate::entities::common::set_unit_context(seeds.0);
+            dispatch::set_prop_current_vertex(seeds.1);
+            dispatch::properties_sectioned(handle, entity, text_style_names)
+        })
+        .collect()
+}
+
 pub(super) fn aggregate_sections(
     selected: &[(Handle, &EntityType)],
     text_style_names: &[String],
 ) -> Vec<crate::scene::model::object::PropSection> {
-    if selected.is_empty() {
-        return vec![];
-    }
-
-    let mut entities = selected.iter();
-    let Some((handle, entity)) = entities.next() else {
+    let Some((first_handle, first_entity)) = selected.first() else {
         return vec![];
     };
-    let mut result = dispatch::properties_sectioned(*handle, entity, text_style_names);
-    for (handle, entity) in entities {
-        // Nothing in common left to narrow: every later entity can only
-        // intersect against an empty set.
-        if result.is_empty() {
-            break;
+    let mut result = dispatch::properties_sectioned(*first_handle, first_entity, text_style_names);
+    let rest = &selected[1..];
+
+    // `refresh_properties` seeds the unit context and the focused vertex on
+    // this thread before every rebuild; capture them once so worker rebuilds
+    // format rows identically.
+    let seeds = (
+        crate::entities::common::unit_context(),
+        dispatch::prop_current_vertex(),
+    );
+    let parallel = selected.len() >= PARALLEL_AGGREGATE_MIN
+        && !selected
+            .iter()
+            .any(|(_, entity)| builds_on_calling_thread(entity));
+
+    if parallel {
+        for wave in rest.chunks(PARALLEL_AGGREGATE_CHUNK) {
+            // Nothing in common left to narrow: every later entity can only
+            // intersect against an empty set.
+            if result.is_empty() {
+                break;
+            }
+            for sections in build_section_wave(wave, text_style_names, seeds) {
+                intersect_into(&mut result, &sections);
+            }
         }
-        let sections = dispatch::properties_sectioned(*handle, entity, text_style_names);
-        result = merge_sections(&result, &sections);
+    } else {
+        for (handle, entity) in rest {
+            // Nothing in common left to narrow: every later entity can only
+            // intersect against an empty set.
+            if result.is_empty() {
+                break;
+            }
+            let sections = dispatch::properties_sectioned(*handle, entity, text_style_names);
+            intersect_into(&mut result, &sections);
+        }
     }
     // Sum the filled area while individual Area rows may still vary.
     if selected.len() > 1
@@ -3821,6 +3984,35 @@ pub(super) fn aggregate_sections(
             })
             .sum::<f64>();
         set_row(&mut result, "cumulative_area", format!("{total:.4}"));
+    }
+    // Several lines: their summed length below the Length row.
+    if selected.len() > 1
+        && selected
+            .iter()
+            .all(|(_, entity)| matches!(entity, codec::EntityType::Line(_)))
+    {
+        let total = selected
+            .iter()
+            .filter_map(|(_, entity)| match entity {
+                codec::EntityType::Line(line) => Some(line.length()),
+                _ => None,
+            })
+            .sum::<f64>();
+        for section in result.iter_mut() {
+            if let Some(at) = section.props.iter().position(|p| p.field == "length") {
+                section.props.insert(
+                    at + 1,
+                    crate::scene::model::object::Property {
+                        label: t!("Total length").into_owned(),
+                        field: "total_length",
+                        value: crate::scene::model::object::PropValue::ReadOnly(
+                            crate::entities::common::format_length(total),
+                        ),
+                    },
+                );
+                break;
+            }
+        }
     }
     result
 }
@@ -3842,7 +4034,7 @@ fn aggregate_solid_history_sections(
         if next.is_empty() {
             return Vec::new();
         }
-        merged = merge_sections(&merged, &next);
+        intersect_into(&mut merged, &next);
     }
     merged
 }
@@ -3872,40 +4064,53 @@ fn retain_compact_solid_sections(sections: &mut Vec<crate::scene::model::object:
     sections.retain(|section| !section.props.is_empty());
 }
 
-fn merge_sections(
-    left: &[crate::scene::model::object::PropSection],
+/// Intersect `acc` with `right` in place — one fold step of the former
+/// `merge_sections(left, right)` helper, with identical semantics:
+///
+/// * `acc` keeps its section order, section titles, row order, labels, and
+///   `field` ids (rows are matched, never re-keyed);
+/// * each `acc` section/row matches the FIRST `right` entry carrying the same
+///   title / `field` (mirroring the old linear `.find`s);
+/// * rows absent from either side drop, as do sections left with no rows;
+/// * surviving values fold through [`merge_prop_value`]; a value equal to its
+///   counterpart is kept as-is, so identical selections clone nothing.
+fn intersect_into(
+    acc: &mut Vec<crate::scene::model::object::PropSection>,
     right: &[crate::scene::model::object::PropSection],
-) -> Vec<crate::scene::model::object::PropSection> {
-    left.iter()
-        .filter_map(|section| {
-            let rhs = right
-                .iter()
-                .find(|candidate| candidate.title == section.title)?;
-            let props: Vec<crate::scene::model::object::Property> = section
-                .props
-                .iter()
-                .filter_map(|prop| {
-                    let other = rhs
-                        .props
-                        .iter()
-                        .find(|candidate| candidate.field == prop.field)?;
-                    Some(crate::scene::model::object::Property {
-                        label: prop.label.clone(),
-                        field: prop.field,
-                        value: merge_prop_value(&prop.value, &other.value),
-                    })
-                })
-                .collect();
-            if props.is_empty() {
-                None
-            } else {
-                Some(crate::scene::model::object::PropSection {
-                    title: section.title.clone(),
-                    props,
-                })
+) {
+    use rustc_hash::FxHashMap;
+
+    // First match wins, exactly like `right.iter().find(...)`.
+    let mut right_sections: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut right_fields: Vec<FxHashMap<&'static str, usize>> = Vec::with_capacity(right.len());
+    for (section_index, section) in right.iter().enumerate() {
+        let mut fields = FxHashMap::default();
+        for (prop_index, prop) in section.props.iter().enumerate() {
+            fields.entry(prop.field).or_insert(prop_index);
+        }
+        right_fields.push(fields);
+        right_sections
+            .entry(section.title.as_str())
+            .or_insert(section_index);
+    }
+
+    acc.retain_mut(|section| {
+        let Some(&section_index) = right_sections.get(section.title.as_str()) else {
+            return false;
+        };
+        let fields = &right_fields[section_index];
+        section.props.retain_mut(|prop| {
+            let Some(&prop_index) = fields.get(prop.field) else {
+                return false;
+            };
+            let other = &right[section_index].props[prop_index];
+            if prop.value != other.value {
+                prop.value = merge_prop_value(&prop.value, &other.value);
             }
-        })
-        .collect()
+            true
+        });
+        !section.props.is_empty()
+    });
 }
 
 fn merge_prop_value(
@@ -3919,6 +4124,19 @@ fn merge_prop_value(
     }
 
     match (left, right) {
+        (
+            PropValue::ChoiceWithTooltip { options, tooltip, .. },
+            PropValue::ChoiceWithTooltip { options: other_options, tooltip: other_tooltip, .. },
+        ) => {
+            let mut merged_options = options.clone();
+            for option in other_options {
+                if !merged_options.contains(option) { merged_options.push(option.clone()); }
+            }
+            PropValue::ChoiceWithTooltip {
+                selected: VARIES_LABEL.into(), options: merged_options,
+                tooltip: if tooltip == other_tooltip { tooltip.clone() } else { String::new() },
+            }
+        }
         (PropValue::LayerChoice(_), PropValue::LayerChoice(_)) => {
             PropValue::LayerChoice(VARIES_LABEL.into())
         }
@@ -4299,7 +4517,7 @@ fn update_row_text(
             | PropValue::PlainText(current)
             | PropValue::Hyperlink(current) => *current = value,
             PropValue::ReadOnlyWithTooltip { value: current, .. } => *current = value,
-            PropValue::Choice { selected, .. } => *selected = value,
+            PropValue::Choice { selected, .. } | PropValue::ChoiceWithTooltip { selected, .. } => *selected = value,
             _ => {}
         }
         return;

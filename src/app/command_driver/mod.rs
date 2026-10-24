@@ -145,6 +145,16 @@ impl OpenCADStudio {
                 tab.dirty = true;
             }
         }
+        let gap_tolerance = self.tabs[self.active_tab]
+            .active_cmd
+            .as_ref()
+            .and_then(|command| command.hatch_gap_tolerance());
+        if let Some(gap_tolerance) = gap_tolerance {
+            if gap_tolerance != self.hatch_gap_tolerance {
+                self.hatch_gap_tolerance = gap_tolerance;
+                self.persist_settings_if_changed();
+            }
+        }
         let mline_settings = self.tabs[self.active_tab]
             .active_cmd
             .as_ref()
@@ -170,6 +180,7 @@ impl OpenCADStudio {
             &result,
             CmdResult::Relaunch(..)
                 | CmdResult::Dispatch(..)
+                | CmdResult::Script(..)
                 | CmdResult::QSelectSample { .. }
                 | CmdResult::SolidEdgeBlend { .. }
                 | CmdResult::SolidSubtract { .. }
@@ -178,6 +189,10 @@ impl OpenCADStudio {
         );
         let task = self.apply_cmd_result_inner(result);
         let i = self.active_tab;
+        // A typed `<angle` does not outlive the command it was typed in.
+        if self.tabs[i].active_cmd.is_none() {
+            self.angle_override = None;
+        }
         // A transparent zoom that just finished hands control back to the
         // command it interrupted before the "command ended" bookkeeping below.
         self.resume_transparent_parent(i);
@@ -445,6 +460,15 @@ impl OpenCADStudio {
             } => {
                 self.finish_qselect_sample(*state, tab_id, handle);
             }
+            CmdResult::QuickCalcPick(value) => {
+                self.tabs[i].active_cmd = None;
+                self.tabs[i].snap_result = None;
+                self.tabs[i].scene.clear_preview_wire();
+                self.restore_pre_cmd_tangent();
+                dispatched = Task::done(Message::QuickCalc(
+                    crate::ui::window::quick_calc::QuickCalcMsg::Picked(value),
+                ));
+            }
             CmdResult::OpenTxt2MtxtSettings => self.open_txt2mtxt_settings(),
             CmdResult::OpenAutoConstrainSettings => {
                 self.handle_open_auto_constrain_settings();
@@ -577,6 +601,9 @@ impl OpenCADStudio {
             }
             result @ CmdResult::SetBlockParameterGrips { .. } => {
                 return self.set_block_parameter_grips(result);
+            }
+            result @ CmdResult::SetBlockConstruction { .. } => {
+                return self.set_block_construction(result);
             }
             result @ CmdResult::EditBlockAuthoring { .. } => {
                 return self.handle_authoring_edit(result);
@@ -888,6 +915,9 @@ impl OpenCADStudio {
             CmdResult::RemoveLiveEntity(handle) => {
                 self.handle_remove_live_entity(handle);
             }
+            CmdResult::Done => {
+                self.handle_done();
+            }
             cancel @ (CmdResult::Cancel | CmdResult::CancelForSpaceChange) => {
                 self.handle_cancel(cancel);
             }
@@ -901,6 +931,9 @@ impl OpenCADStudio {
             }
             CmdResult::Dispatch(cmd) => {
                 dispatched = self.handle_dispatch(cmd);
+            }
+            CmdResult::Script(script) => {
+                dispatched = self.handle_script(script);
             }
             CmdResult::EditTableCell { handle, point } => {
                 if let Some(task) = self.handle_edit_table_cell(handle, point) {
@@ -1225,6 +1258,30 @@ impl OpenCADStudio {
         }
     }
 
+    fn handle_done(&mut self) {
+        let i = self.active_tab;
+        self.tabs[i].scene.clear_preview_wire();
+        if self.tabs[i].suspended_cmd.is_some() {
+            self.tabs[i].active_cmd = self.tabs[i].suspended_cmd.take();
+            let prompt = self.tabs[i].active_cmd.as_ref().map(|c| c.prompt());
+            if let Some(p) = prompt {
+                self.command_line.push_info(&p);
+            }
+            let opts = self.tabs[i]
+                .active_cmd
+                .as_ref()
+                .map(|c| c.options())
+                .unwrap_or_default();
+            self.command_line.set_step_options(opts);
+            self.refresh_active_cmd_preview(i);
+        } else {
+            self.tabs[i].suspended_cmd = None;
+            self.tabs[i].active_cmd = None;
+            self.tabs[i].snap_result = None;
+            self.restore_pre_cmd_tangent();
+        }
+    }
+
     fn handle_cancel(&mut self, cancel: CmdResult) {
         let i = self.active_tab;
         self.tabs[i].pending_parameter_set_follow_up = None;
@@ -1383,6 +1440,31 @@ impl OpenCADStudio {
         self.tabs[i].scene.clear_preview_wire();
         self.restore_pre_cmd_tangent();
         self.dispatch_command(&cmd)
+    }
+
+    fn handle_script(&mut self, script: String) -> Task<Message> {
+        let i = self.active_tab;
+        // A plugin command's script starts from an empty selection.
+        if self.tabs[i]
+            .active_cmd
+            .as_ref()
+            .is_some_and(|c| c.name() == "PLUGIN")
+        {
+            self.tabs[i].scene.deselect_all();
+        }
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        self.tabs[i].scene.clear_preview_wire();
+        self.restore_pre_cmd_tangent();
+        // Each line answers the prompts the previous one left open.
+        for line in script.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                let task = self.run_command_line_streaming(line, true);
+                let _ = self.drive_headless_task(task);
+            }
+        }
+        Task::none()
     }
 
     fn handle_measurement(&mut self, msg: String) {

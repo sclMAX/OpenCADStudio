@@ -9,10 +9,13 @@ pub(crate) mod config;
 pub use automation::{export_headless, run_batch, serve};
 mod annotation_data;
 mod block_actions;
+mod block_parameter_properties;
 mod block_alignment;
 mod block_feedback;
 mod block_cycle_order;
 mod block_grip_set;
+mod block_construction;
+mod block_constraint_status;
 mod block_action_bars;
 mod block_authoring_edit;
 mod block_editor;
@@ -28,6 +31,7 @@ mod block_test;
 #[cfg(test)]
 mod block_test_tests;
 mod block_visibility;
+pub(crate) mod calc;
 mod command_driver;
 pub(crate) use command_driver::{
     copy_to_clipboard_kernel, define_block_raw_doc, paste_entities_kernel, PasteSpace,
@@ -54,6 +58,7 @@ mod options_session;
 pub mod plugin_host;
 mod presspull_ops;
 mod properties;
+mod quick_calc;
 mod recent;
 mod record_api;
 pub(crate) mod settings;
@@ -102,6 +107,7 @@ pub enum UcsGripKind {
 /// threshold the multi-functional menu opens (`grip_popup`).
 #[derive(Clone, Debug)]
 pub struct GripHover {
+    pub document: u64,
     pub handle: codec::Handle,
     pub grip_id: usize,
     pub screen: iced::Point,
@@ -397,6 +403,17 @@ pub(crate) struct FindReplaceState {
     pub replacement: String,
     pub status: String,
     pub current_match: Option<FindMatchKey>,
+    /// The last Find All list; picking a row visits it without searching again.
+    pub results: Vec<FindResult>,
+}
+
+/// One Find All row: the match plus enough context to tell repeats apart.
+#[derive(Clone, Debug)]
+pub(crate) struct FindResult {
+    pub key: FindMatchKey,
+    pub text: String,
+    pub kind: String,
+    pub layer: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -752,6 +769,9 @@ pub(super) struct OpenCADStudio {
     pick_box: i32,
     /// HPASSOC: new hatches follow their boundary objects.
     hatch_associative: bool,
+    /// HPGAPTOL: gaps up to this size count as closed for HATCH/BOUNDARY
+    /// internal-point picks (0 = exact).
+    hatch_gap_tolerance: f64,
     /// MENUBAR: the classic pull-down menus show above the ribbon.
     show_menu_bar: bool,
     /// RIBBONCLOSE hid the ribbon; RIBBON brings it back.
@@ -960,6 +980,23 @@ pub(super) struct OpenCADStudio {
     /// (and on cancel), never a history step of their own.
     #[cfg(not(target_arch = "wasm32"))]
     plugin_grip_live_originals: Vec<(codec::Handle, codec::EntityType)>,
+    /// The grip-settle watchdog floor: [`SETTLE_WATCHDOG`] in production;
+    /// tests lower it to exercise the strike ledger with millisecond
+    /// budgets instead of real seconds.
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_grip_settle_watchdog: std::time::Duration,
+    /// The grip-settle strike ledger: plugin -> the missed-delivery times.
+    /// Three misses inside the strike window tear the connection down (the
+    /// plugin is genuinely wedged under a live pump); a settle landing in
+    /// time clears the entry (one recovered settle resets the count).
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_grip_settle_strikes: rustc_hash::FxHashMap<String, Vec<std::time::Instant>>,
+    /// Grip-declaration re-arms queued by strike tear-downs: the reap tick
+    /// re-dispatches `SelectionChanged` (dedup cleared) once the plugin is
+    /// visible again, so its declared grips come back without human
+    /// intervention.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_plugin_grips_rearm: std::collections::BTreeSet<String>,
     /// Open multi-functional grip popup. Persists across mouse moves
     /// until dismissed (click outside, ESC, cursor leaves the grip).
     grip_popup: Option<GripPopup>,
@@ -1061,6 +1098,8 @@ pub(super) struct OpenCADStudio {
     /// Point Cloud Manager palette (POINTCLOUDMANAGER).
     pub(crate) pc_manager: crate::ui::window::pc_manager::PcManager,
     pub(crate) count_palette: crate::ui::window::count_palette::CountPalette,
+    /// The QuickCalc pallet (QUICKCALC / QC).
+    pub(crate) quick_calc: crate::ui::window::quick_calc::QuickCalcPalette,
     /// Sheet Set Manager palette, the open sheet sets and their dialogs.
     pub(crate) sheet_set: crate::ui::window::sheet_set::SheetSetManager,
     /// A sheet opened from the manager: its drawing (path key) and layout,
@@ -1205,6 +1244,7 @@ pub(super) struct OpenCADStudio {
     hyperlink_editor_description: String,
     hyperlink_editor_mixed: bool,
     hyperlink_editor_dirty: bool,
+    hyperlink_options: crate::ui::window::hyperlink_dialog::HyperlinkOptions,
     pending_startup_modals: std::collections::VecDeque<ModalKind>,
     /// What is drawing the scene, once the first frame has told us. Drives
     /// the graphics warning (popup, status-bar pill, command line).
@@ -1219,6 +1259,7 @@ pub(super) struct OpenCADStudio {
     plotstyle_parent_plot_geometry: Option<(iced::Vector, iced::Vector)>,
     /// FIND dialog inputs and current result cursor.
     find_replace: FindReplaceState,
+    overkill_dialog: Option<crate::ui::window::overkill::State>,
     /// Set once the user acknowledges the AEC-drop warning, so re-entering the
     /// save path proceeds instead of re-showing the warning.
     aec_drop_acknowledged: bool,
@@ -1593,6 +1634,10 @@ pub(super) struct OpenCADStudio {
     /// it on Apply (`apply_named_parameter_editor_rows`,
     /// `src/app/named_parameters.rs`).
     named_parameter_editor_rows: Vec<crate::ui::window::named_parameters::ParamEditorRow>,
+
+    // ── CAL ───────────────────────────────────────────────────────────────
+    /// Variables and `ans` kept between CAL evaluations for this session.
+    cal_context: calc::CalcContext,
 
     // ── Layout Manager Panel ──────────────────────────────────────────────
     layout_manager_selected: String,
@@ -1979,6 +2024,15 @@ pub struct ClipboardDeps {
     pub linetypes: Vec<codec::tables::LineType>,
     pub text_styles: Vec<codec::tables::TextStyle>,
     pub dim_styles: Vec<codec::tables::DimStyle>,
+    /// The text and shape-file styles the captured linetypes' shape and text
+    /// segments point to. Segments name their style by handle, and shape-file
+    /// styles have no name, so a paste matches them by font file instead and
+    /// re-points the recreated linetype at the target's record.
+    pub linetype_styles: Vec<codec::tables::TextStyle>,
+    /// The image definitions the copied raster images point to. A paste
+    /// re-points each image at the target's definition of the same file, or
+    /// recreates the definition there, so it never names the source's object.
+    pub image_definitions: Vec<codec::objects::ImageDefinition>,
     /// Block definitions the copied INSERTs reference (transitively),
     /// snapshotted from the source drawing. Recreated on paste so a block
     /// reference doesn't render empty in a drawing that lacks the
@@ -2189,15 +2243,63 @@ impl ClipboardDeps {
             .cloned()
             .collect();
 
+        let linetypes: Vec<codec::tables::LineType> = ltypes
+            .iter()
+            .filter_map(|n| doc.line_types.get(n).cloned())
+            .collect();
+        let mut linetype_styles: Vec<codec::tables::TextStyle> = Vec::new();
+        for complex in linetypes
+            .iter()
+            .flat_map(|lt| lt.elements.iter())
+            .filter_map(|element| element.complex.as_ref())
+        {
+            if complex.style_handle.is_null()
+                || linetype_styles
+                    .iter()
+                    .any(|s| s.handle == complex.style_handle)
+            {
+                continue;
+            }
+            if let Some(style) = doc
+                .text_styles
+                .iter()
+                .find(|s| s.handle == complex.style_handle)
+            {
+                linetype_styles.push(style.clone());
+            }
+        }
+
+        let mut image_definitions: Vec<codec::objects::ImageDefinition> = Vec::new();
+        for e in entities
+            .iter()
+            .chain(blocks.iter().flat_map(|d| d.entities.iter()))
+        {
+            let EntityType::RasterImage(image) = e else {
+                continue;
+            };
+            let Some(handle) = image.definition_handle.filter(|h| !h.is_null()) else {
+                continue;
+            };
+            if image_definitions.iter().any(|d| d.handle == handle) {
+                continue;
+            }
+            if let Some(codec::objects::ObjectType::ImageDefinition(definition)) =
+                doc.objects.get(&handle)
+            {
+                let mut definition = definition.clone();
+                definition.handle = handle;
+                image_definitions.push(definition);
+            }
+        }
+
         ClipboardDeps {
             layers: layers
                 .iter()
                 .filter_map(|n| doc.layers.get(n).cloned())
                 .collect(),
-            linetypes: ltypes
-                .iter()
-                .filter_map(|n| doc.line_types.get(n).cloned())
-                .collect(),
+            linetypes,
+            linetype_styles,
+            image_definitions,
             text_styles: tstyles
                 .iter()
                 .filter_map(|n| doc.text_styles.get(n).cloned())
@@ -2215,7 +2317,8 @@ impl ClipboardDeps {
     }
 
     /// Breadth-first collect of every object reachable from extension-dictionary
-    /// `root` (dictionary entries, nested xdictionaries, dictionary defaults),
+    /// `root` (dictionary entries, nested xdictionaries, dictionary defaults,
+    /// objects an XRecord hard-owns),
     /// returned as `(source_handle, object)` pairs. Cycle-safe.
     fn collect_ext_subtree(
         doc: &codec::CadDocument,
@@ -2244,6 +2347,16 @@ impl ClipboardDeps {
                 ObjectType::DictionaryWithDefault(d) => {
                     queue.extend(d.entries.iter().map(|(_, ch)| *ch));
                     queue.push(d.default_handle);
+                }
+                // Hard-owned objects (codes 360-369), e.g. the TABLECONTENT
+                // of a table's ACAD_ROUNDTRIP_2008_TABLE_ENTITY record.
+                ObjectType::XRecord(x) => {
+                    queue.extend(
+                        x.entries
+                            .iter()
+                            .filter(|entry| (360..=369).contains(&entry.code))
+                            .filter_map(|entry| entry.value.as_handle()),
+                    );
                 }
                 _ => {}
             }
@@ -2274,23 +2387,47 @@ impl ClipboardDeps {
                     }
                 }
             }
+            Self::queue_table_blocks(doc, e, &mut seen, &mut queue);
         }
         let mut defs = Vec::new();
         while let Some(name) = queue.pop() {
             let Some(def) = Self::snapshot_block(doc, &name) else {
                 continue;
             };
-            // Follow nested INSERTs so their definitions are captured too.
+            // Follow nested INSERTs and table block cells so their
+            // definitions are captured too.
             for e in &def.entities {
                 if let EntityType::Insert(ins) = e {
                     if seen.insert(ins.block_name.clone()) {
                         queue.push(ins.block_name.clone());
                     }
                 }
+                Self::queue_table_blocks(doc, e, &mut seen, &mut queue);
             }
             defs.push(def);
         }
         defs
+    }
+
+    /// Queue the blocks a table's block cells show; the cells name them by
+    /// record handle.
+    fn queue_table_blocks(
+        doc: &codec::CadDocument,
+        entity: &codec::EntityType,
+        seen: &mut rustc_hash::FxHashSet<String>,
+        queue: &mut Vec<String>,
+    ) {
+        let codec::EntityType::Table(table) = entity else {
+            return;
+        };
+        for name in crate::app::command_driver::clipboard::table_cell_blocks(table)
+            .filter_map(|h| doc.block_records.iter().find(|r| r.handle == h))
+            .map(|record| record.name.clone())
+        {
+            if seen.insert(name.clone()) {
+                queue.push(name);
+            }
+        }
     }
 
     /// Snapshot one block definition as a portable `BlockDef`: its base point
@@ -2398,6 +2535,8 @@ pub enum ModalKind {
     RecoveryPrompt,
     Options,
     FindReplace,
+    /// OVERKILL settings for the selected objects.
+    Overkill,
     AecDropWarning,
     #[cfg(not(target_arch = "wasm32"))]
     FileInUse,
@@ -2437,6 +2576,8 @@ pub enum ModalKind {
     TdsImport,
     /// A 3D Studio import set to ask: one mesh with several materials.
     TdsMaterial,
+    /// A texture map a 3D Studio import did not find, one window per map.
+    TdsMissingMap,
     /// Web: a crash-recovery autosave snapshot newer than the drawing's last
     /// save awaits a restore/discard decision. Distinct from the corrupt-file
     /// `RecoveryPrompt` — nothing is wrong with the drawing itself.
@@ -2642,6 +2783,11 @@ pub enum Message {
     FindReplaceNext,
     FindReplaceOne,
     FindReplaceAll,
+    FindReplaceFindAll,
+    FindReplaceSelectResult(usize),
+    OverkillSettingsChanged(crate::modules::draw::modify::overkill::Settings),
+    OverkillToleranceChanged(String),
+    OverkillOk,
     /// System-clipboard text read for the MText editor (`None` = empty/denied).
     MTextPasteClip(Option<String>),
     /// System-clipboard text read for the single-line TEXT editor.
@@ -3855,6 +4001,10 @@ pub enum Message {
     },
     /// User committed a geometry/common field edit (Enter pressed).
     PropGeomCommit(&'static str),
+    PropBlockInput { key: crate::scene::model::object::BlockParameterKey, value: String },
+    PropBlockCommit(crate::scene::model::object::BlockParameterKey),
+    PropBlockChoice { key: crate::scene::model::object::BlockParameterKey, index: usize },
+
     /// Toggle a collapsed coordinate group ("Position", "Scale", …) open or
     /// closed in the Properties panel, keyed `section:base`.
     PropGroupToggle(String),
@@ -4028,6 +4178,8 @@ pub enum Message {
     /// `Scene::named_parameters`.
     NamedParametersOpen,
     BlockEditorSettingsInput(usize, String),
+    BlockConstraintColorInput(usize, String),
+    ToggleBlockConstraintStatus,
     BlockEditorSettingsReset,
     BlockEditorSettingsApply,
     BlockCycleSelect(usize),
@@ -4630,6 +4782,8 @@ pub enum Message {
     ImageEmbedPick,
     /// Result of the embedded-image picker: bytes prepared for an OLE2FRAME.
     ImageEmbedPickResult(Result<crate::io::ole_embed::EmbeddedImage, String>),
+    /// INSERTOBJ: the picture chosen in the Insert Object window.
+    InsertObjectResult(Result<crate::io::ole_embed::EmbeddedImage, String>),
     // ── Missing fonts ─────────────────────────────────────────────────────
     /// Download the offered missing fonts from the community repository.
     MissingFontsDownload,
@@ -4655,10 +4809,13 @@ pub enum Message {
     RefEditDialog(crate::ui::window::refedit_dialog::RefEditDialogMsg),
     /// An edit in the Password Protected PDF window.
     PdfPassword(crate::ui::window::pdf_password_dialog::PdfPasswordMsg),
+    HyperlinkDialog(crate::ui::window::hyperlink_dialog::HyperlinkMsg),
     PdfShxDialog(crate::ui::window::pdf_shx_dialog::ShxDialogMsg),
     /// A click or search in the Point Cloud Manager.
     PcManager(crate::ui::window::pc_manager::PcManagerMsg),
     Count(crate::ui::window::count_palette::CountMsg),
+    /// The QuickCalc pallet.
+    QuickCalc(crate::ui::window::quick_calc::QuickCalcMsg),
     SheetSet(crate::ui::window::sheet_set::SheetSetMsg),
     PdfImportPickResult(Result<(std::path::PathBuf, std::sync::Arc<Vec<u8>>), String>),
     /// Result of the PDFATTACH file picker.
@@ -4917,6 +5074,7 @@ impl OpenCADStudio {
             cursor_size: 5,
             pick_box: 3,
             hatch_associative: true,
+            hatch_gap_tolerance: 0.0,
             show_menu_bar: false,
             ribbon_closed: false,
             double_click_block_refedit: false,
@@ -5018,6 +5176,12 @@ impl OpenCADStudio {
             plugin_grip_deliveries: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             plugin_grip_live_originals: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_grip_settle_watchdog: crate::app::update::SETTLE_WATCHDOG,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_grip_settle_strikes: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_plugin_grips_rearm: Default::default(),
             grip_popup: None,
             grip_pending: None,
             visibility_popup: None,
@@ -5055,6 +5219,7 @@ impl OpenCADStudio {
             show_browser: false,
             pc_manager: Default::default(),
             count_palette: Default::default(),
+            quick_calc: Default::default(),
             sheet_set: Default::default(),
             sheet_set_pending_layout: None,
             sheet_set_import_parent: None,
@@ -5116,12 +5281,14 @@ impl OpenCADStudio {
             hyperlink_editor_description: String::new(),
             hyperlink_editor_mixed: false,
             hyperlink_editor_dirty: false,
+            hyperlink_options: Default::default(),
             pending_startup_modals: std::collections::VecDeque::new(),
             gpu_status: crate::scene::pipeline::GpuStatus::Unknown,
             gpu_status_generation: 0,
             gpu_warning_silenced: String::new(),
             plotstyle_parent_plot_geometry: None,
             find_replace: FindReplaceState::default(),
+            overkill_dialog: None,
             aec_drop_acknowledged: false,
             aec_drop_count: 0,
             layer_delete_pending: None,
@@ -5277,6 +5444,7 @@ impl OpenCADStudio {
             alias_close_confirm: false,
             alias_import_report: String::new(),
             named_parameter_editor_rows: Vec::new(),
+            cal_context: calc::CalcContext::default(),
             // Layout Manager
             layout_manager_selected: "Model".to_string(),
             layer_state_selected: None,

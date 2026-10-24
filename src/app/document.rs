@@ -165,6 +165,9 @@ pub(super) struct DocumentTab {
     pub(super) measurement: super::measurement::MeasurementDisplay,
     /// Remaining command tokens queued behind a PAUSE (or `\`) awaiting user interaction.
     pub(super) pending_pause_tokens: Option<Vec<String>>,
+    /// Layers the last LAYISO turned off, so LAYUNISO turns back on exactly
+    /// those and leaves layers that were already off alone (#2021).
+    pub(super) layiso_turned_off: Option<Vec<String>>,
     /// The selection set the most recent command worked on, captured when a
     /// finishing command drops the live selection — re-selectable with the
     /// "Previous" keyword at any Select objects prompt (#426).
@@ -253,6 +256,8 @@ pub(super) struct DocumentTab {
     /// handle numbering, so an app-global set keyed by raw handle leaks one
     /// tab's opt-out into another tab reusing the value (#47).
     pub(super) props_asym_scale: std::collections::HashSet<u64>,
+    /// OLE objects' scale base and aspect lock, by handle.
+    pub(super) ole_frames: std::collections::HashMap<u64, crate::entities::ole2frame::FrameState>,
     /// Node graph shown by the command line's graph button.
     pub(super) graph: crate::ui::node_graph::Graph,
     /// Currently active UCS. `None` means WCS (identity transform).
@@ -304,6 +309,11 @@ pub(super) struct DocumentTab {
     /// of the model-space shader. The scene is still constructed so the
     /// rest of the code can treat it as a normal tab when reading.
     pub(super) is_start: bool,
+    /// Room the docked edges took beside the viewport (left, right) when
+    /// this drawing was last on screen, and the window size then. A dock
+    /// change pans the view by the difference so the drawing stays put,
+    /// and either change sets the viewport's new size right away.
+    pub(super) dock_inset: Option<(f32, f32, (f32, f32))>,
     /// Interactive PAN mode (the PAN command / tool). While active, a left-
     /// button drag pans the view instead of selecting — the only pan path on a
     /// device with no middle mouse button (a trackpad / web client). Exited
@@ -739,6 +749,7 @@ impl DocumentTab {
             pending_action_pair: None,
             measurement: super::measurement::MeasurementDisplay::default(),
             pending_pause_tokens: None,
+            layiso_turned_off: None,
             last_cmd: None,
             last_draw_anchor: None,
             snap_result: None,
@@ -778,6 +789,7 @@ impl DocumentTab {
             block_test: None,
             active_layer: "0".to_string(),
             props_asym_scale: std::collections::HashSet::new(),
+            ole_frames: std::collections::HashMap::new(),
             graph: Default::default(),
             active_ucs: None,
             sketch_session: None,
@@ -798,6 +810,7 @@ impl DocumentTab {
             xref_missing: 0,
             xref_report: Vec::new(),
             is_start: false,
+            dock_inset: None,
             pan_mode: false,
             orbit_mode: false,
             zoom_dynamic_mode: false,

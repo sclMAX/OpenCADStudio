@@ -119,11 +119,15 @@ impl OpenCADStudio {
                 return Some(Task::done(Message::QSelectOpen));
             }
 
-            // CAL / QUICKCALC <expression> — evaluate an arithmetic expression
-            //   (+ - * /, parentheses, unary minus, decimals).
-            "CAL" | "QUICKCALC" | "QC" => {
-                use crate::command::ValuePromptCommand;
-                let c = ValuePromptCommand::new("CAL", "CAL  expression  (e.g. (2+3)*4):");
+            // CAL <expression> — evaluate an expression on the
+            //   shared calculator engine (`app::calc`): arithmetic, points,
+            //   functions, unit suffixes, variables and `ans`. Free text, so
+            //   spaces inside the expression don't end the input.
+            // QUICKCALC / QC show or hide the QuickCalc pallet.
+            "QUICKCALC" | "QC" => return Some(self.toggle_quick_calc()),
+            "CAL" => {
+                use crate::command::FreeTextValuePromptCommand;
+                let c = FreeTextValuePromptCommand::new("CAL", "CAL  expression  (e.g. (2+3)*4):");
                 self.command_line.push_info(&c.prompt());
                 self.tabs[self.active_tab].active_cmd = Some(Box::new(c));
             }
@@ -141,8 +145,14 @@ impl OpenCADStudio {
                         crate::t!("Usage: CAL <expression>   e.g. CAL (2+3)*4").as_ref(),
                     );
                 } else {
-                    match arith_eval(expr) {
-                        Ok(v) => self.command_line.push_output(crate::tf!("= {v}").as_ref()),
+                    self.cal_context.base_unit = crate::app::quick_calc::base_unit(&self.tabs[i]);
+                    self.cal_context.sysvars =
+                        Some(crate::app::quick_calc::sysvars(&self.tabs[i]));
+                    match crate::app::calc::evaluate(expr, &mut self.cal_context) {
+                        Ok(v) => {
+                            let v = v.display();
+                            self.command_line.push_output(crate::tf!("= {v}").as_ref())
+                        }
                         Err(e) => self
                             .command_line
                             .push_error(crate::tf!("CAL: {e}").as_ref()),
@@ -154,9 +164,12 @@ impl OpenCADStudio {
             "LIST" => {
                 let selected: Vec<_> = self.tabs[i].scene.selected_entities();
                 if selected.is_empty() {
-                    self.command_line.push_error(
-                        crate::t!("LIST: no entities selected. Select entities first.").as_ref(),
-                    );
+                    // Without a selection, ask for the objects first.
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("LIST");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                    return Some(Task::none());
                 } else {
                     for (handle, _) in &selected {
                         if let Some(entity) = self.tabs[i].scene.document.get_entity(*handle) {
@@ -792,6 +805,14 @@ impl OpenCADStudio {
 
             // ── FLATTEN — move selected (or all) entities to Z=0 ─────────────
             "FLATTEN" => {
+                // Without a selection, ask for the objects first.
+                if self.tabs[i].scene.selected_entities().is_empty() {
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("FLATTEN");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
+                    return Some(Task::none());
+                }
                 let scene = &self.tabs[i].scene;
                 let handles = crate::modules::draw::modify::flatten::collect_flatten_handles(scene);
                 if handles.is_empty() {
@@ -1046,6 +1067,7 @@ impl OpenCADStudio {
             self.tabs[i].scene.set_current_layout("Model".to_string());
         }
         self.tabs[i].scene.block_edit_block = Some(br_handle);
+        self.reset_block_constraint_display(i);
         self.tabs[i].block_edits.push(BlockEditSession {
             block_name: block_name.clone(),
             br_handle,
@@ -1121,6 +1143,7 @@ impl OpenCADStudio {
             };
             self.tabs[i].scene.set_current_layout("Model".to_string());
             self.tabs[i].scene.block_edit_block = Some(br_handle);
+            self.reset_block_constraint_display(i);
             self.tabs[i].active_block_edit = Some(parent_index);
             *self.tabs[i].scene.camera.borrow_mut() = editor_camera;
         } else {
@@ -1443,13 +1466,19 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
             a.end_angle.to_degrees()
         )
         .into_owned(),
-        codec::EntityType::LwPolyline(p) => crate::tf!(
-            "{} vertices  closed={}  elevation={:.4}",
-            p.vertices.len(),
-            p.is_closed,
-            p.elevation
-        )
-        .into_owned(),
+        codec::EntityType::LwPolyline(p) => {
+            let mut details = crate::tf!(
+                "{} vertices  closed={}  elevation={:.4}",
+                p.vertices.len(),
+                p.is_closed,
+                p.elevation
+            )
+            .into_owned();
+            for v in &p.vertices {
+                details.push_str(&format!("\n    ({:.4},{:.4})", v.location.x, v.location.y));
+            }
+            details
+        }
         codec::EntityType::Text(t) => crate::tf!(
             "\"{}\"  h={:.4}  at ({:.4},{:.4})",
             t.value,
@@ -1497,21 +1526,6 @@ fn entity_list_details(entity: &codec::EntityType) -> String {
     }
 }
 
-// ── CAL — arithmetic expression evaluator ──────────────────────────────────
-// A small recursive-descent parser for `+ - * /`, parentheses, unary signs and
-// decimal numbers. Self-contained (no external dependency).
-fn arith_eval(expr: &str) -> Result<f64, String> {
-    let mut p = ArithParser {
-        chars: expr.chars().filter(|c| !c.is_whitespace()).collect(),
-        pos: 0,
-    };
-    let v = p.expr()?;
-    if p.pos != p.chars.len() {
-        return Err(crate::tf!("unexpected '{}'", p.chars[p.pos]).into_owned());
-    }
-    Ok(v)
-}
-
 impl OpenCADStudio {
     /// Open the attribute editor. If a single block with attributes is already
     /// selected it opens directly on that block; otherwise it starts the
@@ -1540,94 +1554,6 @@ impl OpenCADStudio {
             self.command_line.push_info(&cmd_obj.prompt());
             self.tabs[i].active_cmd = Some(Box::new(cmd_obj));
         }
-    }
-}
-
-struct ArithParser {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl ArithParser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    // expr = term (('+' | '-') term)*
-    fn expr(&mut self) -> Result<f64, String> {
-        let mut v = self.term()?;
-        while let Some(op) = self.peek() {
-            if op == '+' || op == '-' {
-                self.pos += 1;
-                let rhs = self.term()?;
-                v = if op == '+' { v + rhs } else { v - rhs };
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-
-    // term = factor (('*' | '/') factor)*
-    fn term(&mut self) -> Result<f64, String> {
-        let mut v = self.factor()?;
-        while let Some(op) = self.peek() {
-            if op == '*' || op == '/' {
-                self.pos += 1;
-                let rhs = self.factor()?;
-                if op == '/' {
-                    if rhs == 0.0 {
-                        return Err("division by zero".into());
-                    }
-                    v /= rhs;
-                } else {
-                    v *= rhs;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(v)
-    }
-
-    // factor = ('+' | '-') factor | '(' expr ')' | number
-    fn factor(&mut self) -> Result<f64, String> {
-        match self.peek() {
-            Some('+') => {
-                self.pos += 1;
-                self.factor()
-            }
-            Some('-') => {
-                self.pos += 1;
-                Ok(-self.factor()?)
-            }
-            Some('(') => {
-                self.pos += 1;
-                let v = self.expr()?;
-                if self.peek() != Some(')') {
-                    return Err("missing ')'".into());
-                }
-                self.pos += 1;
-                Ok(v)
-            }
-            Some(c) if c.is_ascii_digit() || c == '.' => self.number(),
-            Some(c) => Err(crate::tf!("unexpected '{c}'").into_owned()),
-            None => Err("unexpected end of expression".into()),
-        }
-    }
-
-    fn number(&mut self) -> Result<f64, String> {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == '.' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>()
-            .map_err(|_| crate::tf!("bad number '{s}'").into_owned())
     }
 }
 
@@ -1832,5 +1758,36 @@ mod find_replace_command_tests {
             }
             _ => panic!("Expected CmdResult::Measurement"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cal_tests {
+    use super::*;
+
+    #[test]
+    fn cal_evaluates_on_the_shared_engine() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.document.header.insertion_units = 4;
+        // The prompt takes free text, spaces included; variables, ans and
+        // the drawing unit carry through every CAL.
+        let _ = app.dispatch_command("CAL");
+        let _ = app.feed_active_cmd("$wall = (2 + 1.6) * 1m");
+        for (cmd, expected) in [
+            ("CAL $wall + 90", "= 3690"),
+            ("CAL *2", "= 7380"),
+            ("CAL dist([0,0],[3,4])", "= 5"),
+            ("CAL 1/0", "CAL:"),
+        ] {
+            let _ = app.dispatch_command(cmd);
+            let last = &app.command_line.history.last().unwrap().text;
+            assert!(last.contains(expected), "{cmd}: {last}");
+        }
+        app.tabs[i].scene.document.header.insertion_units = 6;
+        let _ = app.dispatch_command("CAL 1500mm");
+        let last = &app.command_line.history.last().unwrap().text;
+        assert!(last.ends_with("= 1.5"), "{last}");
     }
 }

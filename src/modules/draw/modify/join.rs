@@ -447,18 +447,64 @@ fn segs_of(e: &EntityType) -> Option<Vec<Seg>> {
 
 /// Join `entities` end-to-end: into one entity when they form a single
 /// chain, otherwise chain by chain, leaving alone what joins nothing (a
-/// closed polyline, a lone object, a branching set). Returns
-/// `(removed_handles, new_entities)`, or `None` when nothing joined.
+/// closed polyline, a lone object, a branching set). Lines and arcs left
+/// over then join across gaps: collinear lines into one line, arcs on the
+/// same circle into one arc. Returns `(removed_handles, new_entities)`, or
+/// `None` when nothing joined.
 pub fn join_entities(entities: &[(Handle, &EntityType)]) -> Option<(Vec<Handle>, Vec<EntityType>)> {
+    let (mut removed, mut merged) = join_touching(entities).unwrap_or_default();
+    let mut rest: Vec<(Handle, &EntityType)> = entities
+        .iter()
+        .filter(|(handle, entity)| {
+            !removed.contains(handle) && matches!(entity, EntityType::Line(_) | EntityType::Arc(_))
+        })
+        .copied()
+        .collect();
+    while !rest.is_empty() {
+        let (handle, source) = rest.remove(0);
+        if let Some((mut joined, consumed)) = join_to_source(source, &rest) {
+            rest.retain(|(handle, _)| !consumed.contains(handle));
+            joined.common_mut().handle = Handle::NULL;
+            removed.push(handle);
+            removed.extend(consumed);
+            merged.push(joined);
+        }
+    }
+    (!removed.is_empty()).then_some((removed, merged))
+}
+
+/// Why [`join_entities`] joined nothing, for the command-line error.
+pub fn join_failure_reason(entities: &[(Handle, &EntityType)]) -> std::borrow::Cow<'static, str> {
+    let ends: Option<Vec<Vec<DVec3>>> = entities
+        .iter()
+        .map(|(_, entity)| endpoints(entity))
+        .collect();
+    let Some(ends) = ends else {
+        return crate::t!("JOIN: an object can't be joined (closed, tilted or unsupported type).");
+    };
+    let touch = ends.iter().enumerate().any(|(a, pa)| {
+        ends[a + 1..].iter().any(|pb| {
+            pa.iter()
+                .any(|p| pb.iter().any(|q| p.distance(*q) <= JOIN_EPS))
+        })
+    });
+    if touch {
+        crate::t!("JOIN: the objects branch or leave one plane, so they don't form one chain.")
+    } else {
+        crate::t!("JOIN: the objects don't touch; only collinear lines or arcs of one circle join across a gap.")
+    }
+}
+
+fn endpoints(entity: &EntityType) -> Option<Vec<DVec3>> {
+    segs_of(entity).map(|segs| segs.iter().flat_map(|seg| [seg.a, seg.b]).collect())
+}
+
+fn join_touching(entities: &[(Handle, &EntityType)]) -> Option<(Vec<Handle>, Vec<EntityType>)> {
     if let Some(joined) = join_chain(entities) {
         return Some(joined);
     }
-    let ends: Vec<Option<Vec<DVec3>>> = entities
-        .iter()
-        .map(|(_, entity)| {
-            segs_of(entity).map(|segs| segs.iter().flat_map(|seg| [seg.a, seg.b]).collect())
-        })
-        .collect();
+    let ends: Vec<Option<Vec<DVec3>>> =
+        entities.iter().map(|(_, entity)| endpoints(entity)).collect();
     fn root(group: &mut [usize], mut index: usize) -> usize {
         while group[index] != index {
             group[index] = group[group[index]];
@@ -821,6 +867,21 @@ mod join_tests {
         assert!(out
             .iter()
             .all(|entity| matches!(entity, EntityType::LwPolyline(pl) if pl.is_closed)));
+    }
+
+    // Collinear lines with a gap join into one line spanning it (#2017).
+    #[test]
+    fn collinear_lines_join_across_a_gap() {
+        let (e1, e2) = (line(0.0, 0.0, 4.0, 0.0, 0.0), line(7.0, 0.0, 10.0, 0.0, 0.0));
+        let pairs = [(Handle::new(1), &e1), (Handle::new(2), &e2)];
+        let (removed, out) = join_entities(&pairs).expect("gap joins");
+        assert_eq!(removed.len(), 2);
+        let [EntityType::Line(l)] = out.as_slice() else {
+            panic!("expected one line");
+        };
+        assert_eq!((l.start.x, l.end.x), (0.0, 10.0));
+        let skew = line(7.0, 1.0, 10.0, 2.0, 0.0);
+        assert!(join_entities(&[(Handle::new(1), &e1), (Handle::new(2), &skew)]).is_none());
     }
 
     #[test]

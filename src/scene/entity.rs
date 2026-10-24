@@ -1383,6 +1383,8 @@ impl Scene {
         let end_handle = Handle::new(next + 2);
 
         let mut block_record = codec::tables::BlockRecord::new(name);
+        block_record.flags.anonymous = name.starts_with('*')
+            && !(block_record.is_model_space() || block_record.is_paper_space());
         block_record.handle = br_handle;
         block_record.block_entity_handle = block_handle;
         block_record.block_end_handle = end_handle;
@@ -1682,6 +1684,8 @@ impl Scene {
             self.bg_color
         };
         let depth_map = self.draw_depth_map();
+        let constraint_display = (self.constraint_shading_active() && self.block_edit_block == Some(target_block))
+            .then(|| (self.block_constraint_report(target_block), self.constraint_palette()));
         let mut models: Vec<HatchModel> = self
             .hatches
             .iter()
@@ -1695,7 +1699,7 @@ impl Scene {
                 )
             })
             .flat_map(|(&handle, model)| {
-                let (backdrop, model) = self.synced_hatch_model(
+                let (backdrop, mut model) = self.synced_hatch_model(
                     handle,
                     model,
                     annotation_scale_handle,
@@ -1704,6 +1708,13 @@ impl Scene {
                     &depth_map,
                     tint_selected,
                 );
+                if let Some((report, palette)) = &constraint_display {
+                    if let Some(mut color) = self.constraint_display_color(report, handle, palette) {
+                        color[3] = model.color[3];
+                        model.color = color;
+                        if let crate::scene::model::hatch_model::HatchPattern::Gradient { color2, .. } = &mut model.pattern { *color2 = color; }
+                    }
+                }
                 backdrop.into_iter().chain(std::iter::once(model))
             })
             .collect();
@@ -1864,6 +1875,37 @@ impl Scene {
         include_preview_hidden: bool,
         plot_only: bool,
     ) -> Vec<HatchModel> {
+        self.instanced_hatch_models_for_document(
+            &self.document,
+            layout_block,
+            hatch_bg,
+            tint_selected,
+            frozen,
+            annotation_scale_handle,
+            all_visible,
+            viewport,
+            targets,
+            include_preview_hidden,
+            plot_only,
+        )
+    }
+
+    pub(super) fn instanced_hatch_models_for_document(
+        &self,
+        document: &CadDocument,
+        layout_block: Handle,
+        hatch_bg: [f32; 4],
+        tint_selected: bool,
+        frozen: Option<&rustc_hash::FxHashSet<Handle>>,
+        annotation_scale_handle: Option<Handle>,
+        all_visible: bool,
+        viewport: Option<Handle>,
+        targets: Option<&rustc_hash::FxHashSet<Handle>>,
+        include_preview_hidden: bool,
+        plot_only: bool,
+    ) -> Vec<HatchModel> {
+        let constraint_display = (!plot_only && self.constraint_shading_active() && self.block_edit_block == Some(layout_block))
+            .then(|| (self.block_constraint_report(layout_block), self.constraint_palette()));
         let depth_map = self.draw_depth_map();
         let visibility_reveal = if plot_only {
             rustc_hash::FxHashSet::default()
@@ -1871,7 +1913,7 @@ impl Scene {
             self.visibility_reveal_handles()
         };
         let graph = crate::scene::render_graph::RenderSceneGraph::new(
-            &self.document,
+            document,
             frozen,
             annotation_scale_handle,
             all_visible,
@@ -1908,7 +1950,7 @@ impl Scene {
                         && targets.contains(&common.handle);
                 }
                 let block_uses: Vec<_> = crate::scene::render_graph::entity_render_block_uses(
-                    &self.document,
+                    document,
                     entity,
                     1.0,
                 )
@@ -1920,7 +1962,7 @@ impl Scene {
                 } else {
                     block_uses.into_iter().any(|block_use| {
                         crate::scene::render_graph::block_contains_hatch(
-                            &self.document,
+                            document,
                             &block_use.insert.block_name,
                             &mut hatch_block_memo,
                         )
@@ -1937,7 +1979,7 @@ impl Scene {
                 if plot_only && !self.layer_plottable_in_context(entity, context) {
                     return;
                 }
-                let style = context.style_for(&self.document, entity);
+                let style = context.style_for(document, entity);
                 let preserve_white_mask = source_hatch.is_solid
                     && matches!(source_hatch.common.color, codec::types::Color::Index(7));
                 let color = if preserve_white_mask {
@@ -1954,6 +1996,13 @@ impl Scene {
                 let Some(mut model) = Self::hatch_model_from_dxf(&hatch, color) else {
                     return;
                 };
+                if let Some((report, palette)) = &constraint_display {
+                    if let Some(mut color) = self.constraint_display_color(report, context.root_handle, palette) {
+                        color[3] = model.color[3];
+                        model.color = color;
+                        if let crate::scene::model::hatch_model::HatchPattern::Gradient { color2, .. } = &mut model.pattern { *color2 = color; }
+                    }
+                }
                 model.aci = style.4;
                 model.line_weight_px = style.3;
                 model.draw_depth =
@@ -3333,11 +3382,25 @@ impl Scene {
         // large until the first CANNOSCALE change shrank them. (#1674)
         self.sync_annotation_scale_from_header();
         for obj in self.document.objects.values_mut() {
-            if let codec::objects::ObjectType::Layout(l) = obj {
-                if l.name != "Model" {
+            match obj {
+                codec::objects::ObjectType::Layout(l) if l.name != "Model" => {
                     crate::scene::apply_default_page_setup(l, "");
                     self.unopened_layouts.insert(l.name.clone());
                 }
+                // The codec's Standard multileader style is sized in inches;
+                // the metric template's is in millimetres. Left as-is, a new
+                // leader's arrow and landing were a fraction of a millimetre,
+                // invisible on a sheet. (#2027)
+                codec::objects::ObjectType::MultiLeaderStyle(s)
+                    if s.name.eq_ignore_ascii_case("Standard") =>
+                {
+                    s.text_height = 4.0;
+                    s.arrowhead_size = 4.0;
+                    s.landing_gap = 2.0;
+                    s.landing_distance = 8.0;
+                    s.break_gap_size = 3.75;
+                }
+                _ => {}
             }
         }
     }

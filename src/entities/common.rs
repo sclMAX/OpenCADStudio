@@ -1129,6 +1129,67 @@ pub(crate) fn extrude_wide_band_outline(
     }
 }
 
+/// One wide-polyline segment as `polyline_segment_fill` takes it:
+/// `(p0, p1, hw0, hw1, bulge)`.
+pub(crate) type WideSegment = ([f32; 2], [f32; 2], f32, f32, f32);
+
+/// Mitre the bands of consecutive straight segments of the same width:
+/// both corners where they meet move to the joint's bisector, so the outer
+/// side has no notch and the inner side no overlap. `bands[k]` is the
+/// `polyline_segment_fill` quad of `segments[k]`; `closed` also joins the
+/// last segment to the first. Turns sharper than the wire shaders' mitre
+/// limit keep their butt ends.
+pub(crate) fn mitre_wide_joins(
+    bands: &mut [Vec<[f32; 2]>],
+    segments: &[WideSegment],
+    closed: bool,
+) {
+    let n = segments.len().min(bands.len());
+    let joins = if closed { n } else { n.saturating_sub(1) };
+    for i in 0..joins {
+        let next = (i + 1) % n;
+        let (a0, a1, _, h, a_bulge) = segments[i];
+        let (b0, b1, b_h, _, b_bulge) = segments[next];
+        if a_bulge.abs() > 1e-9 || b_bulge.abs() > 1e-9 || h < 1e-6 {
+            continue;
+        }
+        if bands[i].len() != 4
+            || bands[next].len() != 4
+            || (b_h - h).abs() > 1e-4 * h.max(1.0)
+            || (a1[0] - b0[0]).abs() > 1e-4
+            || (a1[1] - b0[1]).abs() > 1e-4
+        {
+            continue;
+        }
+        let unit = |p: [f32; 2], q: [f32; 2]| {
+            let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+            let len = (dx * dx + dy * dy).sqrt();
+            (len > 1e-9).then(|| [dx / len, dy / len])
+        };
+        let (Some(d0), Some(d1)) = (unit(a0, a1), unit(b0, b1)) else {
+            continue;
+        };
+        let cos = d0[0] * d1[0] + d0[1] * d1[1];
+        let sin = d0[0] * d1[1] - d0[1] * d1[0];
+        if sin.abs() < 1e-6 || 1.0 + cos < 1e-6 {
+            continue;
+        }
+        let half_turn = (sin / (1.0 + cos)).abs() as f64;
+        if half_turn > crate::scene::pipeline::wire_gpu::MITER_LIMIT {
+            continue;
+        }
+        // Left normals; their sum over (1 + cos) reaches the bisector.
+        let k = h / (1.0 + cos);
+        let m = [k * (-d0[1] - d1[1]), k * (d0[0] + d1[0])];
+        let left = [a1[0] + m[0], a1[1] + m[1]];
+        let right = [a1[0] - m[0], a1[1] - m[1]];
+        bands[i][1] = left;
+        bands[i][2] = right;
+        bands[next][0] = left;
+        bands[next][3] = right;
+    }
+}
+
 /// Compute the filled boundary polygon for one polyline segment.
 /// For straight segments: a rectangle/trapezoid.
 /// For arc segments: an arc band (outer arc + reversed inner arc).

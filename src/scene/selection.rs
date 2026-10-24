@@ -1,32 +1,21 @@
 use super::*;
 
-/// The first PE_URL string is the URL; later strings describe the link.
+/// The address of the object's hyperlink.
 pub(crate) fn pe_url_of(entity: &EntityType) -> Option<&str> {
+    pe_url_strings(entity).next().filter(|text| !text.is_empty())
+}
+
+fn pe_url_strings(entity: &EntityType) -> impl Iterator<Item = &str> {
     entity
         .common()
         .extended_data
-        .get_record("PE_URL")
-        .and_then(|record| {
-            record.values.iter().find_map(|value| match value {
-                codec::xdata::XDataValue::String(text) => Some(text.trim()),
-                _ => None,
-            })
-        })
-        .filter(|text| !text.is_empty())
-}
-
-/// Optional description stored after the URL in the standard PE_URL record.
-pub(crate) fn pe_url_description_of(entity: &EntityType) -> Option<&str> {
-    let record = entity.common().extended_data.get_record("PE_URL")?;
-    record
-        .values
-        .iter()
+        .get_record(super::hyperlink::APP)
+        .into_iter()
+        .flat_map(|record| record.values.iter())
         .filter_map(|value| match value {
             codec::xdata::XDataValue::String(text) => Some(text.trim()),
             _ => None,
         })
-        .nth(1)
-        .filter(|text| !text.is_empty())
 }
 
 impl Scene {
@@ -791,7 +780,7 @@ impl Scene {
                                 PropValue::LayerChoice(_) => {
                                     QSelectValueEditor::Choice(layer_options.clone())
                                 }
-                                PropValue::Choice { ref options, .. } => {
+                                PropValue::Choice { ref options, .. } | PropValue::ChoiceWithTooltip { ref options, .. } => {
                                     QSelectValueEditor::Choice(options.clone())
                                 }
                                 PropValue::EditChoice {
@@ -835,7 +824,9 @@ impl Scene {
                                     QSelectValueEditor::Choice(vec!["false".into(), "true".into()])
                                 }
                                 PropValue::AttrText { .. } => QSelectValueEditor::Text,
-                                PropValue::Stepper { .. }
+                                PropValue::BlockNumber { .. }
+                                | PropValue::BlockChoice { .. }
+                                | PropValue::Stepper { .. }
                                 | PropValue::ColorVaries
                                 | PropValue::LwVaries
                                 | PropValue::FieldLwVaries { .. }
@@ -1013,7 +1004,7 @@ impl Scene {
                     | PropValue::PlainText(s)
                     | PropValue::Hyperlink(s) => s,
                     PropValue::LayerChoice(s) => s,
-                    PropValue::Choice { selected, .. } => selected,
+                    PropValue::Choice { selected, .. } | PropValue::ChoiceWithTooltip { selected, .. } => selected,
                     PropValue::EditChoice { value, .. } => value,
                     PropValue::ColorChoice(c) => Self::format_color(c),
                     PropValue::NamedColorChoice { name, .. } => name,
@@ -1025,7 +1016,9 @@ impl Scene {
                     PropValue::BoolToggle { value, .. } => value.to_string(),
                     PropValue::AttrText { value, .. } => value,
                     PropValue::Stepper { display, .. } => display,
-                    PropValue::ColorVaries
+                    PropValue::BlockNumber { .. }
+                    | PropValue::BlockChoice { .. }
+                    | PropValue::ColorVaries
                     | PropValue::LwVaries
                     | PropValue::FieldLwVaries { .. }
                     | PropValue::EntityLink { .. }

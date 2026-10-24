@@ -189,6 +189,26 @@ fn failure(code: &str, error: impl ToString) -> Value {
 /// `{"op":"open","name":"plan.dwg","data_base64":"…"}`: the web build has no
 /// filesystem path to open, so the caller sends the file itself. `name` is
 /// reduced to its file name; it labels the tab and the recent-files entry.
+/// Edits that only touch a document's records, so they can address an
+/// open document behind another tab (#2032). Interactive commands, input,
+/// picks, view and UI actions, plotting and saving still need the tab active.
+fn background_mutation(op: &str) -> bool {
+    matches!(
+        op,
+        "set_properties"
+            | "entities_create"
+            | "entities_delete"
+            | "entities_transform"
+            | "text_replace"
+            | "xdata_set"
+            | "block_define"
+            | "block_delete"
+            | "group_create"
+            | "undo"
+            | "redo"
+    )
+}
+
 fn open_bytes_request(req: &Value) -> Result<(String, Vec<u8>), Value> {
     use base64::Engine as _;
     let name = string(req, "name")?;
@@ -600,6 +620,10 @@ impl OpenCADStudio {
                 | "audit"
                 | "text_search"
                 | "text_audit"
+                | "blocks"
+                | "block_instances"
+                | "cad_get_blocks"
+                | "cad_extract_block_instances"
                 | "keytips"
         );
         if !query && !self.control.enabled {
@@ -851,13 +875,18 @@ impl OpenCADStudio {
                     "activate" | "switch_document" | "close" | "entities_copy_to"
                 )
             {
-                return (
-                    failure(
-                        "document_not_active",
-                        "Activate the requested document first",
-                    ),
-                    Task::none(),
-                );
+                if req["active_only"].as_bool() == Some(true)
+                    || !query && !background_mutation(op)
+                {
+                    return (
+                        failure(
+                            "document_not_active",
+                            "This operation needs the document's tab active; activate it first",
+                        ),
+                        Task::none(),
+                    );
+                }
+                return self.control_request_in_background(id, req);
             }
         // Interactive requests operate on the active tab by definition, so
         // a client may omit document_id (the GUI-hosted REST channel does).
@@ -923,6 +952,10 @@ impl OpenCADStudio {
                 "get_selection" => self.control_get_selection(),
                 "text_search" => self.control_text_search(&req).unwrap_or_else(|e| e),
                 "text_audit" => self.control_text_audit(&req).unwrap_or_else(|e| e),
+                "blocks"
+                | "block_instances"
+                | "cad_get_blocks"
+                | "cad_extract_block_instances" => self.control_blocks(&req).unwrap_or_else(|e| e),
                 "history" => {
                     json!({"ok":true,"entries":self.command_line.history.iter().map(|e|json!({"kind":format!("{:?}",e.kind),"text":e.text})).collect::<Vec<_>>()})
                 }
@@ -1029,6 +1062,29 @@ impl OpenCADStudio {
             .find(|(i, _, _)| i == &id)
             .map(|(_, _, r)| r.clone())
             .unwrap_or_else(|| json!({"ok":true,"status":"accepted","request_id":id}));
+        (response, task)
+    }
+
+    /// Serve a read or semantic edit addressed to an open document that is
+    /// not the visible tab (#2032): the request runs against that document's
+    /// live scene (its undo history, revision and dirty state), and the
+    /// visible tab, its command, selection and camera stay as they were. The
+    /// document is only made current for the duration of this call, so the
+    /// GUI never draws it.
+    fn control_request_in_background(&mut self, id: u64, req: Value) -> (Value, Task<Message>) {
+        let visible = self.tabs[self.active_tab].id;
+        let Some(target) = self.tabs.iter().position(|t| t.id == id) else {
+            return (failure("document_closed", "Document no longer exists"), Task::none());
+        };
+        self.active_tab = target;
+        let (response, task) = self.control_request(req);
+        if let Some(index) = self.tabs.iter().position(|t| t.id == visible) {
+            self.active_tab = index;
+        }
+        // Panels the edit refreshed follow the visible document again.
+        self.refresh_properties();
+        self.sync_ribbon_layers();
+        self.sync_ribbon_styles();
         (response, task)
     }
 
@@ -1890,6 +1946,7 @@ pub(crate) mod http_bridge;
 mod interactive;
 mod sheets;
 pub(crate) use sheets::new_guid_v4;
+pub(crate) mod block_ops;
 pub(crate) mod spellcheck;
 pub(crate) mod text_ops;
 
@@ -1920,6 +1977,45 @@ mod tests {
             r
         }
     }
+    #[test]
+    fn edits_reach_an_inactive_document_without_switching_tabs() {
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let target = app.tabs[app.active_tab].id;
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let visible = app.active_tab;
+        let revision = |app: &OpenCADStudio| {
+            app.tabs.iter().find(|t| t.id == target).unwrap().edit_revision
+        };
+        let send = |app: &mut OpenCADStudio, mut req: Value| {
+            req["protocol"] = json!(1);
+            req["document_id"] = json!(target);
+            req["revision"] = json!(revision(app));
+            req["client_id"] = json!("test");
+            req["request_id"] = json!(format!("bg-{}", app.control.serial));
+            app.control_request(req).0
+        };
+        let created = send(
+            &mut app,
+            json!({"op":"entities_create","entities":[{"type":"Line","start":[0,0],"end":[5,0]}]}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(app.active_tab, visible, "the visible tab must not change");
+        let count = |app: &OpenCADStudio, id: u64| {
+            let tab = app.tabs.iter().find(|t| t.id == id).unwrap();
+            tab.scene.document.entities().count()
+        };
+        assert_eq!(count(&app, target), 1);
+        assert_eq!(count(&app, app.tabs[visible].id), 0);
+        let records = send(&mut app, json!({"op":"entities"}));
+        assert_eq!(records["ok"], true, "{records}");
+        assert_eq!(send(&mut app, json!({"op":"undo"}))["ok"], true);
+        assert_eq!(count(&app, target), 0);
+        assert_eq!(app.active_tab, visible);
+        let run = send(&mut app, json!({"op":"run","cmd":"LINE 0,0 1,1"}));
+        assert_eq!(run["code"], "document_not_active", "{run}");
+    }
+
     #[test]
     fn qsave_completion_reports_clean_document_state() {
         let mut app = OpenCADStudio::new_for_test();

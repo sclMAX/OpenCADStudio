@@ -18,6 +18,7 @@ const NAMES: &[&str] = &[
     "GRIPDYNCOLOR",
     "GRIPTIPS",
     "BACTIONBARMODE",
+    "BCONSTATUSMODE",
 ];
 
 inventory::submit!(crate::command::CommandRegistration { names: NAMES });
@@ -39,6 +40,7 @@ impl OpenCADStudio {
             "BLOCKEDITOR" => u8::from(tab.active_block_edit_session().is_some()),
             "BLOCKTESTWINDOW" => u8::from(tab.block_test.is_some()),
             "BLOCKEDITLOCK" => u8::from(self.block_editor_preferences.locked),
+            "BCONSTATUSMODE" => u8::from(tab.scene.block_constraint_status_mode),
             _ => return None,
         })
     }
@@ -74,6 +76,7 @@ impl OpenCADStudio {
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        if name == "BCONSTATUSMODE" { return Some(self.dispatch_constraint_status_mode(i, value)); }
         if let Some(current) = self.block_editor_preferences.display_variable(&name) {
             if let Some(value) = value {
                 match self

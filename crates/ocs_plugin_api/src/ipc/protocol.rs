@@ -39,6 +39,8 @@ pub enum InteractiveEvent {
     ObjectPick { handle: Handle, pt: [f64; 3] },
     /// User cancelled the prompt (e.g. pressed ESC), resetting interactive collection.
     Cancel,
+    /// A set of entities selected during selection gathering mode.
+    SelectionComplete(Vec<Handle>),
 }
 
 /// Initial handshake sent by the plugin runner immediately after connecting.
@@ -104,6 +106,18 @@ pub enum HostRequest {
     CustomGripEvent {
         tab_index: usize,
         event: CustomGripEvent,
+    },
+    /// V7 (additive): query if an interactive command is in selection-gathering mode (as for `ssget`).
+    IsSelectionGathering {
+        command_id: u64,
+    },
+    /// V7 (additive): query if an interactive command permits drag window/crossing box selections.
+    AcceptsDragSelection {
+        command_id: u64,
+    },
+    /// V7 (additive): query if an interactive command rejects locked layers during selection.
+    SelectionRejectsLockedLayers {
+        command_id: u64,
     },
 }
 

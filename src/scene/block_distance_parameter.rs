@@ -52,7 +52,7 @@ pub(crate) struct Parameter<'a> {
 fn graph_handle(document: &CadDocument, definition: Handle) -> Option<Handle> {
     match document
         .objects
-        .get(&document.extension_dictionary_handle(definition)?)?
+        .get(&super::block_authoring::definition_dictionary(document, definition)?)?
     {
         ObjectType::Dictionary(dictionary) => dictionary.get("ACAD_ENHANCEDBLOCK"),
         _ => None,

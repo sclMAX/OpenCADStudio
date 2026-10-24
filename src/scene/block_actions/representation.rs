@@ -132,6 +132,7 @@ pub(super) fn reconcile(
         }
         entity.common_mut().handle = to;
         entity.common_mut().owner_handle = rep;
+        if crate::scene::block_construction::is_construction(entity.common()) { entity.common_mut().invisible = true; }
         entity.common_mut().raw_record = None;
         if existing {
             *scene.document.get_entity_mut(to).unwrap() = entity;
@@ -297,7 +298,8 @@ pub(super) fn apply_visibility(
     for h in members {
         let id = doc.get_entity(h).and_then(authoring::element_id);
         if let Some(hidden) = id.and_then(|id| flags.get(&id)) {
-            doc.get_entity_mut(h).unwrap().common_mut().invisible = *hidden;
+            let entity = doc.get_entity_mut(h).unwrap();
+            entity.common_mut().invisible = *hidden || crate::scene::block_construction::is_construction(entity.common());
         }
     }
     Ok(())

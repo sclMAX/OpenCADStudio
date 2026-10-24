@@ -441,16 +441,14 @@ fn block_test_lookup_choice_evaluates_temporary_reference_only() {
         .flat_map(|section| &section.props)
         .find(|property| property.field == "dyn_lookup")
         .expect("Test Block should expose the Lookup table choice");
-    let PropValue::Choice { selected, options } = &lookup_property.value else {
+    let PropValue::BlockChoice { key, selected, options, .. } = &lookup_property.value else {
         panic!("Lookup table property should be a choice")
     };
-    assert_eq!(selected, "Small");
+    assert_eq!(*selected, 0);
     assert_eq!(options, &["Small", "Large"]);
 
-    let _ = app.update(super::Message::PropGeomChoiceChanged {
-        field: "dyn_lookup",
-        value: "Large".into(),
-    });
+    let key = *key;
+    let _ = app.update(super::Message::PropBlockChoice { key, index: 1 });
     let EntityType::Insert(evaluated) = app.tabs[test].scene.document.get_entity(insert).unwrap()
     else {
         panic!("expected the temporary Test Block reference")

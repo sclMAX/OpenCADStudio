@@ -220,29 +220,9 @@ impl OpenCADStudio {
             ));
         let label = self.history_label_from_active_cmd(i, "TRIM");
         self.push_undo_snapshot(i, label);
-        // A replacement reusing the original handle must land after the erase;
-        // fresh pieces take over its hatch associations before it goes.
-        let reuses_handle = new_entities.iter().any(|e| e.common().handle == handle);
-        if reuses_handle {
-            self.tabs[i].scene.erase_entities(&[handle]);
-        }
-        let new_handles: Vec<codec::Handle> = new_entities
-            .into_iter()
-            .map(|e| self.tabs[i].scene.add_entity(e))
-            .collect();
-        if !reuses_handle {
-            self.tabs[i].scene.split_hatch_source(handle, &new_handles);
-            self.tabs[i].scene.erase_entities(&[handle]);
-        }
-        // Rebuild replaced dimensions from edited data.
-        for &nh in &new_handles {
-            if matches!(
-                self.tabs[i].scene.document.get_entity(nh),
-                Some(codec::EntityType::Dimension(_))
-            ) {
-                self.tabs[i].scene.invalidate_dim_block_recorded(nh);
-            }
-        }
+        // Apply one-to-one edits in place. Erase/add with the same handle
+        // duplicates its owning block membership and emits duplicate DXF records.
+        let new_handles = self.replace_command_entity(i, handle, new_entities);
         let pedit_entities = if self.tabs[i]
             .active_cmd
             .as_ref()
@@ -319,10 +299,11 @@ impl OpenCADStudio {
         let document = &mut self.tabs[i].scene.document;
         merge_app_ids(document, &self.clipboard_deps);
         let apps = eed_app_map(document, &self.clipboard_deps);
+        let images = merge_image_definitions(document, &self.clipboard_deps);
         // Single shared copy — see `merge_block_defs`. One batched geometry
         // rebuild instead of one per definition; same end state as the
         // per-definition bumps `Scene::define_block_raw` used to run.
-        if merge_block_defs(document, &blocks, &apps) > 0 {
+        if merge_block_defs(document, &blocks, &apps, &images) > 0 {
             self.tabs[i].scene.bump_geometry();
         }
     }
@@ -512,10 +493,44 @@ pub(crate) fn merge_table_records(doc: &mut codec::CadDocument, deps: &crate::ap
             let _ = doc.layers.add(r);
         }
     }
+    // Shape and text segments name their style by handle: find the target's
+    // matching style (a shape file by its font file, it has no name) or
+    // recreate it, so a pasted linetype never points into the source drawing.
+    let mut segment_styles: rustc_hash::FxHashMap<Handle, Handle> =
+        rustc_hash::FxHashMap::default();
+    for style in &deps.linetype_styles {
+        let existing = doc
+            .text_styles
+            .iter()
+            .find(|s| {
+                s.is_shape_file == style.is_shape_file
+                    && if style.is_shape_file {
+                        s.font_file.eq_ignore_ascii_case(&style.font_file)
+                    } else {
+                        s.name.eq_ignore_ascii_case(&style.name)
+                    }
+            })
+            .map(|s| s.handle);
+        let handle = existing.unwrap_or_else(|| {
+            let mut r = style.clone();
+            r.set_handle(doc.allocate_handle());
+            let handle = r.handle;
+            doc.text_styles.add_allow_duplicate(r);
+            handle
+        });
+        segment_styles.insert(style.handle, handle);
+    }
     for rec in &deps.linetypes {
         if !doc.line_types.contains(rec.name()) {
             let mut r = rec.clone();
             r.set_handle(doc.allocate_handle());
+            for element in &mut r.elements {
+                if let Some(complex) = element.complex.as_mut() {
+                    if let Some(new_style) = segment_styles.get(&complex.style_handle) {
+                        complex.style_handle = *new_style;
+                    }
+                }
+            }
             let _ = doc.line_types.add(r);
         }
     }
@@ -543,6 +558,156 @@ pub(crate) fn merge_app_ids(doc: &mut codec::CadDocument, deps: &crate::app::Cli
             let mut r = rec.clone();
             r.handle = doc.allocate_handle();
             let _ = doc.app_ids.add(r);
+        }
+    }
+}
+
+/// The `ACAD_IMAGE_DICT` dictionary under the named-objects root, created
+/// when the drawing has none. `None` when the drawing has no root dictionary.
+fn ensure_image_dictionary(document: &mut codec::CadDocument) -> Option<Handle> {
+    use codec::objects::{Dictionary, ObjectType};
+    let root = document.header.named_objects_dict_handle;
+    let Some(ObjectType::Dictionary(root_dictionary)) = document.objects.get(&root) else {
+        return None;
+    };
+    if let Some(existing) = root_dictionary.get("ACAD_IMAGE_DICT") {
+        if matches!(
+            document.objects.get(&existing),
+            Some(ObjectType::Dictionary(_))
+        ) {
+            return Some(existing);
+        }
+    }
+    let handle = document.allocate_handle();
+    let mut dictionary = Dictionary::new();
+    dictionary.handle = handle;
+    dictionary.owner = root;
+    document
+        .objects
+        .insert(handle, ObjectType::Dictionary(dictionary));
+    if let Some(ObjectType::Dictionary(root_dictionary)) = document.objects.get_mut(&root) {
+        root_dictionary.add_entry("ACAD_IMAGE_DICT", handle);
+    }
+    Some(handle)
+}
+
+/// Register image definition `definition` in ACAD_IMAGE_DICT under its file's
+/// name (made unique), like an image AutoCAD attached. Returns the dictionary,
+/// which is to own the definition; `None` when the drawing has no root
+/// dictionary.
+pub(crate) fn register_image_definition(
+    document: &mut codec::CadDocument,
+    definition: Handle,
+    file_path: &str,
+) -> Option<Handle> {
+    let stem = std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("IMAGE")
+        .to_owned();
+    let dictionary = ensure_image_dictionary(document)?;
+    if let Some(codec::objects::ObjectType::Dictionary(entries)) =
+        document.objects.get_mut(&dictionary)
+    {
+        let mut key = stem.clone();
+        let mut suffix = 1;
+        while entries.get(&key).is_some() {
+            suffix += 1;
+            key = format!("{stem}_{suffix}");
+        }
+        entries.add_entry(key, definition);
+    }
+    Some(dictionary)
+}
+
+/// Source image definition → this drawing's definition of the same file (one
+/// definition per file, as AutoCAD keeps it), recreated and registered in
+/// ACAD_IMAGE_DICT when the drawing has none. Pasting within the drawing
+/// finds the very same object.
+pub(crate) fn merge_image_definitions(
+    doc: &mut codec::CadDocument,
+    deps: &crate::app::ClipboardDeps,
+) -> rustc_hash::FxHashMap<Handle, Handle> {
+    use codec::objects::ObjectType;
+    let mut map = rustc_hash::FxHashMap::default();
+    for definition in &deps.image_definitions {
+        let same_file = |d: &codec::objects::ImageDefinition| {
+            d.file_name.eq_ignore_ascii_case(&definition.file_name)
+        };
+        let existing = match doc.objects.get(&definition.handle) {
+            Some(ObjectType::ImageDefinition(d)) if same_file(d) => Some(definition.handle),
+            _ => doc
+                .objects
+                .iter()
+                .find_map(|(handle, object)| match object {
+                    ObjectType::ImageDefinition(d) if same_file(d) => Some(*handle),
+                    _ => None,
+                }),
+        };
+        let handle = existing.unwrap_or_else(|| {
+            let handle = doc.allocate_handle();
+            let mut copy = definition.clone();
+            copy.handle = handle;
+            // The source images' reactors; pasted images drop theirs.
+            copy.reactors.clear();
+            copy.owner = register_image_definition(doc, handle, &definition.file_name)
+                .unwrap_or(Handle::NULL);
+            doc.objects
+                .insert(handle, ObjectType::ImageDefinition(copy));
+            handle
+        });
+        map.insert(definition.handle, handle);
+    }
+    map
+}
+
+/// Point a pasted raster image at this drawing's image definition. Its
+/// reactor link is dropped, as binding an xref does: the reactor belongs to
+/// the source image, also when pasting within the same drawing.
+fn remap_image_definition(
+    entity: &mut codec::EntityType,
+    definitions: &rustc_hash::FxHashMap<Handle, Handle>,
+) {
+    let codec::EntityType::RasterImage(image) = entity else {
+        return;
+    };
+    if let Some(definition) = image.definition_handle {
+        if let Some(&target) = definitions.get(&definition) {
+            image.definition_handle = Some(target);
+        }
+    }
+    image.definition_reactor_handle = None;
+}
+
+/// The block records a table's block cells show.
+pub(crate) fn table_cell_blocks(
+    table: &codec::entities::Table,
+) -> impl Iterator<Item = Handle> + '_ {
+    table
+        .rows
+        .iter()
+        .flat_map(|row| &row.cells)
+        .flat_map(|cell| &cell.contents)
+        .filter_map(|content| content.block_handle)
+}
+
+/// Point a pasted table's block cells at this drawing's records of the same
+/// blocks. `records` maps source records to target records.
+fn remap_table_cell_blocks(
+    table: &mut codec::entities::Table,
+    records: &std::collections::HashMap<Handle, Handle>,
+) {
+    let contents = table
+        .rows
+        .iter_mut()
+        .flat_map(|row| &mut row.cells)
+        .flat_map(|cell| &mut cell.contents);
+    for content in contents {
+        if let Some(block) = content.block_handle.as_mut() {
+            if let Some(&target) = records.get(block) {
+                *block = target;
+            }
         }
     }
 }
@@ -584,10 +749,13 @@ pub(crate) fn remap_eed_apps(entity: &mut codec::EntityType, apps: &rustc_hash::
 /// document lacks. Shared by `merge_clipboard_blocks` and
 /// `paste_entities_kernel`. Returns how many definitions were created, so
 /// render-cache callers can bump once instead of per definition.
+/// `images` maps source image definitions to this drawing's (see
+/// [`merge_image_definitions`]), for raster images inside the blocks.
 pub(crate) fn merge_block_defs(
     doc: &mut codec::CadDocument,
     blocks: &[crate::app::BlockDef],
     apps: &rustc_hash::FxHashMap<u64, u64>,
+    images: &rustc_hash::FxHashMap<Handle, Handle>,
 ) -> usize {
     let mut created = Vec::new();
     for def in blocks {
@@ -595,16 +763,24 @@ pub(crate) fn merge_block_defs(
         let mut entities = def.entities.clone();
         for entity in &mut entities {
             remap_eed_apps(entity, apps);
+            remap_image_definition(entity, images);
         }
         define_block_raw_doc(doc, &def.name, def.base_point, &entities);
         if doc.block_records.len() > before {
             created.push(def);
         }
     }
-    // Graphs name other records (an evaluated copy names its definition), so
-    // they go in once every record exists.
+    // Graphs and table cells name other records (an evaluated copy names its
+    // definition), so they are re-pointed once every record exists.
     let records = block_record_map(doc, blocks);
     for def in &created {
+        if let Some(record) = doc.block_records.get(&def.name).map(|r| r.handle) {
+            for member in crate::scene::block_authoring::members(doc, record) {
+                if let Some(codec::EntityType::Table(table)) = doc.get_entity_mut(member) {
+                    remap_table_cell_blocks(table, &records);
+                }
+            }
+        }
         import_block_def_graph(doc, def, &records);
     }
     created.len()
@@ -674,13 +850,19 @@ pub(crate) fn paste_entities_kernel(
     merge_table_records(doc, deps);
     // Shared block-definition merge (also used by `merge_clipboard_blocks`).
     let apps = eed_app_map(doc, deps);
-    merge_block_defs(doc, &deps.blocks, &apps);
+    let image_definitions = merge_image_definitions(doc, deps);
+    merge_block_defs(doc, &deps.blocks, &apps, &image_definitions);
+    let records = block_record_map(doc, &deps.blocks);
 
     let by_index: Vec<Handle> = entities
         .iter()
         .cloned()
         .map(|mut entity| {
             remap_eed_apps(&mut entity, &apps);
+            remap_image_definition(&mut entity, &image_definitions);
+            if let codec::EntityType::Table(table) = &mut entity {
+                remap_table_cell_blocks(table, &records);
+            }
             let picture_placement = crate::scene::render_graph::dim_picture_placement(&entity);
             if let Some(t) = translate {
                 crate::scene::view::dispatch::apply_transform(&mut entity, t);
@@ -726,7 +908,6 @@ pub(crate) fn paste_entities_kernel(
         Some(crate::command::EntityTransform::Translate(delta)) => *delta,
         _ => glam::DVec3::ZERO,
     };
-    let records = block_record_map(doc, &deps.blocks);
     for cap in &deps.ext_objects {
         let Some(&new_entity) = by_index.get(cap.entity_index) else {
             continue;
@@ -783,9 +964,8 @@ pub(crate) fn paste_entities_kernel(
 }
 
 /// Document-level clone-add: the `&mut CadDocument` half of
-/// `Scene::add_entity_clone` — fresh inline sub-handles (INSERT attributes,
-/// 3D-polyline vertices; `reset_clone_subhandles` is `scene`-private so the
-/// two lines are mirrored here), NULL top-level/owner handles, then
+/// `Scene::add_entity_clone` — fresh inline sub-handles
+/// (`Scene::reset_clone_subhandles`), NULL top-level/owner handles, then
 /// adds it to `space`. Tessellation/render caching stays caller-side in the
 /// Scene shell.
 fn add_entity_clone_doc(
@@ -793,19 +973,7 @@ fn add_entity_clone_doc(
     mut entity: codec::EntityType,
     space: PasteSpace,
 ) -> Handle {
-    match &mut entity {
-        codec::EntityType::Insert(ins) => {
-            for att in ins.attributes.iter_mut() {
-                att.common.handle = doc.allocate_handle();
-            }
-        }
-        codec::EntityType::Polyline3D(p) => {
-            for v in p.vertices.iter_mut() {
-                v.handle = doc.allocate_handle();
-            }
-        }
-        _ => {}
-    }
+    crate::scene::Scene::reset_clone_subhandles(doc, &mut entity);
     entity.common_mut().handle = Handle::NULL;
     entity.common_mut().owner_handle = Handle::NULL;
     match space {
@@ -836,6 +1004,8 @@ pub(crate) fn define_block_raw_doc(
     let block_handle = Handle::new(next + 1);
     let end_handle = Handle::new(next + 2);
     let mut block_record = codec::tables::BlockRecord::new(name);
+    block_record.flags.anonymous =
+        name.starts_with('*') && !(block_record.is_model_space() || block_record.is_paper_space());
     block_record.handle = br_handle;
     block_record.block_entity_handle = block_handle;
     block_record.block_end_handle = end_handle;
@@ -862,19 +1032,7 @@ fn add_entity_clone_doc_inner(
     entity: &mut codec::EntityType,
     owner: Handle,
 ) {
-    match entity {
-        codec::EntityType::Insert(ins) => {
-            for att in ins.attributes.iter_mut() {
-                att.common.handle = doc.allocate_handle();
-            }
-        }
-        codec::EntityType::Polyline3D(p) => {
-            for v in p.vertices.iter_mut() {
-                v.handle = doc.allocate_handle();
-            }
-        }
-        _ => {}
-    }
+    crate::scene::Scene::reset_clone_subhandles(doc, entity);
     entity.common_mut().handle = Handle::NULL;
     entity.common_mut().owner_handle = owner;
     // An extension dictionary is exclusively owned; the clone must not claim
@@ -912,6 +1070,8 @@ fn define_transformed_block_doc(
     br.handle = br_handle;
     br.block_entity_handle = block_handle;
     br.block_end_handle = end_handle;
+    // See `Scene::define_transformed_block`.
+    br.flags.anonymous = true;
     doc.block_records.add(br).ok()?;
     let mut block = codec::entities::Block::new(&new_name, codec::types::Vector3::ZERO);
     block.common.handle = block_handle;
@@ -1071,11 +1231,34 @@ pub(crate) fn remap_object(
         ObjectType::XRecord(x) => {
             x.handle = new_handle;
             x.owner = map(x.owner);
+            for r in x.reactors.iter_mut() {
+                *r = map(*r);
+            }
+            if let Some(d) = x.xdictionary_handle.as_mut() {
+                *d = map(*d);
+            }
             for entry in &mut x.entries {
                 if let codec::objects::XRecordValue::Handle(handle) = &mut entry.value {
                     *handle = map(*handle);
                 }
             }
+            // The DWG writer can emit these instead of the entries.
+            for reference in &mut x.object_references {
+                reference.handle = map(reference.handle);
+            }
+            // The verbatim DWG record still carries the source handles.
+            x.raw_dwg_data = None;
+        }
+        ObjectType::TableContent(t) => {
+            t.common.handle = new_handle;
+            t.common.owner_handle = map(t.common.owner_handle);
+            for r in t.common.reactors.iter_mut() {
+                *r = map(*r);
+            }
+            if let Some(d) = t.common.xdictionary_handle.as_mut() {
+                *d = map(*d);
+            }
+            remap_table_cell_blocks(t, remap);
         }
         ObjectType::Group(g) => {
             g.handle = new_handle;
@@ -1356,7 +1539,10 @@ mod copy_to_clipboard_kernel_tests {
 
 #[cfg(test)]
 mod paste_entities_kernel_tests {
-    use super::{copy_to_clipboard_kernel, paste_entities_kernel};
+    use super::{
+        copy_to_clipboard_kernel, define_block_raw_doc, paste_entities_kernel, remap_object,
+        table_cell_blocks,
+    };
     use codec::Handle;
 
     fn line_on(layer: &str) -> codec::EntityType {
@@ -1414,6 +1600,409 @@ mod paste_entities_kernel_tests {
         // The layer dependency must have been recreated in the target document.
         assert!(dst.layers.contains("WALLS"));
         assert_eq!(line.common.layer, "WALLS");
+    }
+
+    #[test]
+    fn pasted_complex_linetype_points_at_the_targets_shape_style() {
+        use codec::tables::linetype::{
+            LineTypeComplexContent, LineTypeComplexData, LineTypeElement,
+        };
+        // A shape-file style has no name; a linetype segment names it by handle.
+        let mut seed = codec::CadDocument::new();
+        let mut shapes = codec::tables::TextStyle::new("");
+        shapes.handle = seed.allocate_handle();
+        shapes.is_shape_file = true;
+        shapes.font_file = "ltypeshp.shx".to_string();
+        let shapes_handle = shapes.handle;
+        seed.text_styles.add_allow_duplicate(shapes);
+        let mut batting = codec::tables::LineType::new("BATTING");
+        batting.add_element(LineTypeElement::dash(0.5));
+        batting.add_element(LineTypeElement {
+            length: -0.1,
+            complex: Some(LineTypeComplexData {
+                content: LineTypeComplexContent::Shape { shape_number: 135 },
+                style_handle: shapes_handle,
+                ..Default::default()
+            }),
+        });
+        seed.line_types.add(batting).expect("add linetype");
+        let mut line = codec::entities::Line::new();
+        line.common.linetype = "BATTING".to_string();
+        let source = seed.add_entity(codec::EntityType::Line(line)).unwrap();
+        let (entities, deps) = copy_to_clipboard_kernel(&seed, &[source]);
+
+        let segment_style = |doc: &codec::CadDocument| {
+            doc.line_types
+                .get("BATTING")
+                .expect("pasted linetype")
+                .elements
+                .iter()
+                .find_map(|element| element.complex.as_ref())
+                .expect("shape segment")
+                .style_handle
+        };
+        let shape_styles = |doc: &codec::CadDocument| {
+            doc.text_styles
+                .iter()
+                .filter(|s| s.is_shape_file && s.font_file == "ltypeshp.shx")
+                .map(|s| s.handle)
+                .collect::<Vec<_>>()
+        };
+
+        let mut dst = codec::CadDocument::new();
+        paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        assert_eq!(
+            shape_styles(&dst),
+            vec![segment_style(&dst)],
+            "the segment must point at the target's shape-file style"
+        );
+
+        // A second paste finds that style by its font file: no duplicate.
+        paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        assert_eq!(shape_styles(&dst).len(), 1);
+    }
+
+    #[test]
+    fn pasted_image_points_at_the_targets_definition() {
+        use codec::objects::{ImageDefinition, ImageDefinitionReactor, ObjectType};
+        let mut seed = codec::CadDocument::new();
+        let definition = seed.allocate_handle();
+        let mut image_definition = ImageDefinition::with_dimensions("fx.bmp", 8, 8);
+        image_definition.handle = definition;
+        seed.objects
+            .insert(definition, ObjectType::ImageDefinition(image_definition));
+        let mut image =
+            codec::entities::RasterImage::new("fx.bmp", codec::types::Vector3::ZERO, 8.0, 8.0);
+        image.definition_handle = Some(definition);
+        let source = seed
+            .add_entity(codec::EntityType::RasterImage(image))
+            .unwrap();
+        let reactor = seed.allocate_handle();
+        let mut image_reactor = ImageDefinitionReactor::new(source);
+        image_reactor.handle = reactor;
+        image_reactor.owner = definition;
+        seed.objects
+            .insert(reactor, ObjectType::ImageDefinitionReactor(image_reactor));
+        if let Some(codec::EntityType::RasterImage(image)) = seed.get_entity_mut(source) {
+            image.definition_reactor_handle = Some(reactor);
+        }
+        let (entities, deps) = copy_to_clipboard_kernel(&seed, &[source]);
+
+        let pasted_image = |doc: &codec::CadDocument, handle: Handle| match doc.get_entity(handle) {
+            Some(codec::EntityType::RasterImage(image)) => image.clone(),
+            other => panic!("expected pasted RasterImage, got {other:?}"),
+        };
+        let definitions = |doc: &codec::CadDocument| {
+            doc.objects
+                .iter()
+                .filter(
+                    |(_, o)| matches!(o, ObjectType::ImageDefinition(d) if d.file_name == "fx.bmp"),
+                )
+                .map(|(h, _)| *h)
+                .collect::<Vec<_>>()
+        };
+
+        let mut dst = codec::CadDocument::new();
+        let (handles, _) = paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        let image = pasted_image(&dst, handles[0]);
+        assert_eq!(
+            definitions(&dst),
+            vec![image.definition_handle.expect("definition link")],
+            "the image must point at the target's definition of its file"
+        );
+        assert_eq!(image.definition_reactor_handle, None);
+        // Registered in, and owned by, the target's ACAD_IMAGE_DICT.
+        let root = dst.header.named_objects_dict_handle;
+        let Some(ObjectType::Dictionary(root)) = dst.objects.get(&root) else {
+            panic!("no root dictionary");
+        };
+        let dictionary = root.get("ACAD_IMAGE_DICT").expect("ACAD_IMAGE_DICT");
+        let Some(ObjectType::ImageDefinition(copied)) =
+            dst.objects.get(&image.definition_handle.unwrap())
+        else {
+            panic!("definition missing");
+        };
+        assert_eq!(copied.owner, dictionary);
+
+        // A second paste reuses the definition of the same file.
+        paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        assert_eq!(definitions(&dst).len(), 1);
+
+        // Within the source drawing the paste keeps the very same definition,
+        // but not the source image's reactor.
+        let (handles, _) = paste_entities_kernel(
+            &mut seed,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        let image = pasted_image(&seed, handles[0]);
+        assert_eq!(image.definition_handle, Some(definition));
+        assert_eq!(
+            image.definition_reactor_handle, None,
+            "the pasted image must not share the source image's reactor"
+        );
+    }
+
+    #[test]
+    fn pasted_table_roundtrip_record_brings_its_table_content() {
+        use codec::objects::{Dictionary, ObjectType, XRecord, XRecordEntry};
+        let mut seed = codec::CadDocument::new();
+        let table = seed
+            .add_entity(codec::EntityType::Table(Box::new(
+                codec::entities::Table::new(codec::types::Vector3::ZERO, 2, 2),
+            )))
+            .unwrap();
+        // TABLE -> extension dictionary -> roundtrip XRECORD -360-> TABLECONTENT,
+        // the layout AutoCAD writes.
+        let xdict = seed.allocate_handle();
+        let record = seed.allocate_handle();
+        let content = seed.allocate_handle();
+        let mut dictionary = Dictionary::new();
+        dictionary.handle = xdict;
+        dictionary.owner = table;
+        dictionary.add_entry("ACAD_XREC_ROUNDTRIP", record);
+        let mut roundtrip = XRecord::new();
+        roundtrip.handle = record;
+        roundtrip.owner = xdict;
+        roundtrip.reactors.push(xdict);
+        roundtrip.entries.push(XRecordEntry::string(
+            102,
+            "ACAD_ROUNDTRIP_2008_TABLE_ENTITY",
+        ));
+        roundtrip.entries.push(XRecordEntry::handle(360, content));
+        roundtrip.synchronize_object_references();
+        let mut table_content = codec::entities::Table::new(codec::types::Vector3::ZERO, 2, 2);
+        table_content.common.handle = content;
+        table_content.common.owner_handle = record;
+        seed.objects
+            .insert(xdict, ObjectType::Dictionary(dictionary));
+        seed.objects.insert(record, ObjectType::XRecord(roundtrip));
+        seed.objects
+            .insert(content, ObjectType::TableContent(table_content));
+        if let Some(entity) = seed.get_entity_mut(table) {
+            entity.common_mut().xdictionary_handle = Some(xdict);
+        }
+        let (entities, deps) = copy_to_clipboard_kernel(&seed, &[table]);
+
+        let mut dst = codec::CadDocument::new();
+        let (handles, _) = paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        let new_xdict = dst
+            .get_entity(handles[0])
+            .and_then(|entity| entity.common().xdictionary_handle)
+            .expect("pasted table keeps its extension dictionary");
+        let Some(ObjectType::Dictionary(dictionary)) = dst.objects.get(&new_xdict) else {
+            panic!("extension dictionary missing");
+        };
+        let new_record = dictionary
+            .get("ACAD_XREC_ROUNDTRIP")
+            .expect("roundtrip record");
+        let Some(ObjectType::XRecord(roundtrip)) = dst.objects.get(&new_record) else {
+            panic!("roundtrip record missing");
+        };
+        assert_eq!(roundtrip.reactors, vec![new_xdict]);
+        let new_content = roundtrip
+            .entries
+            .iter()
+            .find(|entry| entry.code == 360)
+            .and_then(|entry| entry.value.as_handle())
+            .expect("hard owner of the table content");
+        assert_eq!(
+            roundtrip
+                .object_references
+                .iter()
+                .map(|reference| reference.handle)
+                .collect::<Vec<_>>(),
+            vec![new_content]
+        );
+        let Some(ObjectType::TableContent(table_content)) = dst.objects.get(&new_content) else {
+            panic!("the record must point at a table content in the target");
+        };
+        assert_eq!(table_content.common.handle, new_content);
+        assert_eq!(table_content.common.owner_handle, new_record);
+    }
+
+    #[test]
+    fn pasted_table_block_cell_points_at_the_targets_block() {
+        use codec::objects::ObjectType;
+        let circle = codec::EntityType::Circle(codec::entities::Circle::new());
+        let mut seed = codec::CadDocument::new();
+        define_block_raw_doc(
+            &mut seed,
+            "CELLBLK",
+            codec::types::Vector3::ZERO,
+            std::slice::from_ref(&circle),
+        );
+        let block = seed.block_records.get("CELLBLK").unwrap().handle;
+        let mut table = codec::entities::Table::new(codec::types::Vector3::ZERO, 2, 2);
+        table.rows[0].cells[0].contents = vec![codec::entities::CellContent::block(block)];
+        let table = seed
+            .add_entity(codec::EntityType::Table(Box::new(table)))
+            .unwrap();
+        let (entities, deps) = copy_to_clipboard_kernel(&seed, &[table]);
+
+        // The target already uses the source block's handle for something else.
+        let mut dst = codec::CadDocument::new();
+        define_block_raw_doc(&mut dst, "OTHER", codec::types::Vector3::ZERO, &[circle]);
+        let (handles, _) = paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        let target = dst
+            .block_records
+            .get("CELLBLK")
+            .expect("the cell's block must be copied")
+            .handle;
+        let Some(codec::EntityType::Table(pasted)) = dst.get_entity(handles[0]) else {
+            panic!("pasted table missing");
+        };
+        assert_eq!(
+            table_cell_blocks(pasted).collect::<Vec<_>>(),
+            vec![target],
+            "the cell must point at the target's copy of its block"
+        );
+
+        // The TABLECONTENT copy of the cells follows the same map.
+        let mut content = codec::entities::Table::new(codec::types::Vector3::ZERO, 2, 2);
+        content.rows[0].cells[0].contents = vec![codec::entities::CellContent::block(block)];
+        let mut object = ObjectType::TableContent(content);
+        let remap = std::collections::HashMap::from([(block, target)]);
+        remap_object(&mut object, Handle::new(0x500), &remap);
+        let ObjectType::TableContent(content) = &object else {
+            unreachable!();
+        };
+        assert_eq!(table_cell_blocks(content).collect::<Vec<_>>(), vec![target]);
+    }
+
+    #[test]
+    fn pasted_block_repoints_its_tables_and_images() {
+        use codec::objects::{ImageDefinition, ObjectType};
+        let circle = codec::EntityType::Circle(codec::entities::Circle::new());
+        let mut seed = codec::CadDocument::new();
+        define_block_raw_doc(
+            &mut seed,
+            "CELLBLK",
+            codec::types::Vector3::ZERO,
+            std::slice::from_ref(&circle),
+        );
+        let cell_block = seed.block_records.get("CELLBLK").unwrap().handle;
+        let definition = seed.allocate_handle();
+        let mut image_definition = ImageDefinition::with_dimensions("fx.bmp", 8, 8);
+        image_definition.handle = definition;
+        seed.objects
+            .insert(definition, ObjectType::ImageDefinition(image_definition));
+        // Block OUTER holds a table showing CELLBLK and an image of fx.bmp;
+        // only an INSERT of OUTER is copied.
+        let mut table = codec::entities::Table::new(codec::types::Vector3::ZERO, 2, 2);
+        table.rows[0].cells[0].contents = vec![codec::entities::CellContent::block(cell_block)];
+        let mut image =
+            codec::entities::RasterImage::new("fx.bmp", codec::types::Vector3::ZERO, 8.0, 8.0);
+        image.definition_handle = Some(definition);
+        define_block_raw_doc(
+            &mut seed,
+            "OUTER",
+            codec::types::Vector3::ZERO,
+            &[
+                codec::EntityType::Table(Box::new(table)),
+                codec::EntityType::RasterImage(image),
+            ],
+        );
+        let insert = seed
+            .add_entity(codec::EntityType::Insert(codec::entities::Insert::new(
+                "OUTER",
+                codec::types::Vector3::ZERO,
+            )))
+            .unwrap();
+        let (entities, deps) = copy_to_clipboard_kernel(&seed, &[insert]);
+
+        // The target's handles run ahead of the source's, so a kept source
+        // handle names something else (or nothing) there.
+        let mut dst = codec::CadDocument::new();
+        for _ in 0..64 {
+            dst.allocate_handle();
+        }
+        define_block_raw_doc(&mut dst, "OTHER", codec::types::Vector3::ZERO, &[circle]);
+        paste_entities_kernel(
+            &mut dst,
+            &entities,
+            &deps,
+            None,
+            crate::app::PasteSpace::Model,
+        );
+        let target_cell = dst
+            .block_records
+            .get("CELLBLK")
+            .expect("the cell's block must be copied with the block")
+            .handle;
+        assert_ne!(
+            target_cell, cell_block,
+            "handles must differ for the test to bite"
+        );
+        let outer = dst.block_records.get("OUTER").expect("OUTER copied").handle;
+        let members = crate::scene::block_authoring::members(&dst, outer);
+        let Some(codec::EntityType::Table(pasted)) =
+            members.iter().find_map(|&h| match dst.get_entity(h) {
+                Some(e @ codec::EntityType::Table(_)) => Some(e),
+                _ => None,
+            })
+        else {
+            panic!("table missing from the pasted block");
+        };
+        assert_eq!(
+            table_cell_blocks(pasted).collect::<Vec<_>>(),
+            vec![target_cell],
+            "the table in the block must point at the target's copy of its cell block"
+        );
+        let Some(codec::EntityType::RasterImage(pasted)) =
+            members.iter().find_map(|&h| match dst.get_entity(h) {
+                Some(e @ codec::EntityType::RasterImage(_)) => Some(e),
+                _ => None,
+            })
+        else {
+            panic!("image missing from the pasted block");
+        };
+        let target_definition = pasted.definition_handle.expect("definition link");
+        assert!(
+            matches!(
+                dst.objects.get(&target_definition),
+                Some(ObjectType::ImageDefinition(d)) if d.file_name == "fx.bmp"
+            ),
+            "the image in the block must point at the target's definition of its file"
+        );
     }
 
     #[test]
@@ -1686,6 +2275,22 @@ mod define_transformed_block_doc_xdict_tests {
         );
     }
 
+    #[test]
+    fn clone_block_is_flagged_anonymous() {
+        let mut doc = codec::CadDocument::new();
+        let line = doc
+            .add_entity(codec::EntityType::Line(codec::entities::Line::new()))
+            .unwrap();
+        let subs = vec![doc.get_entity(line).unwrap().clone()];
+        let name = define_transformed_block_doc(
+            &mut doc,
+            &subs,
+            &crate::command::EntityTransform::Translate(glam::DVec3::ZERO),
+        )
+        .expect("clone block must be created");
+        assert!(doc.block_records.get(&name).unwrap().flags.anonymous);
+    }
+
     /// Pasted/derived sub-entities must not share the source's extension
     /// dictionary. `define_transformed_block_doc` is the verbatim
     /// document-level port of `Scene::define_transformed_block`, and its
@@ -1739,5 +2344,51 @@ mod define_transformed_block_doc_xdict_tests {
                 None => panic!("cloned child {h:?} missing"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod define_block_raw_doc_anonymous_tests {
+    use super::define_block_raw_doc;
+
+    fn defined(name: &str) -> codec::CadDocument {
+        let mut doc = codec::CadDocument::new();
+        define_block_raw_doc(&mut doc, name, codec::types::Vector3::ZERO, &[]);
+        doc
+    }
+
+    /// Pasting an INSERT of an anonymous / dynamic-variant block recreates it
+    /// under its `*U<n>` name; the DWG writer takes the anonymous bit only
+    /// from the flag, so the record must carry it.
+    #[test]
+    fn star_named_block_is_flagged_anonymous() {
+        let doc = defined("*U7");
+        let record = doc.block_records.get("*U7").expect("block defined");
+        assert!(record.flags.anonymous, "*U7 must be flagged anonymous");
+    }
+
+    #[test]
+    fn plain_named_block_is_not_flagged_anonymous() {
+        let doc = defined("Door");
+        let record = doc.block_records.get("Door").expect("block defined");
+        assert!(!record.flags.anonymous);
+    }
+
+    #[test]
+    fn layout_block_is_not_flagged_anonymous() {
+        let doc = defined("*Paper_Space0");
+        let record = doc
+            .block_records
+            .get("*Paper_Space0")
+            .expect("block defined");
+        assert!(!record.flags.anonymous, "a layout block is not anonymous");
+    }
+
+    #[test]
+    fn scene_define_block_raw_flags_star_name_anonymous() {
+        let mut scene = crate::scene::Scene::new();
+        scene.define_block_raw("*U9", codec::types::Vector3::ZERO, vec![]);
+        let record = scene.document.block_records.get("*U9").expect("defined");
+        assert!(record.flags.anonymous);
     }
 }

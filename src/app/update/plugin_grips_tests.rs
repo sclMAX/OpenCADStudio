@@ -1588,3 +1588,155 @@ fn live_geometry_does_not_trigger_the_constraint_solver() {
     assert_eq!(serialized(&app, b), bonded_b);
     grip_points::remove_in_process_sink(TEST_PLUGIN);
 }
+
+// ── The settle watchdog strike ledger ────────────────────────────────────
+//
+// The watchdog floor is lowered from SETTLE_WATCHDOG (10 s) to 10 ms so the
+// missed-delivery ledger runs with millisecond budgets; the silent plugin is
+// the existing in-process shape (a panicked settle handler is contained as
+// "produced no answer", the delivery stays outstanding, and the pump's
+// expiry strike fires on a later pass). The OUT-OF-PROCESS semantics the
+// ledger decides (keep the connection on strike one, `custom_grip_abandon`
+// on the third) sit one layer below: the transport's own abandon test
+// covers the tear itself, the ledger covers the host-side decision lines.
+
+/// Let the lowered settle deadline pass, then pump: the watchdog strikes.
+fn strike_outstanding_settle(app: &mut OpenCADStudio) {
+    std::thread::sleep(app.plugin_grip_settle_watchdog * 3);
+    let _ = app.pump_plugin_grips();
+}
+
+fn strike_count(app: &OpenCADStudio, plugin: &str) -> usize {
+    app.plugin_grip_settle_strikes
+        .get(plugin)
+        .map(|at| at.len())
+        .unwrap_or(0)
+}
+
+/// W1: the first strike ends the drag as a cancel while the plugin's
+/// connection, declared grips and session all stay; W4: the error line
+/// carries the strike counter and the keep decision; a recovered settle
+/// then serves the grips again AND resets the strike count.
+#[test]
+fn first_settle_strike_cancels_the_drag_and_keeps_the_plugin_grips() {
+    let mut app = app();
+    app.plugin_grip_settle_watchdog = std::time::Duration::from_millis(10);
+    let anchor = add(&mut app, arc([0.0, 0.0, 0.0], 5.0, 0.0, 1.0));
+    let before = serialized(&app, anchor);
+    let before_undo = undo_entry_count(&app);
+    let state = install_sink(TEST_PLUGIN);
+    declare(&mut app, TEST_PLUGIN, vec![declared(1, [2.0, 2.0, 0.0])]);
+    *state.panic_on_settle.borrow_mut() = true;
+    let i = tab(&app);
+    let screen = screen_of(&app, [2.0, 2.0, 0.0]);
+    let candidate = app.hit_plugin_grip(i, screen).expect("hittable");
+    let _ = app.begin_plugin_grip_drag(i, &candidate);
+    let _ = app.move_plugin_grip_drag(i, glam::DVec3::new(3.0, 3.0, 0.0));
+    let _ = app.settle_plugin_grip_drag();
+    strike_outstanding_settle(&mut app);
+
+    // The drag ended as a cancel: nothing drawn, no undo step, no pending
+    // settle, and the strike surfaced with its counter.
+    assert!(app.active_plugin_grip().is_none());
+    assert!(!app.is_plugin_grip_settling());
+    assert_eq!(serialized(&app, anchor), before);
+    assert_eq!(undo_entry_count(&app), before_undo);
+    let errors = crate::plugin::drain_errors();
+    assert!(
+        errors
+            .iter()
+            .any(|line| line.contains("strike 1/3") && line.contains("the connection is kept")),
+        "the first strike keeps the plugin and says so: {errors:?}"
+    );
+    assert_eq!(strike_count(&app, TEST_PLUGIN), 1);
+
+    // W3: the grips are still served — a healthy drag now runs through to
+    // the plugin's own labeled undo step, exactly as before the strike, and
+    // the recovery resets the strike count.
+    *state.panic_on_settle.borrow_mut() = false;
+    *state.settle_write.borrow_mut() = Some((anchor, 2.5));
+    let candidate = app.hit_plugin_grip(i, screen).expect("still hittable");
+    let _ = app.begin_plugin_grip_drag(i, &candidate);
+    let _ = app.move_plugin_grip_drag(i, glam::DVec3::new(3.0, 3.0, 0.0));
+    let _ = app.settle_plugin_grip_drag();
+    assert!(
+        app.drive_plugin_grip_settle_to_completion(std::time::Duration::from_millis(500)),
+        "the recovered settle finalizes"
+    );
+    assert_eq!(last_undo_label(&app).as_deref(), Some("CVI: PI radius"));
+    assert_eq!(strike_count(&app, TEST_PLUGIN), 0, "the recovery resets");
+    grip_points::remove_in_process_sink(TEST_PLUGIN);
+}
+
+/// W2: the third missed delivery inside the window tears the connection
+/// down (the plugin is genuinely wedged) and clears the ledger; W4: every
+/// strike landed a line; W3: the teardown queues the grip re-arm, which the
+/// reap tick dispatches (the SelectionChanged dedup cleared) the moment the
+/// plugin is visible again.
+#[test]
+fn third_settle_strike_tears_the_connection_down_and_arms_the_rearm() {
+    let mut app = app();
+    app.plugin_grip_settle_watchdog = std::time::Duration::from_millis(10);
+    let _anchor = add(&mut app, arc([0.0, 0.0, 0.0], 5.0, 0.0, 1.0));
+    let state = install_sink(TEST_PLUGIN);
+    declare(&mut app, TEST_PLUGIN, vec![declared(1, [2.0, 2.0, 0.0])]);
+    *state.panic_on_settle.borrow_mut() = true;
+    let i = tab(&app);
+    let screen = screen_of(&app, [2.0, 2.0, 0.0]);
+    for expected in [1usize, 2, 3] {
+        let candidate = app.hit_plugin_grip(i, screen).expect("hittable");
+        let _ = app.begin_plugin_grip_drag(i, &candidate);
+        let _ = app.settle_plugin_grip_drag();
+        assert_eq!(strike_count(&app, TEST_PLUGIN), expected - 1);
+        strike_outstanding_settle(&mut app);
+        if expected < 3 {
+            assert_eq!(strike_count(&app, TEST_PLUGIN), expected);
+        } else {
+            // The teardown branch clears the ledger in the same strike: a
+            // relaunched plugin starts from a clean count.
+            assert_eq!(strike_count(&app, TEST_PLUGIN), 0);
+        }
+    }
+    let errors = crate::plugin::drain_errors();
+    assert!(
+        errors
+            .iter()
+            .any(|line| line.contains("strike 3/3") && line.contains("connection torn down")),
+        "the third strike tears the connection down: {errors:?}"
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|line| line.contains("custom-grip settle delivery"))
+            .count(),
+        3,
+        "every strike surfaced its line: {errors:?}"
+    );
+    assert_eq!(
+        strike_count(&app, TEST_PLUGIN),
+        0,
+        "the teardown clears the ledger"
+    );
+
+    // The re-arm: queued at the teardown, dispatched by the reap tick with
+    // the fingerprint dedup cleared (an unchanged selection still reaches
+    // the plugin), and the grips remain servable throughout.
+    assert!(app.pending_plugin_grips_rearm.contains(TEST_PLUGIN));
+    assert!(
+        app.hit_plugin_grip(i, screen).is_some(),
+        "the grips survive"
+    );
+    let _ = crate::plugin::v4_support::take_test_dispatch_log();
+    app.reap_plugin_grips();
+    assert!(app.pending_plugin_grips_rearm.is_empty());
+    let log = crate::plugin::v4_support::take_test_dispatch_log();
+    assert!(
+        log.iter().any(|entry| entry.contains("SelectionChanged")),
+        "the reap re-dispatches the selection broadcast for the re-arm: {log:?}"
+    );
+    assert!(
+        app.hit_plugin_grip(i, screen).is_some(),
+        "still servable after the re-arm"
+    );
+    grip_points::remove_in_process_sink(TEST_PLUGIN);
+}

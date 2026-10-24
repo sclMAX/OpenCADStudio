@@ -2,6 +2,7 @@ use codec::entities::{Ole2Frame, OleObjectType};
 
 use crate::command::EntityTransform;
 use crate::entities::common::{center_grip, edit_prop as edit, ro_prop as ro, square_grip};
+use crate::t;
 use crate::entities::traits::RenderConvertible;
 use crate::scene::convert::acad_to_render::{RenderEntity, RenderObject};
 use crate::scene::model::object::{GripApply, GripDef, PropSection};
@@ -78,49 +79,185 @@ fn grips(ole: &Ole2Frame) -> Vec<GripDef> {
     ]
 }
 
+/// What an OLE object keeps while its drawing is open: the size its scales
+/// are measured against (unknown for an object read from a file until it is
+/// first resized, so its scales show 0) and whether resizing keeps its
+/// aspect ratio.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameState {
+    pub base: Option<(f64, f64)>,
+    pub lock_aspect: bool,
+}
+
+impl Default for FrameState {
+    fn default() -> Self {
+        Self {
+            base: None,
+            lock_aspect: true,
+        }
+    }
+}
+
+/// OLEHIDE: 0 every OLE object shows, 1 only those in paper space, 2 only
+/// those in model space, 3 none (a profile setting).
+static OLE_HIDE: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(0);
+
+pub(crate) fn hide_mode() -> i16 {
+    OLE_HIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_hide_mode(value: i16) {
+    OLE_HIDE.store(value.clamp(0, 3), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether OLEHIDE hides this object.
+pub(crate) fn hidden(ole: &Ole2Frame) -> bool {
+    match hide_mode() {
+        1 => !ole.is_paper_space,
+        2 => ole.is_paper_space,
+        3 => true,
+        _ => false,
+    }
+}
+
+/// OLEFRAME of the drawing: 0 no frame, 1 frame shown and plotted, 2 frame
+/// shown but not plotted (the default).
+pub(crate) fn frame_mode(document: &codec::CadDocument) -> i16 {
+    crate::io::drawing_variable(document, "OLEFRAME")
+        .and_then(|value| value.trim().parse::<i16>().ok())
+        .filter(|value| (0..=2).contains(value))
+        .unwrap_or(2)
+}
+
+/// Lower-left corner, width and height of the frame.
+pub(crate) fn frame_box(ole: &Ole2Frame) -> (glam::DVec3, f64, f64) {
+    let x = ole.upper_left_corner.x.min(ole.lower_right_corner.x);
+    let y = ole.upper_left_corner.y.min(ole.lower_right_corner.y);
+    (
+        glam::DVec3::new(x, y, ole.upper_left_corner.z),
+        (ole.lower_right_corner.x - ole.upper_left_corner.x).abs(),
+        (ole.upper_left_corner.y - ole.lower_right_corner.y).abs(),
+    )
+}
+
+/// Resizes the frame about its upper-left corner, which stays.
+pub(crate) fn set_size(ole: &mut Ole2Frame, width: f64, height: f64) {
+    ole.lower_right_corner.x = ole.upper_left_corner.x + width;
+    ole.lower_right_corner.y = ole.upper_left_corner.y - height;
+}
+
+/// The Plot quality choices, by the value the object stores (DXF 73, the
+/// byte after the OLE data in DWG).
+pub(crate) fn plot_quality_labels() -> [String; 3] {
+    [
+        crate::tr!("ole-props", "plot-monochrome"),
+        crate::tr!("ole-props", "plot-low"),
+        crate::tr!("ole-props", "plot-high"),
+    ]
+}
+
+/// What the Properties palette refuses for an OLE object.
+pub(crate) fn validate_property(field: &str, value: &str) -> Result<(), &'static str> {
+    match field {
+        "ole_width" | "ole_height" | "ole_scale_width" | "ole_scale_height" => {
+            match crate::entities::common::parse_f64(value) {
+                Some(v) if v > 0.0 => Ok(()),
+                _ => Err("Invalid input"),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 fn properties(ole: &Ole2Frame) -> Vec<PropSection> {
+    use crate::scene::model::object::{PropValue, Property};
     let type_str = match ole.ole_object_type {
-        OleObjectType::Link => "Link",
-        OleObjectType::Embedded => "Embedded",
-        OleObjectType::Static => "Static",
+        OleObjectType::Link => crate::tr!("ole-props", "type-link"),
+        OleObjectType::Embedded => crate::tr!("ole-props", "type-embedded"),
+        OleObjectType::Static => crate::tr!("ole-props", "type-static"),
     };
-    let width = (ole.lower_right_corner.x - ole.upper_left_corner.x).abs();
-    let height = (ole.upper_left_corner.y - ole.lower_right_corner.y).abs();
+    let (corner, width, height) = frame_box(ole);
+    let labels = plot_quality_labels();
+    let quality = labels[usize::from(ole.lock_aspect.min(2))].clone();
+    let yes_no = |on: bool| PropValue::Choice {
+        selected: if on { t!("Yes") } else { t!("No") }.into_owned(),
+        options: vec![t!("Yes").into_owned(), t!("No").into_owned()],
+    };
     vec![
         PropSection {
-            title: "Geometry".into(),
+            title: t!("Geometry").into_owned(),
             props: vec![
-                edit("Position X", "ole_ulx", ole.upper_left_corner.x),
-                edit("Position Y", "ole_uly", ole.upper_left_corner.y),
-                edit("Position Z", "ole_ulz", ole.upper_left_corner.z),
-                ro("Width", "ole_width", format!("{:.4}", width)),
-                ro("Height", "ole_height", format!("{:.4}", height)),
-                ro("Scale width", "ole_scale_width", String::new()),
-                ro("Scale height", "ole_scale_height", String::new()),
-                ro("Lock aspect", "ole_lock_aspect", String::new()),
+                edit(t!("Position X").as_ref(), "ole_x", corner.x),
+                edit(t!("Position Y").as_ref(), "ole_y", corner.y),
+                edit(t!("Position Z").as_ref(), "ole_z", corner.z),
+                edit(t!("Width").as_ref(), "ole_width", width),
+                edit(t!("Height").as_ref(), "ole_height", height),
+                // The scales and the aspect lock live with the open drawing;
+                // the Properties panel fills them in.
+                crate::entities::common::edit_scalar_prop(
+                    &crate::tr!("ole-props", "scale-width"),
+                    "ole_scale_width",
+                    0.0,
+                ),
+                crate::entities::common::edit_scalar_prop(
+                    &crate::tr!("ole-props", "scale-height"),
+                    "ole_scale_height",
+                    0.0,
+                ),
+                Property {
+                    label: crate::tr!("ole-props", "lock-aspect"),
+                    field: "ole_lock_aspect",
+                    value: yes_no(true),
+                },
             ],
         },
         PropSection {
-            title: "Misc".into(),
+            title: t!("Misc").into_owned(),
             props: vec![
-                ro("Type", "ole_type", type_str),
-                ro("Plot quality", "ole_plot_quality", String::new()),
+                ro(t!("Type").as_ref(), "ole_type", type_str),
+                Property {
+                    label: crate::tr!("ole-props", "plot-quality"),
+                    field: "ole_plot_quality",
+                    value: PropValue::Choice {
+                        selected: quality,
+                        options: labels.to_vec(),
+                    },
+                },
+                ro(
+                    &crate::tr!("ole-props", "source-app"),
+                    "ole_source_app",
+                    ole.source_application.clone(),
+                ),
             ],
         },
     ]
 }
 
 fn apply_geom_prop(ole: &mut Ole2Frame, field: &str, value: &str) {
-    let Ok(v) = value.trim().parse::<f64>() else {
+    if field == "ole_plot_quality" {
+        if let Some(index) = plot_quality_labels().iter().position(|label| label == value) {
+            ole.lock_aspect = index as u8;
+        } else if let Ok(index) = value.trim().parse::<u8>() {
+            ole.lock_aspect = index.min(2);
+        }
+        return;
+    }
+    let Some(v) = crate::entities::common::parse_f64(value) else {
         return;
     };
-    match field {
-        "ole_ulx" => ole.upper_left_corner.x = v,
-        "ole_uly" => ole.upper_left_corner.y = v,
-        "ole_ulz" => ole.upper_left_corner.z = v,
-        "ole_lrx" => ole.lower_right_corner.x = v,
-        "ole_lry" => ole.lower_right_corner.y = v,
-        _ => {}
+    let (corner, width, height) = frame_box(ole);
+    let shift = match field {
+        "ole_x" => glam::DVec3::new(v - corner.x, 0.0, 0.0),
+        "ole_y" => glam::DVec3::new(0.0, v - corner.y, 0.0),
+        "ole_z" => glam::DVec3::new(0.0, 0.0, v - corner.z),
+        "ole_width" if v > 0.0 => return set_size(ole, v, height),
+        "ole_height" if v > 0.0 => return set_size(ole, width, v),
+        _ => return,
+    };
+    for point in [&mut ole.upper_left_corner, &mut ole.lower_right_corner] {
+        point.x += shift.x;
+        point.y += shift.y;
+        point.z += shift.z;
     }
 }
 
@@ -169,8 +306,16 @@ fn apply_transform(ole: &mut Ole2Frame, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Ole2Frame {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
-        Some(to_render(self))
+    fn to_render(&self, document: &codec::CadDocument) -> Option<RenderEntity> {
+        if hidden(self) {
+            return None;
+        }
+        let mut render = to_render(self);
+        // OLEFRAME 0: no frame; the picture inside still selects the object.
+        if frame_mode(document) == 0 {
+            render.object = RenderObject::Lines(Vec::new());
+        }
+        Some(render)
     }
 }
 

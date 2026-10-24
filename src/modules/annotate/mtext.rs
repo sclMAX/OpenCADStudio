@@ -104,22 +104,30 @@ impl MTextCommand {
         true
     }
 
-    fn boundary_geometry(&self, opposite: DVec3) -> (DVec3, f64, f64) {
+    /// Signed text-area extents along the rotated boundary axes from the
+    /// first corner to `opposite`; a typed width overrides the picked one.
+    fn boundary_extents(&self, opposite: DVec3) -> (f64, f64) {
         let first = self.first.unwrap_or(opposite);
         let local = self.plane.vector_to_local(opposite - first);
         let (sin, cos) = self.rotation.sin_cos();
         let picked_horizontal = local.x * cos + local.y * sin;
         let vertical = -local.x * sin + local.y * cos;
-        let width = self.width.unwrap_or(picked_horizontal.abs());
-        let horizontal = if self.width.is_some() {
-            width.copysign(if picked_horizontal.abs() > 1e-12 {
+        let horizontal = match self.width {
+            Some(width) => width.copysign(if picked_horizontal.abs() > 1e-12 {
                 picked_horizontal
             } else {
                 1.0
-            })
-        } else {
-            picked_horizontal
+            }),
+            None => picked_horizontal,
         };
+        (horizontal, vertical)
+    }
+
+    fn boundary_geometry(&self, opposite: DVec3) -> (DVec3, f64, f64) {
+        let first = self.first.unwrap_or(opposite);
+        let (sin, cos) = self.rotation.sin_cos();
+        let (horizontal, vertical) = self.boundary_extents(opposite);
+        let width = horizontal.abs();
         let (xmin, xmax) = (horizontal.min(0.0), horizontal.max(0.0));
         let (ymin, ymax) = (vertical.min(0.0), vertical.max(0.0));
         let horizontal_anchor = match self.attachment {
@@ -426,8 +434,27 @@ impl CadCommand for MTextCommand {
         CmdResult::Cancel
     }
 
-    fn on_mouse_move(&mut self, _point: DVec3) -> Option<WireModel> {
-        None
+    fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {
+        if self.step != Step::OppositeCorner {
+            return None;
+        }
+        let first = self.first?;
+        let (h, v) = self.boundary_extents(point);
+        let (sin, cos) = self.rotation.sin_cos();
+        let points = [(0.0, 0.0), (h, 0.0), (h, v), (0.0, v), (0.0, 0.0)]
+            .into_iter()
+            .map(|(x, y)| {
+                let offset = DVec3::new(x * cos - y * sin, x * sin + y * cos, 0.0);
+                let world = first + self.plane.vector_to_world(offset);
+                [world.x, world.y, world.z]
+            })
+            .collect();
+        Some(WireModel::solid_f64(
+            "rubber_band".into(),
+            points,
+            WireModel::CYAN,
+            false,
+        ))
     }
 }
 

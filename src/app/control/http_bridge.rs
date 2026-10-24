@@ -313,6 +313,12 @@ fn mutate_request(op: &str, fields: &Value, document_id: Option<u64>) -> Value {
             envelope[key] = value.clone();
         }
     }
+    // The cached id stands for "the drawing on screen": once the person has
+    // switched tabs, it must be refused (and refreshed), not edited in the
+    // background like a document the caller named itself.
+    if document_id.is_some() && fields.get("document_id").is_none() {
+        envelope["active_only"] = json!(true);
+    }
     if envelope["request_id"].as_str().is_none_or(str::is_empty) {
         let serial = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         envelope["request_id"] = json!(format!("gui-http-{serial}"));

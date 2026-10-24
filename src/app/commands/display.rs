@@ -1340,62 +1340,6 @@ impl OpenCADStudio {
                 return Some(Task::none());
             }
 
-            // HYPERLINK <url> — attach a hyperlink to the selected objects, stored
-            // in the standard PE_URL XData record so it round-trips in the file.
-            "HYPERLINK" => {
-                use crate::command::SelectThenValueCommand;
-                let has_sel = !self.tabs[i].scene.selected_entities().is_empty();
-                let c =
-                    SelectThenValueCommand::new("HYPERLINK", "HYPERLINK  URL to attach:", has_sel);
-                self.command_line.push_info(&c.prompt());
-                self.tabs[i].active_cmd = Some(Box::new(c));
-            }
-            cmd if cmd.starts_with("HYPERLINK ") => {
-                use codec::xdata::XDataValue;
-                let url = cmd
-                    .strip_prefix("HYPERLINK")
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if url.is_empty() {
-                    self.command_line.push_info(
-                        crate::t!("Usage: HYPERLINK <url>   (select objects first)").as_ref(),
-                    );
-                    return Some(Task::none());
-                }
-                let handles: Vec<codec::Handle> = self.tabs[i]
-                    .scene
-                    .selected_entities()
-                    .iter()
-                    .map(|(h, _)| *h)
-                    .filter(|handle| !self.tabs[i].scene.is_layer_locked(*handle))
-                    .collect();
-                if handles.is_empty() {
-                    self.command_line
-                        .push_error(crate::t!("HYPERLINK: select objects first.").as_ref());
-                    return Some(Task::none());
-                }
-                self.push_undo_snapshot(i, "HYPERLINK");
-                let mut n = 0usize;
-                for h in &handles {
-                    if self.tabs[i].scene.document.get_entity(*h).is_some() {
-                        crate::scene::view::dispatch::set_entity_xdata(
-                            &mut self.tabs[i].scene.document,
-                            *h,
-                            "PE_URL",
-                            Some(vec![XDataValue::String(url.clone())]),
-                        );
-                        n += 1;
-                    }
-                }
-                self.invalidate_property_targets(i, &handles);
-                self.tabs[i].dirty = true;
-                self.refresh_properties();
-                self.command_line
-                    .push_output(crate::tf!("HYPERLINK: attached to {n} object(s).").as_ref());
-                return Some(Task::none());
-            }
-
             // IMAGEADJUST: chosen images (pickfirst first), then the dialog.
             "IMAGEADJUST" => {
                 let keep = crate::modules::insert::xadjust::keeps("I");

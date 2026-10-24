@@ -136,12 +136,14 @@ fn collect_excludes_locked_layer_and_respects_selection() {
     scene.document.layers.add(layer).unwrap();
     scene.document.get_entity_mut(b).unwrap().common_mut().layer = "LOCKED".into();
 
-    // Empty selection → all active/unlocked candidates (b excluded).
-    let candidates = collect_flatten_handles(&scene);
-    assert!(candidates.contains(&a) && candidates.contains(&c));
-    assert!(!candidates.contains(&b));
+    // Empty selection → nothing: FLATTEN asks for objects first.
+    assert!(collect_flatten_handles(&scene).is_empty());
 
-    // Non-empty selection → only the selected handles (minus locked).
+    // The selected handles, minus the locked one.
+    scene.selected.insert(c);
+    let candidates = collect_flatten_handles(&scene);
+    assert_eq!(candidates, vec![c]);
+    scene.selected.clear();
     scene.selected.insert(a);
     scene.selected.insert(b);
     let candidates = collect_flatten_handles(&scene);
@@ -167,6 +169,7 @@ fn collect_excludes_entities_outside_active_space() {
         .common_mut()
         .owner_handle = b; // active block
 
+    scene.selected.extend([a, c]);
     let candidates = collect_flatten_handles(&scene);
     assert!(
         !candidates.contains(&a),
@@ -188,6 +191,7 @@ fn plan_moves_only_movable_candidates() {
             Vector3::new(0.0, 0.0, 1.0),
         )))
         .unwrap();
+    scene.selected.extend([a, b, c, ray]);
     let handles = collect_flatten_handles(&scene);
     assert_eq!(handles.len(), 4);
     let updates = plan_flatten(&scene, &handles);

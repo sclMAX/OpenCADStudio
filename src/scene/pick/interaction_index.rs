@@ -1119,15 +1119,18 @@ impl InteractionIndex {
 
     fn queried_wire_keys(
         &self,
-        mut indices: Vec<u32>,
+        indices: impl IntoIterator<Item = u32>,
         include_screen_unbounded: bool,
     ) -> Vec<(u64, u32)> {
-        indices.extend_from_slice(&self.unbounded_wires);
-        if include_screen_unbounded {
-            indices.extend_from_slice(&self.screen_unbounded_wires);
-        }
+        let screen_unbounded: &[u32] = if include_screen_unbounded {
+            &self.screen_unbounded_wires
+        } else {
+            &[]
+        };
         let mut keys: Vec<(u64, u32)> = indices
             .into_iter()
+            .chain(self.unbounded_wires.iter().copied())
+            .chain(screen_unbounded.iter().copied())
             .filter_map(|index| {
                 self.wire_handles
                     .get(index as usize)
@@ -1248,11 +1251,13 @@ impl InteractionIndex {
     }
 
     pub(crate) fn snap_candidate_keys(&self, parts: &SnapCandidateParts) -> Vec<(u64, u32)> {
-        self.queried_wire_keys(parts.wire_indices.clone(), false)
+        // `parts.wire_indices` is already sorted and deduplicated, so read it
+        // in place and let `queried_wire_keys` merge the unbounded extension.
+        self.queried_wire_keys(parts.wire_indices.iter().copied(), false)
     }
 
     fn snap_candidates_from_parts(
-        wires: Arc<Vec<WireModel>>,
+        wires: CandidateWires,
         parts: SnapCandidateParts,
         query_aabb: Option<[f64; 4]>,
         screen: Option<([f32; 4], Mat4, DVec3, Rectangle)>,
@@ -1280,7 +1285,7 @@ impl InteractionIndex {
         category: SnapQueryCategory,
     ) -> InteractionCandidates {
         Self::snap_candidates_from_parts(
-            wires,
+            CandidateWires::Snapshot(wires),
             self.snap_candidate_parts_xy(aabb, category),
             Some(aabb),
             None,
@@ -1289,7 +1294,7 @@ impl InteractionIndex {
 
     pub(crate) fn query_remapped_snap_xy_from_parts_with_category(
         &self,
-        wires: Arc<Vec<WireModel>>,
+        wires: Arc<SharedWireRuns>,
         slots: &rustc_hash::FxHashMap<(u64, u32), u32>,
         parts: SnapCandidateParts,
         aabb: [f64; 4],
@@ -1327,7 +1332,7 @@ impl InteractionIndex {
                 |value, wire| value.wire = wire,
             ),
         };
-        Self::snap_candidates_from_parts(wires, parts, Some(aabb), None)
+        Self::snap_candidates_from_parts(CandidateWires::Shared(wires), parts, Some(aabb), None)
     }
 
     pub(crate) fn query_snap_screen_with_category(
@@ -1340,7 +1345,7 @@ impl InteractionIndex {
         category: SnapQueryCategory,
     ) -> InteractionCandidates {
         Self::snap_candidates_from_parts(
-            wires,
+            CandidateWires::Snapshot(wires),
             self.snap_candidate_parts_screen(screen_rect, view_rot, eye, bounds, category),
             None,
             Some((screen_rect, view_rot, eye, bounds)),
@@ -1349,7 +1354,7 @@ impl InteractionIndex {
 
     pub(crate) fn query_remapped_snap_screen_from_parts_with_category(
         &self,
-        wires: Arc<Vec<WireModel>>,
+        wires: Arc<SharedWireRuns>,
         slots: &rustc_hash::FxHashMap<(u64, u32), u32>,
         parts: SnapCandidateParts,
         screen_rect: [f32; 4],
@@ -1391,7 +1396,7 @@ impl InteractionIndex {
             ),
         };
         Self::snap_candidates_from_parts(
-            wires,
+            CandidateWires::Shared(wires),
             parts,
             None,
             Some((screen_rect, view_rot, eye, bounds)),
@@ -1449,12 +1454,12 @@ impl InteractionIndex {
 
     pub(crate) fn query_remapped_xy_area(
         &self,
-        wires: Arc<Vec<WireModel>>,
+        wires: Arc<SharedWireRuns>,
         slots: &rustc_hash::FxHashMap<(u64, u32), u32>,
         aabb: [f64; 4],
     ) -> InteractionCandidates {
         InteractionCandidates {
-            wires,
+            wires: CandidateWires::Shared(wires),
             wire_indices: Some(self.remap_wire_indices(
                 self.wires.query_xy_unordered(aabb),
                 slots,
@@ -1496,12 +1501,12 @@ impl InteractionIndex {
 
     pub(crate) fn query_remapped_xy(
         &self,
-        wires: Arc<Vec<WireModel>>,
+        wires: Arc<SharedWireRuns>,
         slots: &rustc_hash::FxHashMap<(u64, u32), u32>,
         aabb: [f64; 4],
     ) -> InteractionCandidates {
         InteractionCandidates {
-            wires,
+            wires: CandidateWires::Shared(wires),
             wire_indices: Some(self.remap_wire_indices(
                 self.wires.query_xy(aabb),
                 slots,
@@ -1558,7 +1563,7 @@ impl InteractionIndex {
 
     pub(crate) fn query_remapped_screen(
         &self,
-        wires: Arc<Vec<WireModel>>,
+        wires: Arc<SharedWireRuns>,
         slots: &rustc_hash::FxHashMap<(u64, u32), u32>,
         screen_rect: [f32; 4],
         view_rot: Mat4,
@@ -1566,7 +1571,7 @@ impl InteractionIndex {
         bounds: Rectangle,
     ) -> InteractionCandidates {
         InteractionCandidates {
-            wires,
+            wires: CandidateWires::Shared(wires),
             wire_indices: Some(self.remap_wire_indices(
                 self.wires.query_screen(screen_rect, view_rot, eye, bounds),
                 slots,
@@ -1671,7 +1676,7 @@ impl InteractionIndex {
                 },
             );
         InteractionCandidates {
-            wires,
+            wires: CandidateWires::Snapshot(wires),
             wire_indices: Some(wire_indices),
             segments: Some(segments),
             snap_points: None,
@@ -1692,7 +1697,7 @@ impl InteractionIndex {
         wire_indices.sort_unstable();
         wire_indices.dedup();
         InteractionCandidates {
-            wires,
+            wires: CandidateWires::Snapshot(wires),
             wire_indices: Some(wire_indices),
             segments: Some(self.segments.query_xy(aabb)),
             snap_points: Some(self.snap_points.query_xy(aabb)),
@@ -1721,7 +1726,7 @@ impl InteractionIndex {
         wire_indices.sort_unstable();
         wire_indices.dedup();
         InteractionCandidates {
-            wires,
+            wires: CandidateWires::Snapshot(wires),
             wire_indices: Some(wire_indices),
             segments: Some(
                 self.segments
@@ -1770,8 +1775,67 @@ impl std::fmt::Debug for InteractionIndex {
     }
 }
 
+/// Zero-copy wire backing for post-edit overlay candidate sets: slot `i`
+/// resolves through a shared memoized run at a stored offset instead of a
+/// private deep clone, so a query never copies candidate geometry.
+#[derive(Default)]
+pub struct SharedWireRuns(Vec<(Arc<Vec<WireModel>>, u32)>);
+
+impl SharedWireRuns {
+    pub(crate) fn push(&mut self, run: &Arc<Vec<WireModel>>, index: u32) {
+        self.0.push((Arc::clone(run), index));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn get(&self, slot: u32) -> Option<&WireModel> {
+        let (run, index) = self.0.get(slot as usize)?;
+        run.get(*index as usize)
+    }
+}
+
+/// How an [`InteractionCandidates`] resolves its wire slots: a private
+/// snapshot copy, or a zero-copy overlay gather over shared runs.
+enum CandidateWires {
+    Snapshot(Arc<Vec<WireModel>>),
+    Shared(Arc<SharedWireRuns>),
+}
+
+impl CandidateWires {
+    fn same_source(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Snapshot(a), Self::Snapshot(b)) => Arc::ptr_eq(a, b),
+            (Self::Shared(a), Self::Shared(b)) => Arc::ptr_eq(a, b),
+            (Self::Snapshot(_), Self::Shared(_)) | (Self::Shared(_), Self::Snapshot(_)) => false,
+        }
+    }
+
+    fn slot_count(&self) -> usize {
+        match self {
+            Self::Snapshot(wires) => wires.len(),
+            Self::Shared(runs) => runs.len(),
+        }
+    }
+
+    fn slot(&self, index: u32) -> Option<&WireModel> {
+        match self {
+            Self::Snapshot(wires) => wires.get(index as usize),
+            Self::Shared(runs) => runs.get(index),
+        }
+    }
+
+    fn clone_arc(&self) -> Self {
+        match self {
+            Self::Snapshot(wires) => Self::Snapshot(Arc::clone(wires)),
+            Self::Shared(runs) => Self::Shared(Arc::clone(runs)),
+        }
+    }
+}
+
 pub struct InteractionCandidates {
-    wires: Arc<Vec<WireModel>>,
+    wires: CandidateWires,
     wire_indices: Option<Vec<u32>>,
     segments: Option<Vec<SegmentRef>>,
     snap_points: Option<Vec<SnapPointRef>>,
@@ -1816,7 +1880,7 @@ pub trait WireSource {
 impl InteractionCandidates {
     pub fn all(wires: Arc<Vec<WireModel>>) -> Self {
         Self {
-            wires,
+            wires: CandidateWires::Snapshot(wires),
             wire_indices: None,
             segments: None,
             snap_points: None,
@@ -1836,7 +1900,7 @@ impl InteractionCandidates {
     /// full-scene scan.
     pub fn pending(wires: Arc<Vec<WireModel>>) -> Self {
         Self {
-            wires,
+            wires: CandidateWires::Snapshot(wires),
             wire_indices: Some(Vec::new()),
             segments: Some(Vec::new()),
             snap_points: Some(Vec::new()),
@@ -1856,27 +1920,30 @@ impl InteractionCandidates {
     }
 
     pub fn iter(&self) -> WireIter<'_> {
-        match &self.wire_indices {
-            Some(indices) => WireIter::Indexed {
-                wires: &self.wires,
+        match (&self.wires, &self.wire_indices) {
+            (CandidateWires::Snapshot(wires), Some(indices)) => WireIter::Indexed {
+                wires,
                 indices: indices.iter(),
             },
-            None => WireIter::All(self.wires.as_slice().iter()),
+            (CandidateWires::Snapshot(wires), None) => WireIter::All(wires.as_slice().iter()),
+            (CandidateWires::Shared(runs), indices) => WireIter::Shared {
+                runs,
+                indices: indices.as_ref().map(|indices| indices.iter()),
+                next: 0,
+            },
         }
     }
 
     pub fn len(&self) -> usize {
         self.wire_indices
             .as_ref()
-            .map_or(self.wires.len(), Vec::len)
+            .map_or(self.wires.slot_count(), Vec::len)
     }
 
     pub fn get(&self, index: usize) -> Option<&WireModel> {
         match &self.wire_indices {
-            Some(indices) => indices
-                .get(index)
-                .and_then(|&wire| self.wires.get(wire as usize)),
-            None => self.wires.get(index),
+            Some(indices) => indices.get(index).copied().and_then(|wire| self.wires.slot(wire)),
+            None => self.wires.slot(index as u32),
         }
     }
 
@@ -1909,7 +1976,7 @@ impl InteractionCandidates {
     }
 
     pub fn source_wire(&self, index: u32) -> Option<&WireModel> {
-        self.wires.get(index as usize)
+        self.wires.slot(index)
     }
 
     pub fn query_aabb(&self) -> Option<[f64; 4]> {
@@ -1948,13 +2015,13 @@ impl InteractionCandidates {
     /// Leave out every wire `drop` matches, with the segments, points and
     /// triangles that belong to it.
     pub(crate) fn exclude_wires(&mut self, drop: impl Fn(&WireModel) -> bool) {
-        let wires = Arc::clone(&self.wires);
-        let dropped = |wire: u32| wires.get(wire as usize).is_some_and(&drop);
+        let backing = self.wires.clone_arc();
+        let dropped = |wire: u32| backing.slot(wire).is_some_and(&drop);
         match self.wire_indices.as_mut() {
             Some(indices) => indices.retain(|&wire| !dropped(wire)),
             None => {
                 self.wire_indices = Some(
-                    (0..wires.len() as u32)
+                    (0..backing.slot_count() as u32)
                         .filter(|&wire| !dropped(wire))
                         .collect(),
                 );
@@ -1979,7 +2046,7 @@ impl InteractionCandidates {
     }
 
     pub(crate) fn extend_indexed_area(&mut self, other: Self) {
-        debug_assert!(Arc::ptr_eq(&self.wires, &other.wires));
+        debug_assert!(self.wires.same_source(&other.wires));
 
         fn append<T>(target: &mut Option<Vec<T>>, incoming: Option<Vec<T>>) {
             let (Some(target), Some(incoming)) = (target.as_mut(), incoming) else {
@@ -2000,7 +2067,7 @@ impl InteractionCandidates {
     }
 
     pub(crate) fn extend_indexed(&mut self, other: Self) {
-        debug_assert!(Arc::ptr_eq(&self.wires, &other.wires));
+        debug_assert!(self.wires.same_source(&other.wires));
 
         fn extend<T: Ord>(target: &mut Option<Vec<T>>, incoming: Option<Vec<T>>) {
             let (Some(target), Some(incoming)) = (target.as_mut(), incoming) else {
@@ -2122,6 +2189,50 @@ impl<const N: usize> WireSource for [WireModel; N] {
     }
 }
 
+/// Two wire sources read back to back without copying either one's wires:
+/// `head` first (in its own index order), then `tail`. Produces the same wire
+/// sequence a `Vec` built by `extend` would have, so consumers that only walk
+/// `iter()` see identical geometry while the caller pays zero clones.
+///
+/// The optional indexed views (`segments`, `snap_points`, …) stay `None`:
+/// the tail has no parallel index, so an index-only walk over the head would
+/// silently drop the tail's wires. Consumers fall back to full iteration,
+/// exactly like a plain `Vec<WireModel>` source.
+pub struct ChainedWireSource<'a, H: WireSource + ?Sized, T: WireSource + ?Sized> {
+    head: &'a H,
+    tail: &'a T,
+}
+
+impl<'a, H: WireSource + ?Sized, T: WireSource + ?Sized> ChainedWireSource<'a, H, T> {
+    pub fn new(head: &'a H, tail: &'a T) -> Self {
+        Self { head, tail }
+    }
+}
+
+impl<H: WireSource + ?Sized, T: WireSource + ?Sized> WireSource for ChainedWireSource<'_, H, T> {
+    fn iter(&self) -> WireIter<'_> {
+        WireIter::Chain(Box::new(self.head.iter()), Box::new(self.tail.iter()))
+    }
+
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    fn get(&self, index: usize) -> Option<&WireModel> {
+        self.head.get(index).or_else(|| {
+            index
+                .checked_sub(self.head.len())
+                .and_then(|tail_index| self.tail.get(tail_index))
+        })
+    }
+
+    fn source_wire(&self, index: u32) -> Option<&WireModel> {
+        self.head
+            .source_wire(index)
+            .or_else(|| self.tail.source_wire(index))
+    }
+}
+
 #[derive(Clone)]
 pub enum WireIter<'a> {
     All(std::slice::Iter<'a, WireModel>),
@@ -2129,6 +2240,15 @@ pub enum WireIter<'a> {
         wires: &'a [WireModel],
         indices: std::slice::Iter<'a, u32>,
     },
+    /// Zero-copy walk over a shared overlay gather: slots resolve through
+    /// the runs without any wire being cloned. With no explicit indices the
+    /// full slot range is walked in order, mirroring `All`.
+    Shared {
+        runs: &'a SharedWireRuns,
+        indices: Option<std::slice::Iter<'a, u32>>,
+        next: u32,
+    },
+    Chain(Box<WireIter<'a>>, Box<WireIter<'a>>),
 }
 
 impl<'a> Iterator for WireIter<'a> {
@@ -2140,6 +2260,28 @@ impl<'a> Iterator for WireIter<'a> {
             Self::Indexed { wires, indices } => {
                 indices.next().and_then(|&idx| wires.get(idx as usize))
             }
+            Self::Shared {
+                runs,
+                indices,
+                next,
+            } => {
+                let slot = match indices {
+                    Some(indices) => *indices.next()?,
+                    None => {
+                        let slot = *next;
+                        if slot as usize >= runs.len() {
+                            return None;
+                        }
+                        *next += 1;
+                        slot
+                    }
+                };
+                runs.get(slot)
+            }
+            Self::Chain(head, tail) => match head.next() {
+                Some(wire) => Some(wire),
+                None => tail.next(),
+            },
         }
     }
 }
@@ -2479,9 +2621,11 @@ mod area_query_tests {
         };
         assert_eq!(index.snap_candidate_keys(&parts()), vec![(9, 0)]);
         let local_wires = Arc::new(vec![wires[1].clone()]);
+        let mut local_runs = SharedWireRuns::default();
+        local_runs.push(&local_wires, 0);
         let slots = rustc_hash::FxHashMap::from_iter([((9, 0), 0)]);
         let remapped = index.query_remapped_snap_screen_from_parts_with_category(
-            local_wires,
+            Arc::new(local_runs),
             &slots,
             parts(),
             screen_rect,
@@ -2613,11 +2757,17 @@ mod area_query_tests {
         );
         let base_wires = Arc::new(vec![endpoint.clone(), unrelated.clone()]);
         let local_wires = Arc::new(vec![endpoint, unrelated]);
+        let local_runs = || {
+            let mut runs = SharedWireRuns::default();
+            runs.push(&local_wires, 0);
+            runs.push(&local_wires, 1);
+            Arc::new(runs)
+        };
         let slots = rustc_hash::FxHashMap::from_iter([((21, 0), 0), ((22, 0), 1)]);
         let index = InteractionIndex::build(&base_wires);
         let aabb = [-0.1, -0.1, 0.1, 0.1];
 
-        let remapped = |wires, category| {
+        let remapped = |wires: Arc<SharedWireRuns>, category| {
             index.query_remapped_snap_xy_from_parts_with_category(
                 wires,
                 &slots,
@@ -2626,11 +2776,11 @@ mod area_query_tests {
                 category,
             )
         };
-        let preview = remapped(Arc::clone(&local_wires), SnapQueryCategory::DiscretePreview);
+        let preview = remapped(local_runs(), SnapQueryCategory::DiscretePreview);
         assert_eq!(preview.len(), 1);
         assert_eq!(preview.source_wire(0).unwrap().name, "21");
 
-        let full = remapped(local_wires, SnapQueryCategory::Full);
+        let full = remapped(local_runs(), SnapQueryCategory::Full);
         assert_eq!(full.len(), 2, "full snap still includes unbounded wires");
     }
 
@@ -2638,7 +2788,7 @@ mod area_query_tests {
     fn the_area_merge_dedups_wire_indices_and_nothing_else() {
         let arc = Arc::new(sample());
         let base = |indices: Vec<u32>, segments: Vec<SegmentRef>| InteractionCandidates {
-            wires: Arc::clone(&arc),
+            wires: CandidateWires::Snapshot(Arc::clone(&arc)),
             wire_indices: Some(indices),
             segments: Some(segments),
             snap_points: None,

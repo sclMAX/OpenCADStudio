@@ -2756,8 +2756,11 @@ pub(crate) enum ArrowKind {
         filled: bool,
         size_mul: f32,
     },
+    /// `width` is the stroke's full width: 0 draws a hairline (Oblique,
+    /// DIMTSZ), more draws a filled band (Architectural tick).
     Tick {
         size: f32,
+        width: f32,
     },
     Open {
         size: f32,
@@ -2767,8 +2770,13 @@ pub(crate) enum ArrowKind {
         size: f32,
         filled: bool,
     },
+    /// "Origin indicator": an open circle of diameter `size` around the tip
+    /// and a stroke from the tip back along the leader. "Origin indicator 2"
+    /// (`inner`) adds a circle half that size, and its stroke starts at the
+    /// outer circle.
     Origin {
         size: f32,
+        inner: bool,
     },
     Box_ {
         size: f32,
@@ -2873,16 +2881,28 @@ fn builtin_arrow_from_block_name(name: &str, dimasz: f32) -> Option<ArrowKind> {
             size: dimasz * 0.5,
             filled: false,
         }),
-        "ORIGIN" | "ORIGIN2" | "ORIGININDICATOR" | "ORIGININDICATOR2" => {
-            Some(ArrowKind::Origin { size: dimasz })
-        }
+        "ORIGIN" | "ORIGININDICATOR" => Some(ArrowKind::Origin {
+            size: dimasz,
+            inner: false,
+        }),
+        "ORIGIN2" | "ORIGININDICATOR2" => Some(ArrowKind::Origin {
+            size: dimasz,
+            inner: true,
+        }),
         // `ArrowKind::Tick` draws the stroke `size` to either side of the tip
         // (total 2·size — its `size` is a half-length, matching DIMTSZ). The
         // block's stroke runs (-0.5,-0.5)→(0.5,0.5) scaled by DIMASZ, so its
         // half-length is DIMASZ/√2, not DIMASZ/2 — halving drew every
         // oblique stroke √2 short of the file's own. (#898)
-        "OBLIQUE" | "ARCHTICK" => Some(ArrowKind::Tick {
+        "OBLIQUE" => Some(ArrowKind::Tick {
             size: dimasz * std::f32::consts::FRAC_1_SQRT_2,
+            width: 0.0,
+        }),
+        // `_ArchTick` is the same stroke as an LWPOLYLINE of constant width
+        // 0.15 (`_Oblique` is a LINE), so it scales to 0.15·DIMASZ.
+        "ARCHTICK" => Some(ArrowKind::Tick {
+            size: dimasz * std::f32::consts::FRAC_1_SQRT_2,
+            width: dimasz * 0.15,
         }),
         "BOXFILLED" => Some(ArrowKind::Box_ {
             size: dimasz,
@@ -3333,11 +3353,19 @@ pub(crate) fn append_arrow(g: &mut DimGeom, tip: Vec3, dir: Vec3, arrow: &ArrowK
                 push_tri(&mut g.arrow_fill, tip, left, right);
             }
         }
-        ArrowKind::Tick { size } => {
+        ArrowKind::Tick { size, width } => {
             // 45° oblique tick crossing the dim line at the tip; `size` is
             // the half-length used by DIMTSZ.
             let off = (dir + perp).normalize_or_zero() * *size;
             add_segment(&mut g.dim_lines, tip - off, tip + off);
+            if *width > 0.0 {
+                // A wide polyline's band, square at both ends.
+                let side = (perp - dir).normalize_or_zero() * (*width * 0.5);
+                let (a, b) = (tip - off - side, tip - off + side);
+                let (c, d) = (tip + off + side, tip + off - side);
+                push_tri(&mut g.arrow_fill, a, b, c);
+                push_tri(&mut g.arrow_fill, a, c, d);
+            }
         }
         ArrowKind::Open { size, half_angle } => {
             let base = tip + dir * *size;
@@ -3362,22 +3390,25 @@ pub(crate) fn append_arrow(g: &mut DimGeom, tip: Vec3, dir: Vec3, arrow: &ArrowK
                 }
             }
         }
-        ArrowKind::Origin { size } => {
-            // Small filled dot at the tip with a perpendicular tick crossing
-            // the dim line — matches "_ORIGIN" / "_ORIGIN2" blocks.
-            let r = *size * 0.25;
-            const N: usize = 12;
-            let mut ring: Vec<Vec3> = Vec::with_capacity(N + 1);
-            for i in 0..=N {
-                let a = i as f32 * std::f32::consts::TAU / N as f32;
-                ring.push(tip + Vec3::new(a.cos() * r, a.sin() * r, 0.0));
+        ArrowKind::Origin { size, inner } => {
+            // The "_Origin" / "_Origin2" blocks at unit size: an open circle
+            // of radius 0.5 (plus 0.25 for "_Origin2") around the tip and a
+            // stroke back along the leader to 1.0, starting at the centre
+            // ("_Origin") or at the outer circle ("_Origin2").
+            const N: usize = 16;
+            let radii: &[f32] = if *inner { &[0.5, 0.25] } else { &[0.5] };
+            for &k in radii {
+                let r = *size * k;
+                let ring: Vec<Vec3> = (0..=N)
+                    .map(|i| {
+                        let a = i as f32 * std::f32::consts::TAU / N as f32;
+                        tip + Vec3::new(a.cos() * r, a.sin() * r, 0.0)
+                    })
+                    .collect();
+                add_polyline(&mut g.dim_lines, &ring);
             }
-            add_polyline(&mut g.dim_lines, &ring);
-            for i in 0..N {
-                push_tri(&mut g.arrow_fill, tip, ring[i], ring[i + 1]);
-            }
-            let half = *size * 0.5;
-            add_segment(&mut g.dim_lines, tip - perp * half, tip + perp * half);
+            let start = if *inner { *size * 0.5 } else { 0.0 };
+            add_segment(&mut g.dim_lines, tip + dir * start, tip + dir * *size);
         }
         ArrowKind::Box_ { size, filled } => {
             let half = *size * 0.5;
@@ -3491,6 +3522,10 @@ mod tests {
             ArrowKind::Tick { .. }
         ));
         assert!(matches!(
+            arrow_from_block_name(Some("OBLIQUE"), 1.0),
+            ArrowKind::Tick { width, .. } if width == 0.0
+        ));
+        assert!(matches!(
             arrow_from_block_name(Some("NONE"), 1.0),
             ArrowKind::None
         ));
@@ -3503,6 +3538,90 @@ mod tests {
             arrow_from_block_name(None, 1.0),
             ArrowKind::Triangle { filled: true, .. }
         ));
+    }
+
+    #[test]
+    fn arch_tick_is_a_band_as_wide_as_its_block() {
+        // AutoCAD 2025's "_ArchTick": an LWPOLYLINE (-0.5,-0.5)→(0.5,0.5) of
+        // constant width 0.15, here at DIMASZ 2 × DIMSCALE 100.
+        let mut g = DimGeom::new();
+        append_arrow(
+            &mut g,
+            Vec3::ZERO,
+            Vec3::X,
+            &arrow_from_block_name(Some("ARCHTICK"), 200.0),
+        );
+        assert_eq!(g.arrow_fill.len(), 6);
+        let along = Vec3::new(1.0, 1.0, 0.0).normalize();
+        let across = Vec3::new(-1.0, 1.0, 0.0).normalize();
+        let (mut half_len, mut half_width) = (0.0_f32, 0.0_f32);
+        for p in &g.arrow_fill {
+            let p = Vec3::from_array(*p);
+            half_len = half_len.max(p.dot(along).abs());
+            half_width = half_width.max(p.dot(across).abs());
+        }
+        assert!((half_len - 100.0 * std::f32::consts::SQRT_2).abs() < 1e-3);
+        assert!((half_width - 15.0).abs() < 1e-3, "half width {half_width}");
+
+        // "_Oblique" is a LINE: no band.
+        let mut g = DimGeom::new();
+        append_arrow(
+            &mut g,
+            Vec3::ZERO,
+            Vec3::X,
+            &arrow_from_block_name(Some("OBLIQUE"), 200.0),
+        );
+        assert!(g.arrow_fill.is_empty());
+    }
+
+    #[test]
+    fn origin_arrows_draw_their_blocks() {
+        // The "_Origin" / "_Origin2" blocks AutoCAD 2025 writes, at unit size:
+        //   _Origin:  CIRCLE r=0.5, LINE (0,0)->(-1,0)
+        //   _Origin2: CIRCLE r=0.5, CIRCLE r=0.25, LINE (-0.5,0)->(-1,0)
+        // Open circles, no fill; the block's -X runs back along the leader.
+        let runs = |name: &str| {
+            let mut g = DimGeom::new();
+            append_arrow(
+                &mut g,
+                Vec3::ZERO,
+                Vec3::X,
+                &arrow_from_block_name(Some(name), 100.0),
+            );
+            assert!(g.arrow_fill.is_empty(), "{name} is not filled");
+            g.dim_lines
+                .split(|p| p[0].is_nan())
+                .map(|run| run.to_vec())
+                .collect::<Vec<_>>()
+        };
+        let is_circle = |run: &[[f32; 3]], r: f32| {
+            run.len() > 8 && run.iter().all(|p| ((p[0].hypot(p[1])) - r).abs() < 1.0e-3)
+        };
+        let is_stroke = |run: &[[f32; 3]], from: f32, to: f32| {
+            run.len() == 2
+                && (run[0][0] - from).abs() < 1.0e-3
+                && (run[1][0] - to).abs() < 1.0e-3
+                && run.iter().all(|p| p[1].abs() < 1.0e-3)
+        };
+
+        let origin = runs("_Origin");
+        assert_eq!(origin.len(), 2, "_Origin: one circle and one stroke");
+        assert!(
+            is_circle(&origin[0], 50.0),
+            "_Origin circle has radius 0.5 × size"
+        );
+        assert!(
+            is_stroke(&origin[1], 0.0, 100.0),
+            "_Origin stroke runs centre → 1.0"
+        );
+
+        let origin2 = runs("_Origin2");
+        assert_eq!(origin2.len(), 3, "_Origin2: two circles and one stroke");
+        assert!(is_circle(&origin2[0], 50.0) && is_circle(&origin2[1], 25.0));
+        assert!(
+            is_stroke(&origin2[2], 50.0, 100.0),
+            "_Origin2 stroke runs 0.5 → 1.0"
+        );
     }
 
     #[test]

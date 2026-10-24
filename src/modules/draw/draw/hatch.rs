@@ -43,6 +43,18 @@ enum Mode {
     Manual,
 }
 
+/// The largest gap a boundary pick may bridge (HPGAPTOL range).
+pub const MAX_GAP_TOLERANCE: f64 = 5000.0;
+
+/// A typed gap tolerance, if it is a number in `0..=MAX_GAP_TOLERANCE`.
+fn parse_gap_tolerance(text: &str) -> Option<f64> {
+    text.trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|value| (0.0..=MAX_GAP_TOLERANCE).contains(value))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HatchMode {
     PickInside,
@@ -198,6 +210,10 @@ pub struct HatchCommand {
     island_style: codec::entities::HatchStyleType,
     inherited: Option<(HatchModel, codec::types::Color, codec::types::Transparency)>,
     plane: WorkingPlane,
+    /// HPGAPTOL: gaps up to this size count as closed for a picked point.
+    gap_tolerance: f64,
+    /// The next typed value sets `gap_tolerance`.
+    gap_prompt: bool,
 }
 
 impl HatchCommand {
@@ -240,6 +256,8 @@ impl HatchCommand {
                 .unwrap_or(codec::entities::HatchStyleType::Normal),
             inherited,
             plane,
+            gap_tolerance: 0.0,
+            gap_prompt: false,
         };
         command.set_object_selection(selected_objects);
         command
@@ -248,6 +266,12 @@ impl HatchCommand {
     /// HPASSOC: whether the hatch starts out associative.
     pub fn with_associative(mut self, associative: bool) -> Self {
         self.associative = associative;
+        self
+    }
+
+    /// HPGAPTOL: the largest gap a picked boundary may have.
+    pub fn with_gap_tolerance(mut self, gap_tolerance: f64) -> Self {
+        self.gap_tolerance = gap_tolerance;
         self
     }
 
@@ -551,6 +575,9 @@ impl CadCommand for HatchCommand {
     }
 
     fn prompt(&self) -> String {
+        if self.gap_prompt {
+            return format!("HATCH  {} <{}>:", t!("Gap tolerance"), self.gap_tolerance);
+        }
         match &self.mode {
             HatchMode::PickInside => {
                 let miss = if self.missed {
@@ -592,6 +619,9 @@ impl CadCommand for HatchCommand {
 
     fn options(&self) -> Vec<crate::command::CmdOption> {
         use crate::command::CmdOption;
+        if self.gap_prompt {
+            return Vec::new();
+        }
         match &self.mode {
             HatchMode::PickInside => {
                 let mut options = vec![
@@ -624,6 +654,10 @@ impl CadCommand for HatchCommand {
                     CmdOption::new(
                         &crate::tf!("Island style: {}", self.island_style_label()),
                         "Y",
+                    ),
+                    CmdOption::new(
+                        &format!("{}: {}", t!("Gap tolerance"), self.gap_tolerance),
+                        "G",
                     ),
                 ];
                 if self.region_count() > 0 {
@@ -684,11 +718,18 @@ impl CadCommand for HatchCommand {
     }
 
     fn on_point(&mut self, pt: DVec3) -> CmdResult {
+        if self.gap_prompt {
+            return CmdResult::NeedPoint;
+        }
         let pt = self.plane.to_local(pt);
         match &self.mode {
             HatchMode::PickInside => {
                 let xy = [pt.x, pt.y];
-                let faces = crate::scene::boundary_faces_around(&self.boundary_sources, xy, 1.0e-6);
+                let faces = crate::scene::boundary_faces_around(
+                    &self.boundary_sources,
+                    xy,
+                    self.gap_tolerance,
+                );
                 match resolve_hatch_rings(&faces, xy) {
                     Some(rings) => {
                         self.missed = false;
@@ -722,6 +763,10 @@ impl CadCommand for HatchCommand {
     }
 
     fn on_enter(&mut self) -> CmdResult {
+        if self.gap_prompt {
+            self.gap_prompt = false;
+            return CmdResult::NeedPoint;
+        }
         if matches!(self.mode, HatchMode::Manual) && self.manual_arc_midpoint.is_some() {
             return CmdResult::NeedPoint;
         }
@@ -784,6 +829,26 @@ impl CadCommand for HatchCommand {
         } else {
             CmdResult::CommitHatch(self.make_hatch(rings))
         }
+    }
+
+    fn wants_raw_point(&self) -> bool {
+        self.mode == HatchMode::PickInside && !self.gap_prompt
+    }
+
+    fn hatch_gap_tolerance(&self) -> Option<f64> {
+        Some(self.gap_tolerance)
+    }
+
+    fn dyn_field(&self) -> crate::command::DynField {
+        if self.gap_prompt {
+            crate::command::DynField::Scalar
+        } else {
+            crate::command::DynField::Point
+        }
+    }
+
+    fn dyn_commit_as_text(&self) -> bool {
+        self.gap_prompt
     }
 
     fn is_selection_gathering(&self) -> bool {
@@ -850,6 +915,18 @@ impl CadCommand for HatchCommand {
     fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
         let input = text.trim();
         let upper = input.to_ascii_uppercase();
+        if self.gap_prompt {
+            if let Some(value) = parse_gap_tolerance(input) {
+                self.gap_tolerance = value;
+                self.missed = false;
+            }
+            self.gap_prompt = false;
+            return Some(CmdResult::NeedPoint);
+        }
+        if matches!(self.mode, HatchMode::PickInside) && matches!(upper.as_str(), "G" | "GAP") {
+            self.gap_prompt = true;
+            return Some(CmdResult::NeedPoint);
+        }
         if matches!(self.mode, HatchMode::Manual) {
             return match upper.as_str() {
                 "A" | "ARC" => {
@@ -980,6 +1057,8 @@ pub struct GradientCommand {
     kind: crate::scene::model::hatch_model::GradientKind,
     /// Swap the two colour stops.
     invert: bool,
+    /// HPGAPTOL: gaps up to this size count as closed for a picked point.
+    gap_tolerance: f64,
 }
 
 impl GradientCommand {
@@ -993,7 +1072,14 @@ impl GradientCommand {
             missed: false,
             kind: crate::scene::model::hatch_model::GradientKind::Linear,
             invert: false,
+            gap_tolerance: 0.0,
         }
+    }
+
+    /// HPGAPTOL: the largest gap a picked boundary may have.
+    pub fn with_gap_tolerance(mut self, gap_tolerance: f64) -> Self {
+        self.gap_tolerance = gap_tolerance;
+        self
     }
 
     fn make_hatch(&self, rings: Vec<Vec<[f64; 2]>>) -> HatchModel {
@@ -1097,7 +1183,11 @@ impl CadCommand for GradientCommand {
         match &self.mode {
             Mode::PickInside => {
                 let xy = [pt.x, pt.y];
-                let faces = crate::scene::boundary_faces_around(&self.boundary_sources, xy, 1.0e-6);
+                let faces = crate::scene::boundary_faces_around(
+                    &self.boundary_sources,
+                    xy,
+                    self.gap_tolerance,
+                );
                 match resolve_hatch_rings(&faces, xy) {
                     Some(rings) => {
                         self.missed = false;
@@ -1132,6 +1222,10 @@ impl CadCommand for GradientCommand {
 
     fn on_escape(&mut self) -> CmdResult {
         CmdResult::Cancel
+    }
+
+    fn wants_raw_point(&self) -> bool {
+        matches!(self.mode, Mode::PickInside)
     }
 
     fn wants_text_input(&self) -> bool {
@@ -1220,6 +1314,7 @@ impl BoundaryCommand {
         sources: rustc_hash::FxHashMap<Handle, crate::scene::BoundarySource>,
         selected_objects: Vec<Handle>,
         plane: WorkingPlane,
+        gap_tolerance: f64,
     ) -> Self {
         let mut command = Self {
             sources,
@@ -1229,7 +1324,7 @@ impl BoundaryCommand {
             selected_objects: Vec::new(),
             mode: BoundaryMode::PickInside,
             island_style: BoundaryIslandStyle::Normal,
-            gap_tolerance: 1.0e-6,
+            gap_tolerance,
             plane,
             missed: false,
             output_region: false,
@@ -1284,7 +1379,7 @@ impl BoundaryCommand {
             &self.sources
         };
         let outlines = crate::scene::boundary_faces_around(sources, point, self.gap_tolerance);
-        let tolerance = Tolerance::new(self.gap_tolerance);
+        let tolerance = Tolerance::new(1.0e-6);
         let curves = |outline: &Vec<[f64; 2]>| {
             outline
                 .iter()
@@ -1363,7 +1458,7 @@ impl BoundaryCommand {
             &self.point_regions,
             self.plane,
             sources,
-            self.gap_tolerance,
+            1.0e-6,
         )
     }
 }
@@ -1396,7 +1491,7 @@ impl CadCommand for BoundaryCommand {
                 t!("%{cmd}  Select objects:", cmd = self.name()).into_owned()
             }
             BoundaryMode::GapTolerance { .. } => {
-                format!("BOUNDARY  {} <{}>:", t!("Tolerance"), self.gap_tolerance)
+                format!("BOUNDARY  {} <{}>:", t!("Gap tolerance"), self.gap_tolerance)
             }
         }
     }
@@ -1427,7 +1522,10 @@ impl CadCommand for BoundaryCommand {
             CmdOption::new("Advanced options", "A"),
             CmdOption::new(t!("Boundary").as_ref(), "O"),
             CmdOption::new(&island, "S"),
-            CmdOption::new(t!("Tolerance").as_ref(), "G"),
+            CmdOption::new(
+                &format!("{}: {}", t!("Gap tolerance"), self.gap_tolerance),
+                "G",
+            ),
         ];
         if self.region_count() > 0 {
             options.push(CmdOption::enter("Accept"));
@@ -1524,11 +1622,9 @@ impl CadCommand for BoundaryCommand {
             return_to_selection,
         } = self.mode
         {
-            if let Ok(value) = text.trim().parse::<f64>() {
-                if value.is_finite() && value > 0.0 {
-                    self.gap_tolerance = value;
-                    self.rebuild_faces();
-                }
+            if let Some(value) = parse_gap_tolerance(text) {
+                self.gap_tolerance = value;
+                self.rebuild_faces();
             }
             self.mode = if return_to_selection {
                 BoundaryMode::SelectObjects
@@ -1576,6 +1672,14 @@ impl CadCommand for BoundaryCommand {
             _ => return None,
         }
         Some(CmdResult::NeedPoint)
+    }
+
+    fn wants_raw_point(&self) -> bool {
+        self.mode == BoundaryMode::PickInside
+    }
+
+    fn hatch_gap_tolerance(&self) -> Option<f64> {
+        Some(self.gap_tolerance)
     }
 
     fn is_selection_gathering(&self) -> bool {
@@ -1800,7 +1904,7 @@ mod tests {
                 segments,
             },
         );
-        let mut command = BoundaryCommand::new(sources, Vec::new(), WorkingPlane::default());
+        let mut command = BoundaryCommand::new(sources, Vec::new(), WorkingPlane::default(), 0.0);
         command.point_regions = vec![rings];
         command.output_region = true;
 

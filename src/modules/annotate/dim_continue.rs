@@ -545,8 +545,8 @@ fn refresh_measurement(dimension: &mut Dimension, plane: Plane) {
             let axis = Vec2::new(value.rotation.cos(), value.rotation.sin());
             value.base.actual_measurement = (second - first).dot(axis).abs();
         }
-        Dimension::Angular2Ln(value) => value.base.actual_measurement = value.measurement_degrees(),
-        Dimension::Angular3Pt(value) => value.base.actual_measurement = value.measurement_degrees(),
+        Dimension::Angular2Ln(value) => value.base.actual_measurement = value.measurement_radians(),
+        Dimension::Angular3Pt(value) => value.base.actual_measurement = value.measurement_radians(),
         Dimension::Ordinate(value) => value.refresh_measurement(),
         _ => {}
     }
@@ -590,7 +590,7 @@ fn preview_for_dimension(dimension: &Dimension) -> WireModel {
                 lines[1][1] - vertex,
                 project(&plane, value.dimension_arc),
                 project(&plane, value.base.text_middle_point),
-                value.base.actual_measurement,
+                value.measurement_degrees(),
             );
         }
         Dimension::Angular3Pt(value) => {
@@ -604,7 +604,7 @@ fn preview_for_dimension(dimension: &Dimension) -> WireModel {
                 project(&plane, value.second_point) - vertex,
                 project(&plane, value.definition_point),
                 project(&plane, value.base.text_middle_point),
-                value.base.actual_measurement,
+                value.measurement_degrees(),
             );
         }
         Dimension::Ordinate(value) => {

@@ -73,8 +73,6 @@ pub static COPY: &[u8] = include_bytes!("../../assets/icons/ui/copy.svg");
 pub static MENU: &[u8] = include_bytes!("../../assets/icons/ui/menu.svg");
 pub static MOVE: &[u8] = include_bytes!("../../assets/icons/ui/move.svg");
 pub static RESIZE: &[u8] = include_bytes!("../../assets/icons/ui/resize.svg");
-/// `RESIZE` mirrored for a bottom-left corner grip.
-pub static RESIZE_LEFT: &[u8] = include_bytes!("../../assets/icons/ui/resize_left.svg");
 pub static PIN: &[u8] = include_bytes!("../../assets/icons/ui/pin.svg");
 /// `PIN` tilted 30°: the pin while auto-hide is on.
 pub static PIN_ACTIVE: &[u8] = include_bytes!("../../assets/icons/ui/pin_active.svg");
@@ -101,6 +99,8 @@ pub static MORE: &[u8] = include_bytes!("../../assets/icons/ui/more.svg");
 pub static INFO: &[u8] = include_bytes!("../../assets/icons/ui/info.svg");
 pub static MESH: &[u8] = include_bytes!("../../assets/icons/ui/mesh.svg");
 pub static ALERT: &[u8] = include_bytes!("../../assets/icons/ui/alert.svg");
+pub static WARNING: &[u8] = include_bytes!("../../assets/icons/ui/warning.svg");
+pub static IMAGE: &[u8] = include_bytes!("../../assets/icons/ui/image.svg");
 pub static LOCK: &[u8] = include_bytes!("../../assets/icons/ui/lock.svg");
 pub static EYE: &[u8] = include_bytes!("../../assets/icons/ui/eye.svg");
 pub static EYE_OFF: &[u8] = include_bytes!("../../assets/icons/ui/eye_off.svg");

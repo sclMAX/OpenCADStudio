@@ -428,8 +428,10 @@ impl OpenCADStudio {
             } else {
                 None
             };
-            if let Some(command) = self.tabs[i].active_cmd.as_mut() {
+            let tab = &mut self.tabs[i];
+            if let Some(command) = tab.active_cmd.as_mut() {
                 command.set_point_pick_context(context);
+                command.refresh_point_pick_scene(&tab.scene);
             }
         }
     }
@@ -593,6 +595,39 @@ impl OpenCADStudio {
         StepInput::SelectionComplete(kept)
     }
 
+    /// Drops entities on locked layers from a completed selection when the active
+    /// command rejects them (e.g. ssget ":L"), deselecting them and reporting
+    /// how many were on a locked layer.
+    pub(in crate::app) fn filter_locked_layer_selection(&mut self, input: StepInput) -> StepInput {
+        let StepInput::SelectionComplete(handles) = input else {
+            return input;
+        };
+        let i = self.active_tab;
+        if !self.tabs[i]
+            .active_cmd
+            .as_ref()
+            .is_some_and(|command| command.selection_rejects_locked_layers())
+        {
+            return StepInput::SelectionComplete(handles);
+        }
+        let (kept, dropped): (Vec<Handle>, Vec<Handle>) = handles.into_iter().partition(|handle| {
+            !self.tabs[i].scene.is_layer_locked(*handle)
+        });
+        for handle in &dropped {
+            self.tabs[i].scene.deselect_entity(*handle);
+        }
+        if !dropped.is_empty() {
+            let count = dropped.len();
+            self.command_line.push_info(&if count == 1 {
+                "1 was on a locked layer.".to_string()
+            } else {
+                format!("{count} were on a locked layer.")
+            });
+            self.refresh_properties();
+        }
+        StepInput::SelectionComplete(kept)
+    }
+
     /// What one selection step picked, as the reference words it: `N found`
     /// for the first step, `N found, M total`, `N found (D duplicate), M
     /// total` when some were chosen already, `N found, R removed, M total` in
@@ -703,6 +738,7 @@ impl OpenCADStudio {
         let input = self.filter_associative_dimension_selection(input);
         let input = self.filter_block_reference_selection(input);
         let input = self.filter_locked_point_cloud_selection(input);
+        let input = self.filter_locked_layer_selection(input);
         let input = self.filter_command_entity_selection(input);
         if let (Some(key), StepInput::SelectionComplete(kept)) = (gathering, &input) {
             self.selection_report = Some((key, kept.clone()));
@@ -833,9 +869,7 @@ impl OpenCADStudio {
                 command.inject_selection_entities(entities);
             }
         }
-        if matches!(&input, StepInput::Point(_)) {
-            self.refresh_command_point_pick_context(i);
-        }
+        self.refresh_command_point_pick_context(i);
         let ctrl = self.ctrl_down;
         let shift = self.shift_down;
         let picked_handle = if let StepInput::EntityPick(h, _) = &input {
@@ -969,6 +1003,10 @@ impl OpenCADStudio {
             // A path after OPEN / SAVEAS may hold spaces; it is one answer.
             || tokens[0].eq_ignore_ascii_case("OPEN")
             || tokens[0].eq_ignore_ascii_case("SAVEAS")
+            // A calculator expression may hold spaces; it is one answer.
+            || tokens[0].eq_ignore_ascii_case("CAL")
+            || tokens[0].eq_ignore_ascii_case("QUICKCALC")
+            || tokens[0].eq_ignore_ascii_case("QC")
         {
             return self.dispatch_command(cmd);
         }
@@ -1193,11 +1231,18 @@ impl OpenCADStudio {
 
     pub(in crate::app) fn feed_active_cmd(&mut self, token: &str) -> Task<Message> {
         let i = self.active_tab;
+        let trimmed = token.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("ENTER")
+            || trimmed.eq_ignore_ascii_case("RETURN")
+        {
+            return self.feed_command(StepInput::Enter);
+        }
         // Object-pick step: the token is a handle (as returned by `query`).
         if self.tabs[i]
             .active_cmd
             .as_ref()
-            .is_some_and(|c| c.needs_entity_pick())
+            .is_some_and(|c| c.needs_entity_pick() || c.is_selection_gathering())
         {
             // Option keywords take precedence over the handle reading —
             // "F"/"C"/"E" are valid hex, but during TRIM/EXTEND they are the
@@ -1209,6 +1254,9 @@ impl OpenCADStudio {
                 .and_then(|c| c.on_text_input(token));
             if let Some(r) = consumed {
                 return self.apply_cmd_result(r);
+            }
+            if let Some(task) = self.try_selection_keyword(token) {
+                return task;
             }
             let accepts_points = self.tabs[i]
                 .active_cmd

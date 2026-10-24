@@ -575,6 +575,45 @@ fn center_segment(mline: &MLine, index: usize) -> Option<(DVec3, DVec3)> {
     ))
 }
 
+/// TRIM on an MLINE: on the picked segment, every element loses the stretch
+/// around `pick` between its nearest cutting edges, or up to the segment's
+/// end on a side without one, as CUT ALL removes it. `cuts` gives the
+/// cutting fractions along an element from its start to its end point.
+pub(crate) fn trim_mline_at(
+    mline: &MLine,
+    pick: DVec3,
+    cuts: impl Fn(DVec3, DVec3) -> Vec<f64>,
+) -> Option<MLine> {
+    let mut mline = mline.clone();
+    let (segment, _, _, _) = closest_segment(&mline, pick)?;
+    let normal = DVec3::new(mline.normal.x, mline.normal.y, mline.normal.z);
+    let mut trimmed = false;
+    for element in 0..mline.style_element_count {
+        let Some((a, b)) = element_segment(&mline, segment, element) else {
+            continue;
+        };
+        let Some(curve) = segment_curve(a, b, normal) else {
+            continue;
+        };
+        let length = curve.length();
+        let edges = cuts(a, b);
+        let Some(at) = curve.parameter_at(pick.to_array()) else {
+            continue;
+        };
+        if length <= 1.0e-10 || edges.is_empty() {
+            continue;
+        }
+        let at = at.clamp(0.0, 1.0);
+        let low = edges.iter().copied().filter(|t| *t < at).fold(0.0, f64::max) * length;
+        let high = edges.iter().copied().filter(|t| *t > at).fold(1.0, f64::min) * length;
+        let data = &mut mline.vertices[segment].segments[element];
+        remove_drawn_range(&mut data.parameters, length, low, high);
+        add_cut_range(&mut data.area_fill_parameters, length, low, high);
+        trimmed = true;
+    }
+    trimmed.then_some(mline)
+}
+
 fn segment_curve(first: DVec3, second: DVec3, normal: DVec3) -> Option<PlanarCurve> {
     let direction = KernelVec3::from(second.to_array()) - KernelVec3::from(first.to_array());
     let length = direction.length();
@@ -1064,3 +1103,38 @@ fn segment_intersection(
 }
 
 inventory::submit!(crate::command::CommandRegistration { names: &["MLEDIT"] });
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    #[test]
+    fn trim_cuts_every_element_between_its_edges() {
+        let mut mline = MLine::new();
+        mline.style_element_count = 2;
+        mline.add_vertex(codec::types::Vector3::new(0.0, 0.0, 0.0));
+        mline.add_vertex(codec::types::Vector3::new(10.0, 0.0, 0.0));
+        for vertex in &mut mline.vertices {
+            for (element, offset) in [1.0, -1.0].into_iter().enumerate() {
+                vertex.segments[element].parameters = vec![offset, 0.0];
+            }
+        }
+        // Cutting edges at x = 3 and x = 7, whatever the element's offset.
+        let cuts = |a: DVec3, b: DVec3| vec![(3.0 - a.x) / (b.x - a.x), (7.0 - a.x) / (b.x - a.x)];
+        let trimmed = trim_mline_at(&mline, DVec3::new(5.0, 0.2, 0.0), cuts).unwrap();
+        for element in 0..2 {
+            let data = &trimmed.vertices[0].segments[element];
+            assert_eq!(drawn_ranges(&data.parameters, 10.0), vec![(0.0, 3.0), (7.0, 10.0)]);
+        }
+        // The fill between the outer lines leaves the same gap.
+        let mut style = codec::objects::MLineStyle::new("FILLED");
+        style.elements = vec![
+            codec::objects::MLineStyleElement::new(1.0),
+            codec::objects::MLineStyleElement::new(-1.0),
+        ];
+        style.flags.fill_on = true;
+        let fill = crate::entities::mline::mline_fill_triangles_with_style(&trimmed, &style);
+        assert!(!fill.is_empty());
+        assert!(fill.iter().all(|p| p[0] <= 3.0 + 1e-6 || p[0] >= 7.0 - 1e-6), "{fill:?}");
+    }
+}

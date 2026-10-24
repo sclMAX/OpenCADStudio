@@ -255,6 +255,9 @@ impl InstanceContext {
     }
 
     pub fn style_for(&self, document: &CadDocument, entity: &EntityType) -> ResolvedStyle {
+        if self.insert_path.iter().any(|insert| crate::scene::block_construction::is_construction(&insert.common)) {
+            return crate::scene::block_construction::display_style();
+        }
         self.block_style
             .map(|style| style.resolve(document, entity, self.viewport))
             .unwrap_or_else(|| render_style_for_viewport(document, entity, self.viewport))
@@ -281,6 +284,9 @@ pub struct RenderSceneGraph<'a> {
     depths: &'a FxHashMap<u64, [f32; 2]>,
     viewport: Option<Handle>,
     visibility_reveal: Option<&'a FxHashSet<Handle>>,
+    /// Published on the first INSERT: every placement asks for its block's
+    /// base point.
+    dictionary_owners: std::sync::OnceLock<super::block_authoring::DictionaryOwners<'a>>,
 }
 
 impl<'a> RenderSceneGraph<'a> {
@@ -300,6 +306,7 @@ impl<'a> RenderSceneGraph<'a> {
             depths,
             viewport: None,
             visibility_reveal: None,
+            dictionary_owners: std::sync::OnceLock::new(),
         }
     }
 
@@ -430,6 +437,8 @@ impl<'a> RenderSceneGraph<'a> {
         V: FnMut(&EntityType, &InstanceContext) -> bool,
         F: FnMut(&EntityType, &InstanceContext),
     {
+        self.dictionary_owners
+            .get_or_init(|| super::block_authoring::DictionaryOwners::publish(self.document));
         let insert_entity = EntityType::Insert(insert.clone());
         let block_style = parent
             .block_style
@@ -590,6 +599,9 @@ impl<'a> RenderSceneGraph<'a> {
     /// layer of the reference that places it.
     fn document_visible(&self, entity: &EntityType, member: bool) -> bool {
         let common = entity.common();
+        if crate::scene::block_construction::is_construction(common) {
+            if member || !self.visibility_reveal.is_some_and(|handles| handles.contains(&common.handle)) { return false; }
+        }
         if common.invisible
             && !self
                 .visibility_reveal
@@ -630,10 +642,7 @@ pub(crate) fn block_member_layer_hidden(document: &CadDocument, layer: &str) -> 
 }
 
 pub fn block_base_point(document: &CadDocument, block_name: &str) -> Vector3 {
-    document
-        .block_records
-        .iter()
-        .find(|record| record.name.eq_ignore_ascii_case(block_name))
+    block_record_by_name(document, block_name)
         .map(|record| {
             if let Some((_, parameter)) = super::block_basepoint::parameter(document, record.handle)
             {
@@ -648,6 +657,19 @@ pub fn block_base_point(document: &CadDocument, block_name: &str) -> Vector3 {
                 .unwrap_or(record.base_point)
         })
         .unwrap_or(Vector3::ZERO)
+}
+
+/// An annotative dimension with a single scale representation has a single
+/// picture, its own block: edits drop it and moves carry it like any other
+/// dimension's. With several, each scale's block is a separate picture those
+/// edits leave behind, so it is drawn from its definition instead.
+fn single_scale_picture(document: &CadDocument, handle: Handle, block: &str) -> bool {
+    crate::scene::annotative::object_scale_memberships(document, handle).len() == 1
+        && matches!(
+            document.get_entity(handle),
+            Some(EntityType::Dimension(stored))
+                if stored.base().block_name.trim().eq_ignore_ascii_case(block)
+        )
 }
 
 /// The block reference that places a dimension's picture block: at the
@@ -896,7 +918,8 @@ fn entity_owned_block_uses(
                 let base = dimension.base();
                 let mut insert = dimension_picture_insert(base, record.name.clone());
                 insert.common = base.common.clone();
-                let picture = !crate::scene::annotative::is_annotative(document, entity);
+                let picture = !crate::scene::annotative::is_annotative(document, entity)
+                    || single_scale_picture(document, base.common.handle, &record.name);
                 vec![block_use(
                     document,
                     insert,

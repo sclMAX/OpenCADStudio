@@ -139,6 +139,9 @@ pub fn apply_geom_prop_in_working_plane(
 }
 
 pub fn apply_common_prop(entity: &mut EntityType, field: &str, value: &str) {
+    if matches!(field, "layer" | "linetype") && crate::scene::block_construction::is_construction(entity.common()) {
+        return;
+    }
     let e = entity.as_entity_mut();
     match field {
         "layer" => e.set_layer(value.to_string()),
@@ -311,11 +314,13 @@ pub fn set_entity_thickness(entity: &mut EntityType, v: f64) {
 }
 
 pub fn toggle_invisible(entity: &mut EntityType) {
+    if crate::scene::block_construction::is_construction(entity.common()) { return }
     let cur = entity.as_entity_mut().is_invisible();
     entity.as_entity_mut().set_invisible(!cur);
 }
 
 pub fn apply_color(entity: &mut EntityType, color: AcadColor) {
+    if crate::scene::block_construction::is_construction(entity.common()) { return }
     entity.as_entity_mut().set_color(color);
     let common = entity.common_mut();
     common.color_name = None;
@@ -324,6 +329,7 @@ pub fn apply_color(entity: &mut EntityType, color: AcadColor) {
 
 /// Like [`apply_color`], but keeps a colour-book identity (`BOOK$NAME`).
 pub fn apply_named_color(entity: &mut EntityType, color: AcadColor, name: Option<String>) {
+    if crate::scene::block_construction::is_construction(entity.common()) { return }
     apply_color(entity, color);
     entity.common_mut().color_name = name;
 }

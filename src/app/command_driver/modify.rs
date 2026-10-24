@@ -214,13 +214,12 @@ impl OpenCADStudio {
                 self.refresh_properties();
             }
             None => {
+                let reason = crate::modules::draw::modify::join::join_failure_reason(&pairs);
                 self.tabs[i].active_cmd = None;
                 self.tabs[i].snap_result = None;
                 self.tabs[i].scene.clear_preview_wire();
                 self.restore_pre_cmd_tangent();
-                self.command_line.push_error(
-                    crate::t!("JOIN: objects don't form a single connected chain, or contain an unsupported type / tilted arc.").as_ref(),
-                );
+                self.command_line.push_error(reason.as_ref());
             }
         }
         None

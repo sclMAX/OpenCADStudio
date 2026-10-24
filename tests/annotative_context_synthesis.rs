@@ -232,3 +232,60 @@ fn object_scale_membership_add_remove_roundtrips() {
         "object should be non-annotative once its last representation is gone"
     );
 }
+
+/// A context's fit overrides reach the dimension drawn at its scale. AutoCAD
+/// 2025 keeps, for a 1:50 context, DIMTMOVE 1 (leader) with override code 16
+/// under a style whose DIMTMOVE is 0, and draws that scale with the leader.
+#[test]
+fn dimension_context_fit_overrides_reach_the_drawn_dimension() {
+    use codec::entities::{Dimension, DimensionLinear};
+    use codec::xdata::XDataValue;
+    use OpenCADStudio::entities::dim_override as ov;
+
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let dim = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(150.0, 0.0, 0.0));
+    let ent = doc
+        .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dim))))
+        .unwrap();
+    let sh = doc.allocate_handle();
+    let mut s = Scale::new("1:50", 1.0, 50.0);
+    s.handle = sh;
+    doc.objects.insert(sh, ObjectType::Scale(s));
+    assert!(annotative::create_annotation_context(&mut doc, ent, sh));
+    let leaf = context_leaves(&doc, ent)[0];
+
+    let drawn_dimtmove = |doc: &CadDocument| {
+        let drawn =
+            annotative::entity_for_annotation_context(doc, doc.get_entity(ent).unwrap(), Some(sh));
+        ov::int(&drawn.common().extended_data, ov::DIMTMOVE)
+    };
+    let set_context = |doc: &mut CadDocument, dimtmove: bool, override_code: u8| {
+        let Some(ObjectType::ObjectContextData(c)) = doc.objects.get_mut(&leaf) else {
+            panic!("dimension context leaf");
+        };
+        let ObjectContextKind::Dim(d) = &mut c.kind else {
+            panic!("dimension context kind");
+        };
+        d.dimtmove = dimtmove;
+        d.override_code = override_code;
+    };
+
+    // Not flagged as overridden: the style decides.
+    set_context(&mut doc, true, 0);
+    assert_eq!(drawn_dimtmove(&doc), None);
+
+    set_context(&mut doc, true, 16);
+    assert_eq!(drawn_dimtmove(&doc), Some(1));
+    // Only the drawn copy carries it; the stored dimension is unchanged.
+    assert_eq!(
+        ov::int(
+            &doc.get_entity(ent).unwrap().common().extended_data,
+            ov::DIMTMOVE
+        ),
+        None
+    );
+
+    // The dimension's own override still wins.
+    ov::set(&mut doc, ent, ov::DIMTMOVE, Some(XDataValue::Integer16(2)));
+    assert_eq!(drawn_dimtmove(&doc), Some(2));
+}

@@ -534,26 +534,26 @@ impl OpenCADStudio {
                     .map(|(_, e)| e.common().layer.clone())
                     .collect();
                 if sel_layers.is_empty() {
-                    self.command_line.push_error(
-                        crate::t!("LAYISO: select entities on the layers to isolate first.")
-                            .as_ref(),
-                    );
+                    use crate::modules::draw::select::SelectObjectsCommand;
+                    let cmd = SelectObjectsCommand::new("LAYISO");
+                    self.command_line.push_info(&cmd.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(cmd));
                 } else {
                     let names: Vec<String> = self.tabs[i]
                         .scene
                         .document
                         .layers
                         .iter()
+                        .filter(|l| !sel_layers.contains(&l.name) && !l.is_off())
                         .map(|l| l.name.clone())
                         .collect();
                     let undo = self.begin_layer_undo(i, "LAYISO", &names);
                     for name in &names {
-                        if !sel_layers.contains(name) {
-                            if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
-                                dl.turn_off();
-                            }
+                        if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
+                            dl.turn_off();
                         }
                     }
+                    self.tabs[i].layiso_turned_off = Some(names.clone());
                     self.tabs[i].scene.invalidate_layer_visibility(&names);
                     self.tabs[i].dirty = true;
                     self.commit_layer_undo(i, undo);
@@ -626,18 +626,17 @@ impl OpenCADStudio {
                 }
             }
 
-            // LAYUNISO — restore all layers that were turned off by LAYISO (turn all on)
+            // LAYUNISO — turn back on the layers the last LAYISO turned off
             "LAYUNISO" => {
-                let names: Vec<String> = self.tabs[i]
-                    .scene
-                    .document
-                    .layers
-                    .iter()
-                    .map(|l| l.name.clone())
-                    .collect();
+                let Some(names) = self.tabs[i].layiso_turned_off.take() else {
+                    self.command_line.push_info(
+                        crate::t!("LAYUNISO: no layers were isolated by LAYISO.").as_ref(),
+                    );
+                    return Some(Task::none());
+                };
                 let undo = self.begin_layer_undo(i, "LAYUNISO", &names);
                 for name in &names {
-                    if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(&name) {
+                    if let Some(dl) = self.tabs[i].scene.document.layers.get_mut(name) {
                         dl.turn_on();
                     }
                 }

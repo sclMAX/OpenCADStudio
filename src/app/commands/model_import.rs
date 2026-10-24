@@ -627,6 +627,11 @@ impl OpenCADStudio {
         for line in &import.messages {
             self.command_line.push_output(line);
         }
+        // Each missing texture map is also shown in a window of its own.
+        self.import_dialogs.tds_maps = import.missing_maps;
+        if !self.import_dialogs.tds_maps.is_empty() {
+            self.active_modal = Some(crate::app::ModalKind::TdsMissingMap);
+        }
         self.tabs[i].dirty = true;
         self.refresh_properties();
     }

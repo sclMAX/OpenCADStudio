@@ -108,6 +108,16 @@ impl OpenCADStudio {
                 .as_ref()
                 .map(|(_, t)| t.clone())
                 .unwrap_or_else(|| lookup::empty_table(parameter));
+            if original.as_ref().is_some_and(|(handle, _)| {
+                drafts.iter().any(|draft: &Draft| {
+                    draft
+                        .original
+                        .as_ref()
+                        .is_some_and(|(existing, _)| existing == handle)
+                })
+            }) {
+                continue;
+            }
             if edited.row_count < 0
                 || edited.row_count > 1000
                 || edited.columns.is_empty()
@@ -131,10 +141,19 @@ impl OpenCADStudio {
         let selected = if name.is_empty() {
             0
         } else {
-            let Some(index) = drafts
-                .iter()
-                .position(|d| d.original_parameter.lookup_name.eq_ignore_ascii_case(name))
-            else {
+            let Some(index) = drafts.iter().position(|d| {
+                d.original_parameter.lookup_name.eq_ignore_ascii_case(name)
+                    || lookup::parameters(&tab.scene.document, definition)
+                        .into_iter()
+                        .any(|(_, p)| {
+                            p.lookup_name.eq_ignore_ascii_case(name)
+                                && d.edited.columns.iter().any(|column| {
+                                    column.lookup_property
+                                        && column.node_id
+                                            == p.parameter.parameter.element.eval.node_id
+                                })
+                        })
+            }) else {
                 self.command_line
                     .push_error(crate::t!("No Lookup parameter has that name.").as_ref());
                 return Task::none();
@@ -147,7 +166,7 @@ impl OpenCADStudio {
             epoch: tab.scene.geometry_epoch,
             drafts,
             selected,
-            properties: lookup::properties(&tab.scene.document, definition),
+            properties: lookup::authoring_properties(&tab.scene.document, definition),
             selected_property: None,
             error: None,
             notice: None,
@@ -184,6 +203,25 @@ impl OpenCADStudio {
         if stale {
             self.block_lookup.as_mut().unwrap().error = Some(
                 crate::t!("The block changed. Cancel and reopen the Lookup table.").into_owned(),
+            );
+            return Task::none();
+        }
+        let mut claimed = std::collections::BTreeSet::new();
+        if state
+            .drafts
+            .iter()
+            .filter(|draft| draft.changed())
+            .any(|draft| {
+                draft
+                    .edited
+                    .columns
+                    .iter()
+                    .filter(|column| column.lookup_property)
+                    .any(|column| !claimed.insert(column.node_id))
+            })
+        {
+            self.block_lookup.as_mut().unwrap().error = Some(
+                crate::t!("A Lookup output cannot belong to multiple edited tables.").into_owned(),
             );
             return Task::none();
         }

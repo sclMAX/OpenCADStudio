@@ -483,6 +483,9 @@ impl Camera {
         if delta_x.abs() < 1e-6 && delta_y.abs() < 1e-6 {
             return;
         }
+        if !(delta_x.is_finite() && delta_y.is_finite()) {
+            return;
+        }
         let old_rot = self.rotation;
         let speed = 0.005_f32;
 
@@ -540,8 +543,12 @@ impl Camera {
     /// target — reachable from a high `ZOOMFACTOR` and from a fast ZOOM
     /// Dynamic drag alike.
     pub fn zoom(&mut self, delta: f32) {
-        self.distance = (self.distance * Self::ZOOM_STEP.powf(delta))
+        let distance = (self.distance * Self::ZOOM_STEP.powf(delta))
             .clamp(Self::DISTANCE_MIN, Self::DISTANCE_MAX);
+        // `clamp` passes NaN through; keep the last usable zoom instead.
+        if distance.is_finite() {
+            self.distance = distance;
+        }
     }
 
     /// The `delta` `zoom` needs in order to scale `distance` by `ratio`:
@@ -606,8 +613,11 @@ impl Camera {
         };
         let cam_right = self.rotation * Vec3::X;
         let cam_up = self.rotation * Vec3::Y;
-        self.target -= (cam_right * delta_x * wpp).as_dvec3();
-        self.target += (cam_up * delta_y * wpp).as_dvec3();
+        let step = (cam_up * delta_y * wpp - cam_right * delta_x * wpp).as_dvec3();
+        // A non-finite step would park the view nowhere for good.
+        if step.is_finite() {
+            self.target += step;
+        }
     }
 
     /// The 8 corners of `min..max`, expressed in camera space relative to the
@@ -683,6 +693,9 @@ impl Camera {
         aspect: f32,
         pixels: Option<(f32, f32)>,
     ) {
+        if !(min.is_finite() && max.is_finite()) {
+            return;
+        }
         let grow = |px: f32| {
             if px.is_finite() && px > 0.0 {
                 1.0 + EXTENTS_BORDER_PX / px

@@ -18,10 +18,14 @@ pub(crate) mod display;
 mod draw;
 mod field;
 mod fileops;
+mod hyperlink;
+pub(crate) use hyperlink::{hyperlink_options, set_hyperlink_options};
 mod inquiry;
 mod layerprops;
 mod layers;
 mod model_import;
+mod ole;
+pub(crate) use ole::{ole_quality, set_ole_quality};
 mod pc_colormap;
 mod pc_extract;
 mod pdf_dialogs;
@@ -198,6 +202,10 @@ impl OpenCADStudio {
         }
         if cmd.trim_start_matches(['_', '.']) == "BGRIPSET" {
             return Some(self.start_block_grip_set());
+        }
+        let construction = cmd.trim_start_matches(['_', '.']);
+        if construction == "BCONSTRUCTION" || construction.starts_with("BCONSTRUCTION ") {
+            return Some(self.start_block_construction(construction.strip_prefix("BCONSTRUCTION").unwrap().trim()));
         }
         if cmd.trim_start_matches(['_', '.']) == "BCYCLEORDER" {
             return Some(self.open_block_cycle_order());
@@ -532,10 +540,16 @@ impl OpenCADStudio {
         if let Some(t) = self.dispatch_attdef(cmd, i) {
             return Some(t);
         }
+        if let Some(t) = self.dispatch_ole(cmd, i) {
+            return Some(t);
+        }
         if let Some(t) = self.dispatch_sheet_set(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_field(cmd, i) {
+            return Some(t);
+        }
+        if let Some(t) = self.dispatch_hyperlink(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_count(cmd, i) {
@@ -705,6 +719,7 @@ inventory::submit!(crate::command::CommandRegistration {
         // Script forms of the table commands.
         "-LAYER",
         "-PURGE",
+        "-OVERKILL",
         "-STYLE",
         "-RENAME",
         "-DIMSTYLE",

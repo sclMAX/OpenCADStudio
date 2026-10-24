@@ -160,11 +160,42 @@ pub(crate) fn stretch_entity_except(
             }
         }
         codec::EntityType::Text(t) => {
-            if in_win(t.insertion_point.x, t.insertion_point.y) {
-                t.insertion_point.x += dx;
-                t.insertion_point.y += dy;
-                t.insertion_point.z += dz;
-                stretched = true;
+            use codec::entities::{TextHorizontalAlignment as HA, TextVerticalAlignment as VA};
+            let shift = |p: &mut codec::types::Vector3| {
+                p.x += dx;
+                p.y += dy;
+                p.z += dz;
+            };
+            let justified =
+                !matches!((t.horizontal_alignment, t.vertical_alignment), (HA::Left, VA::Baseline));
+            match t.alignment_point.as_mut() {
+                // Aligned and Fit text runs between its two points: each
+                // stretches on its own.
+                Some(a) if matches!(t.horizontal_alignment, HA::Aligned | HA::Fit) => {
+                    if in_win(t.insertion_point.x, t.insertion_point.y) {
+                        shift(&mut t.insertion_point);
+                        stretched = true;
+                    }
+                    if in_win(a.x, a.y) {
+                        shift(a);
+                        stretched = true;
+                    }
+                }
+                // Other justified text is placed by its alignment point; the
+                // first point moves with it.
+                Some(a) if justified => {
+                    if in_win(a.x, a.y) {
+                        shift(a);
+                        shift(&mut t.insertion_point);
+                        stretched = true;
+                    }
+                }
+                _ => {
+                    if in_win(t.insertion_point.x, t.insertion_point.y) {
+                        shift(&mut t.insertion_point);
+                        stretched = true;
+                    }
+                }
             }
         }
         codec::EntityType::MText(t) => {
@@ -260,7 +291,7 @@ pub(crate) fn stretch_entity_except(
                 }
             }
             if stretched {
-                dim.base_mut().actual_measurement = dim.measurement();
+                dim.base_mut().actual_measurement = dim.stored_measurement();
             }
         }
         codec::EntityType::Polyline3D(p) => {

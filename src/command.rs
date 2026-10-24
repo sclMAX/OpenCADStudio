@@ -1751,6 +1751,12 @@ pub enum CmdResult {
         displacement_overrides: Option<(f64, f64)>,
         rotate_only: Vec<Handle>,
     },
+    SetBlockConstruction {
+        document: u64,
+        definition: Handle,
+        handles: Vec<Handle>,
+        operation: crate::modules::block_editor::construction::Operation,
+    },
     AlignBlockReference {
         document: u64,
         alignment: Box<crate::scene::block_alignment::Alignment>,
@@ -1759,6 +1765,8 @@ pub enum CmdResult {
         flipped: bool,
     },
     EvaluateBlockParameter {
+        /// Native runtime grip identity, retained for commit-time eligibility checks.
+        grip: Option<usize>,
         insert: Option<Handle>,
         document: u64,
         definition: Handle,
@@ -1810,6 +1818,9 @@ pub enum CmdResult {
         tab_id: u64,
         handle: Option<Handle>,
     },
+    /// A QuickCalc pick finished: the point, distance or angle it measured,
+    /// for the pallet's input.
+    QuickCalcPick(crate::app::calc::Value),
     /// Command is still waiting for the next point; show updated prompt.
     NeedPoint,
     /// Update the committed-segment wire (normal colour) and keep collecting points.
@@ -2189,6 +2200,8 @@ pub enum CmdResult {
     },
     /// Cancel: discard any preview and end the command.
     Cancel,
+    /// Cleanly end the command without reporting cancellation.
+    Done,
     /// End the command and begin in-place editing of the table cell under
     /// `point` on table `handle` (TABLEDIT). The host resolves the cell —
     /// it owns the document needed for the table-style lookup — honors
@@ -2219,6 +2232,11 @@ pub enum CmdResult {
     /// collecting an option + value, then running `UCS Z 90`). Unlike
     /// `Relaunch` it does not touch the selection.
     Dispatch(String),
+    /// End the command and run `script` as typed command-line input, one
+    /// line after another (a plugin's `CommandStep::Dispatch`, e.g. the
+    /// command calls of a script). A plugin command's script starts from an
+    /// empty selection.
+    Script(String),
     /// Move `dest` entities to the layer of the `src` entity; end command.
     MatchEntityLayer {
         dest: Vec<Handle>,
@@ -2960,6 +2978,9 @@ pub trait CadCommand: Send {
     /// Refreshed for each point input so zoom and viewport changes are reflected.
     fn set_point_pick_context(&mut self, _context: Option<PointPickContext>) {}
 
+    /// Refresh geometry used by scene-aware point placement before input/preview.
+    fn refresh_point_pick_scene(&mut self, _scene: &Scene) {}
+
     /// Called when the user presses Enter (finalize / next option).
     fn on_enter(&mut self) -> CmdResult;
 
@@ -3236,6 +3257,11 @@ pub trait CadCommand: Send {
 
     fn inject_hover_entity(&mut self, _handle: Handle, _entity: EntityType) {}
 
+    /// The step a QuickCalc pick is on (1-based), for the pallet's banner.
+    fn quick_calc_step(&self) -> Option<u8> {
+        None
+    }
+
     /// Preview wires that must survive generic command-preview refreshes such
     /// as snap-dwell ticks. Transient hover candidates remain supplied by
     /// `on_hover_entity` on viewport moves.
@@ -3375,6 +3401,11 @@ pub trait CadCommand: Send {
         None
     }
 
+    /// Non-mutating parameter input for the host's staged geometry preview.
+    fn block_parameter_preview(&self, _cursor: DVec3) -> Option<CmdResult> {
+        None
+    }
+
     /// Advance the insertion anchor on a rising Ctrl key edge.
     fn cycle_insertion_point(&mut self) -> bool {
         false
@@ -3444,6 +3475,11 @@ pub trait CadCommand: Send {
         false
     }
 
+    /// Exclude locked-layer entities from interactive selection (e.g. ssget ":L").
+    fn selection_rejects_locked_layers(&self) -> bool {
+        false
+    }
+
     fn inject_selection_entities(&mut self, _entities: Vec<SelectionEntity>) {}
 
     fn area_preview_regions(&self) -> Option<Vec<AreaPreviewRegion>> {
@@ -3462,6 +3498,21 @@ pub trait CadCommand: Send {
     /// these steps. Default `false`. (#291)
     fn window_corner_pick(&self) -> bool {
         false
+    }
+
+    /// The step takes the bare cursor position: an internal point picked
+    /// inside an area (HATCH, BOUNDARY). Object snap, tracking and the
+    /// Ortho/Polar lock would move the pick onto a nearby edge and select the
+    /// neighbouring area, so the host skips them all for this step. Default
+    /// `false`. (#2009)
+    fn wants_raw_point(&self) -> bool {
+        false
+    }
+
+    /// HPGAPTOL as the command currently has it, so a gap tolerance changed
+    /// at its prompt is kept for later boundary picks. Default `None`.
+    fn hatch_gap_tolerance(&self) -> Option<f64> {
+        None
     }
 
     /// The step draws a window that selects objects rather than placing

@@ -825,7 +825,13 @@ impl OpenCADStudio {
             }
             return;
         }
-        let mut previews = if let Some(wires) = self.dimension_preview_wires(i, cur) {
+        let parameter_preview = self.block_parameter_geometry_preview(i, cur);
+        let mut parameter_hidden = None;
+        let mut previews = if let Some(preview) = parameter_preview {
+            self.tabs[i].scene.set_command_preview_hatches(preview.hatches);
+            parameter_hidden = Some(preview.hidden);
+            preview.wires
+        } else if let Some(wires) = self.dimension_preview_wires(i, cur) {
             wires
         } else {
             let tab = &mut self.tabs[i];
@@ -875,11 +881,13 @@ impl OpenCADStudio {
         }
         let preview_count = previews.len();
         let compute_ms = crate::perf::elapsed_ms(compute_started);
-        let preview_hidden = self.tabs[i]
-            .active_cmd
-            .as_ref()
-            .map(|command| command.preview_hidden_handles().to_vec())
-            .unwrap_or_default();
+        let preview_hidden = parameter_hidden.unwrap_or_else(|| {
+            self.tabs[i]
+                .active_cmd
+                .as_ref()
+                .map(|command| command.preview_hidden_handles().to_vec())
+                .unwrap_or_default()
+        });
         self.tabs[i]
             .scene
             .set_command_preview_hidden(&preview_hidden);

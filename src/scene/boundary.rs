@@ -1,9 +1,9 @@
 use super::*;
 
 use kernel::geom2d::{
-    bounded_faces, closest_point, contains, distance_to, intersect, ring_nesting_depths,
-    segment_crossing, signed_area, triangulate, Curve, Line, SegmentCrossing, Tolerance,
-    Transform as CurveTransform,
+    bounded_faces, closest_point, contains, distance_to, gap_bridges, intersect,
+    ring_nesting_depths, segment_crossing, signed_area, triangulate, Curve, Line,
+    SegmentCrossing, Tolerance, Transform as CurveTransform,
 };
 
 use crate::command::WorkingPlane;
@@ -52,6 +52,54 @@ fn wire_segments_on_plane(wire: &WireModel, plane: WorkingPlane, tolerance: f64)
 }
 
 fn entity_curves_on_plane(entity: &EntityType, plane: WorkingPlane, tolerance: f64) -> Vec<Curve> {
+    // Straight entities have no unique support plane. Check their actual
+    // points and direction against the hatch OCS instead of an arbitrary one.
+    let straight = match entity {
+        EntityType::Line(line) => Some((line.start, line.end, None)),
+        EntityType::Ray(ray) => Some((ray.base_point, ray.base_point, Some((ray.direction, true)))),
+        EntityType::XLine(line) => Some((
+            line.base_point,
+            line.base_point,
+            Some((line.direction, false)),
+        )),
+        _ => None,
+    };
+    if let Some((start, end, direction)) = straight {
+        let local = |point: codec::types::Vector3| {
+            plane.to_local(glam::DVec3::new(point.x, point.y, point.z))
+        };
+        let start = local(start);
+        let end = local(end);
+        if start.z.abs() > tolerance || end.z.abs() > tolerance {
+            return Vec::new();
+        }
+        let start = [start.x, start.y];
+        let curve = if let Some((direction, ray)) = direction {
+            let direction =
+                plane.vector_to_local(glam::DVec3::new(direction.x, direction.y, direction.z));
+            if direction.z.abs() > 1.0e-9 || direction.x.hypot(direction.y) < 1.0e-12 {
+                return Vec::new();
+            }
+            let direction = [direction.x, direction.y];
+            if ray {
+                Curve::Ray(kernel::geom2d::Ray {
+                    origin: start,
+                    direction,
+                })
+            } else {
+                Curve::XLine(kernel::geom2d::XLine {
+                    base: start,
+                    direction,
+                })
+            }
+        } else {
+            Curve::Line(Line {
+                start,
+                end: [end.x, end.y],
+            })
+        };
+        return vec![curve];
+    }
     let Some(planar) = crate::entities::curve::entity_curve(entity) else {
         return Vec::new();
     };
@@ -77,14 +125,51 @@ fn entity_curves_on_plane(entity: &EntityType, plane: WorkingPlane, tolerance: f
     }
 }
 
-fn entity_boundary_source_on_plane(
+fn has_unsupported_polyline_topology(entity: &EntityType) -> bool {
+    match entity {
+        EntityType::Polyline(polyline) => {
+            let unsupported_flags = codec::entities::PolylineFlags::POLYGON_MESH
+                | codec::entities::PolylineFlags::POLYFACE_MESH
+                | codec::entities::PolylineFlags::CURVE_FIT
+                | codec::entities::PolylineFlags::SPLINE_FIT;
+            polyline.flags.bits() & unsupported_flags.bits() != 0
+        }
+        EntityType::Polyline3D(polyline) => {
+            polyline.flags.is_3d_mesh
+                || polyline.flags.is_polyface_mesh
+                || polyline.flags.spline_fit
+                || polyline.smooth_type != codec::entities::polyline3d::SmoothSurfaceType::None
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn entity_boundary_source_on_plane(
     entity: &EntityType,
     plane: WorkingPlane,
     tolerance: f64,
     clip_bounds: Option<([f64; 2], [f64; 2])>,
 ) -> Option<BoundarySource> {
+    // Mesh vertex order describes rows/faces; fit flags describe smooth curves,
+    // not the chordal path the explode fallback would produce.
+    if has_unsupported_polyline_topology(entity) {
+        return None;
+    }
+
     let curves = entity_curves_on_plane(entity, plane, tolerance);
 
+    let curves = if curves.is_empty()
+        && matches!(entity, EntityType::Polyline(_) | EntityType::Polyline3D(_))
+    {
+        // Heavy and 3D polylines are not single planar curves in entity_curve.
+        // Their constituent edges still cut a hatch when they lie in its OCS.
+        crate::modules::draw::modify::explode::explode_polyline_segments(entity)
+            .iter()
+            .flat_map(|piece| entity_curves_on_plane(piece, plane, tolerance))
+            .collect()
+    } else {
+        curves
+    };
     if curves.is_empty() {
         return None;
     }
@@ -134,7 +219,7 @@ fn needs_scene_boundary_sources(entity: &EntityType, plane: WorkingPlane, tolera
 /// tessellating them raw yields a unit stub that can never close a face.
 /// With no bounds there is nothing to clip against, so unbounded curves
 /// contribute nothing.
-fn live_segments_for_curves(
+pub(crate) fn live_segments_for_curves(
     curves: &[Curve],
     clip_bounds: Option<([f64; 2], [f64; 2])>,
     tolerance: f64,
@@ -587,7 +672,7 @@ fn edge_curve(
             .values()
             .flat_map(|source| source.curves.iter())
             .filter(|curve| {
-                distance_to(curve, edge.start).min(distance_to(curve, edge.end)) <= tolerance * 4.0
+                distance_to(curve, edge.start).max(distance_to(curve, edge.end)) <= tolerance * 4.0
             })
             .collect(),
     };
@@ -1027,14 +1112,20 @@ impl Scene {
                     {
                         continue;
                     }
-                    let old_count = path.boundary_handles.len();
-                    path.boundary_handles
-                        .retain(|source| self.document.get_entity(*source).is_some());
-                    if path.boundary_handles.is_empty() {
+                    // An erased source leaves the path as it is, no longer
+                    // associative: the remaining sources alone would bound
+                    // a different region.
+                    if path
+                        .boundary_handles
+                        .iter()
+                        .any(|source| self.document.get_entity(*source).is_none())
+                    {
+                        path.boundary_handles.clear();
                         path.flags.set_external(false);
+                        association_changed = true;
+                        modified = true;
+                        continue;
                     }
-                    association_changed |= path.boundary_handles.len() != old_count;
-                    modified |= association_changed;
                     let sources: rustc_hash::FxHashMap<_, _> = path
                         .boundary_handles
                         .iter()
@@ -1357,15 +1448,23 @@ pub(crate) fn separated_hatch_path_groups(
     groups
 }
 
+/// The faces the segments enclose once gaps up to `gap` are bridged.
+fn faces_with_gaps(mut segments: Vec<Line>, gap: f64) -> Vec<Vec<[f64; 2]>> {
+    let bridges = gap_bridges(&segments, gap, Tolerance::new(WELD_TOLERANCE));
+    segments.extend(bridges);
+    bounded_faces(&segments, Tolerance::new(WELD_TOLERANCE))
+}
+
+/// Every face the sources enclose, treating gaps up to `gap` as closed.
 pub(crate) fn boundary_faces(
     sources: &rustc_hash::FxHashMap<Handle, BoundarySource>,
-    tolerance: f64,
+    gap: f64,
 ) -> Vec<Vec<[f64; 2]>> {
     let segments: Vec<_> = sources
         .values()
         .flat_map(|source| source.segments.iter().copied())
         .collect();
-    bounded_faces(&segments, Tolerance::new(tolerance))
+    faces_with_gaps(segments, gap)
 }
 
 /// The faces a pick at `point` needs, built from the sources near it only.
@@ -1375,11 +1474,14 @@ pub(crate) fn boundary_faces(
 /// the box lies wholly outside it, so it cannot cut that face or sit in it
 /// as an island: the result matches `boundary_faces` over every source for
 /// this pick, without building the arrangement of the whole drawing (#1869).
+///
+/// Gaps up to `gap` between loose ends count as closed (`gap_bridges`).
 pub(crate) fn boundary_faces_around(
     sources: &rustc_hash::FxHashMap<Handle, BoundarySource>,
     point: [f64; 2],
-    tolerance: f64,
+    gap: f64,
 ) -> Vec<Vec<[f64; 2]>> {
+    let tolerance = gap.max(WELD_TOLERANCE);
     let boxes: Vec<([f64; 2], [f64; 2], &BoundarySource)> = sources
         .values()
         .filter_map(|source| {
@@ -1419,10 +1521,10 @@ pub(crate) fn boundary_faces_around(
             })
             .flat_map(|(_, _, source)| source.segments.iter().copied())
             .collect();
-        let faces = bounded_faces(&segments, Tolerance::new(tolerance));
+        let faces = faces_with_gaps(segments, gap);
         let innermost = faces
             .iter()
-            .filter(|face| contains(&face_curves(face), point, Tolerance::new(tolerance)))
+            .filter(|face| contains(&face_curves(face), point, Tolerance::new(WELD_TOLERANCE)))
             .min_by(|a, b| signed_area(a).abs().total_cmp(&signed_area(b).abs()));
         let settled = innermost.is_some_and(|face| {
             face.iter().all(|p| {
@@ -1659,5 +1761,31 @@ mod boundary_xline_tests {
         let room = boundary_faces_around(&sources, [51.0, 51.0], tolerance);
         assert_eq!(islands(&room), 1, "the island in the picked room is kept");
         assert!(room.len() < all.len() / 4, "only the neighbourhood is built");
+    }
+
+    #[test]
+    fn gap_tolerance_closes_a_corner_gap_that_fits() {
+        // A square whose right side stops 0.5 short of the bottom one.
+        let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 0.5], [10.0, 10.0], [0.0, 10.0]];
+        let sources: rustc_hash::FxHashMap<_, _> = [(0, 1), (2, 3), (3, 4), (4, 0)]
+            .into_iter()
+            .enumerate()
+            .map(|(k, (a, b))| {
+                let line = Line {
+                    start: corners[a],
+                    end: corners[b],
+                };
+                let source = BoundarySource {
+                    segments: vec![line],
+                    curves: vec![Curve::Line(line)],
+                };
+                (Handle::new(k as u64 + 1), source)
+            })
+            .collect();
+        assert!(boundary_faces(&sources, 0.0).is_empty());
+        assert!(boundary_faces_around(&sources, [5.0, 5.0], 0.4).is_empty());
+        let faces = boundary_faces_around(&sources, [5.0, 5.0], 0.6);
+        assert_eq!(faces.len(), 1);
+        assert!((signed_area(&faces[0]).abs() - 100.0).abs() < 1e-9);
     }
 }

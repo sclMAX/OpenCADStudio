@@ -71,6 +71,13 @@ impl State {
         let Some(draft) = self.drafts.get_mut(self.selected) else {
             return;
         };
+        let primary_id = draft
+            .original_parameter
+            .parameter
+            .parameter
+            .element
+            .eval
+            .node_id;
         let table = &mut draft.edited;
         let cols = table.columns.len();
         let rows = table.row_count.max(0) as usize;
@@ -94,16 +101,24 @@ impl State {
                     .position(|c| c.lookup_property)
                     .unwrap_or(cols);
                 for row in (0..rows).rev() {
-                    table
-                        .expressions
-                        .insert(row * cols + index, property.value.clone());
+                    table.expressions.insert(
+                        row * cols + index,
+                        if property.column.lookup_property {
+                            format!("Value{}", row + 1)
+                        } else {
+                            property.value.clone()
+                        },
+                    );
                 }
                 table.columns.insert(index, property.column.clone());
                 table.column_count += 1;
                 self.selected_property = None;
             }
             Action::RemoveProperty(index)
-                if table.columns.get(index).is_some_and(|c| !c.lookup_property) =>
+                if table
+                    .columns
+                    .get(index)
+                    .is_some_and(|c| !c.lookup_property || c.node_id != primary_id) =>
             {
                 for row in (0..rows).rev() {
                     table.expressions.remove(row * cols + index);
@@ -154,7 +169,15 @@ impl State {
                 table.columns[index].writable = value;
             }
             Action::Audit => {
-                match block_lookup::validate(table, draft.original.as_ref().map(|(_, t)| t)) {
+                match block_lookup::validate(table, draft.original.as_ref().map(|(_, t)| t))
+                    .and_then(|_| {
+                        block_lookup::validate_with_properties(
+                            table,
+                            draft.original.as_ref().map(|(_, t)| t),
+                            &self.properties,
+                        )
+                    })
+                {
                     Ok(()) => self.notice = Some(crate::t!("Table audit passed.").into_owned()),
                     Err(error) => self.error = Some(crate::t!(error.as_str()).into_owned()),
                 }
@@ -174,18 +197,10 @@ pub(crate) fn view(state: &State, sizing: crate::ui::modal::ModalSizing) -> Elem
     for (index, column) in table.columns.iter().enumerate() {
         let name = if column.lookup_property {
             state
-                .drafts
+                .properties
                 .iter()
-                .find(|d| {
-                    d.original_parameter
-                        .parameter
-                        .parameter
-                        .element
-                        .eval
-                        .node_id
-                        == column.node_id
-                })
-                .map(|d| d.original_parameter.lookup_name.clone())
+                .find(|p| p.column.lookup_property && p.column.node_id == column.node_id)
+                .map(|p| p.label.clone())
                 .unwrap_or_else(|| crate::t!("Lookup value").into_owned())
         } else {
             state
@@ -207,6 +222,20 @@ pub(crate) fn view(state: &State, sizing: crate::ui::modal::ModalSizing) -> Elem
                 ]
                 .spacing(4),
             );
+            if column.node_id
+                != draft
+                    .original_parameter
+                    .parameter
+                    .parameter
+                    .element
+                    .eval
+                    .node_id
+            {
+                header = header.push(
+                    button(text(crate::t!("Remove").into_owned()).size(11))
+                        .on_press(send(Action::RemoveProperty(index))),
+                );
+            }
         } else {
             header = header.push(
                 button(text(crate::t!("Remove").into_owned()).size(11))
@@ -270,7 +299,7 @@ pub(crate) fn view(state: &State, sizing: crate::ui::modal::ModalSizing) -> Elem
                     .label
                     .clone())
                 .on_select(move |i| send(Action::Property(i)))
-                .placeholder(crate::t!("Choose input property").into_owned())
+                .placeholder(crate::t!("Choose input or Lookup output property").into_owned())
                 .width(Fill),
                 button(text(crate::t!("Add Property").into_owned()))
                     .on_press_maybe(state.selected_property.map(|_| send(Action::AddProperty)))
@@ -283,6 +312,8 @@ pub(crate) fn view(state: &State, sizing: crate::ui::modal::ModalSizing) -> Elem
                 .into_owned()
             )
             .size(12),
+            text(crate::tr!("block-lookup", "input-help", closed = "[2,6]", open = "(2,6]")).size(12),
+            text(crate::tr!("block-lookup", "quoted-help", name = "`a b`")).size(12),
             scrollable(grid)
                 .direction(scrollable::Direction::Both {
                     vertical: Default::default(),

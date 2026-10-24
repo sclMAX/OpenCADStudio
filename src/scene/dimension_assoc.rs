@@ -2373,7 +2373,7 @@ impl Scene {
             }
             let measurement = match &**dimension {
                 Dimension::Linear(linear) => linear_measurement(linear),
-                _ => dimension.measurement(),
+                _ => dimension.stored_measurement(),
             };
             // Store the raw sheet measurement; the formatter applies DIMLFAC once.
             debug_assert!(

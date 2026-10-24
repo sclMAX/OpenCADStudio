@@ -422,6 +422,15 @@ impl OpenCADStudio {
             return Task::none();
         }
         let i = self.active_tab;
+        // A Mac keyboard's Delete key sends Backspace: with nothing typed and
+        // no command running it erases the selection, as Delete does.
+        if cfg!(target_os = "macos")
+            && self.command_line.input.is_empty()
+            && self.tabs[i].active_cmd.is_none()
+            && !self.tabs[i].scene.selected.is_empty()
+        {
+            return Task::done(Message::DeleteSelected);
+        }
         // Backspace edits the focused dynamic-input field first;
         // emptying it unlocks the field (back to cursor tracking).
         if self.dyn_input && !self.tabs[i].dyn_fields.is_empty() {
@@ -1262,6 +1271,10 @@ impl OpenCADStudio {
 
     pub(in crate::app) fn on_command_escape(&mut self) -> Task<Message> {
         self.tabs[self.active_tab].measurement.clear();
+        // Escape also closes the overlapping-objects list.
+        if self.cycle_candidates.take().is_some() {
+            self.tabs[self.active_tab].scene.set_hover_highlight(None);
+        }
         // Escape answers a pending client getpoint request first: no point.
         if self.control.get_point.is_some() {
             self.resolve_get_point(None);
@@ -2676,6 +2689,11 @@ impl OpenCADStudio {
             return self.on_dynamic_dimension_choice(field, &value);
         }
         let i = self.active_tab;
+        if field == "ole_lock_aspect" {
+            self.set_ole_lock_aspect(i, &value);
+            self.tabs[i].properties.edit_choice_open = false;
+            return Task::none();
+        }
         if field == "ext_pcx_locked" {
             let handles = self.point_cloud_lock_targets(i);
             self.apply_property_op(i, "CHPROP", &handles, |app, handle| {
@@ -4068,6 +4086,19 @@ impl OpenCADStudio {
                         return Task::none();
                     }
                 }
+                if field.starts_with("ole_") {
+                    if let Err(message) = crate::entities::ole2frame::validate_property(field, &val) {
+                        self.command_line.push_error(message);
+                        return Task::none();
+                    }
+                    if matches!(
+                        field,
+                        "ole_width" | "ole_height" | "ole_scale_width" | "ole_scale_height"
+                    ) {
+                        self.resize_ole_frames(i, &handles, field, &val);
+                        return Task::none();
+                    }
+                }
                 if field.starts_with("att_") {
                     if let Err(message) =
                         crate::entities::attribute::validate_definition_property(field, &val)
@@ -4321,18 +4352,12 @@ impl OpenCADStudio {
                                 }
                             }
                             "hyperlink" => {
-                                // Stored in the standard PE_URL XDATA
-                                // record; an empty value clears it.
-                                let vals = if val.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(vec![codec::xdata::XDataValue::String(val.clone())])
-                                };
-                                crate::scene::view::dispatch::set_entity_xdata(
+                                // The address of the PE_URL record; its
+                                // text and named location stay.
+                                crate::scene::hyperlink::set_url(
                                     &mut self.tabs[i].scene.document,
                                     handle,
-                                    "PE_URL",
-                                    vals,
+                                    &val,
                                 );
                             }
                             "arrow_size" | "text_offset" | "dim_scale_overall" => {

@@ -50,6 +50,7 @@ pub(super) fn default_bindings() -> BTreeMap<String, String> {
         ("F12".to_string(), "DYNINPUT"),
         (format!("{ACCEL}+0"), "CLEANSCREEN"),
         (format!("{ACCEL}+1"), "PROPERTIES"),
+        (format!("{ACCEL}+K"), "HYPERLINK"),
         (format!("{ACCEL}+N"), "QNEW"),
         (format!("{ACCEL}+O"), "OPEN"),
         (format!("{ACCEL}+P"), "PLOT"),

@@ -5,6 +5,8 @@ use codec::{CadDocument, EntityType, Handle};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 
+mod constraints;
+
 /// The copy is built in the last saved document, so the source definition and
 /// its references remain at their checkpoint even when the editor is dirty.
 pub(super) struct DefinitionCopy {
@@ -37,6 +39,9 @@ fn remap_common(common: &mut EntityCommon, handles: &FxHashMap<Handle, Handle>) 
 }
 
 fn cloneable_object(object: &ObjectType) -> bool {
+    if let ObjectType::Associative(object) = object {
+        return constraints::cloneable(object);
+    }
     if let ObjectType::DynamicBlock(object) = object {
         return !matches!(object.data, codec::objects::DynamicBlockData::Unknown);
     }
@@ -388,6 +393,9 @@ pub(super) fn copy_definition(
     for (old, mut object) in objects {
         let new = handles[&old];
         match &mut object {
+            ObjectType::Associative(object) => {
+                constraints::remap(object, new, &handles)?;
+            }
             ObjectType::DynamicBlock(object) => {
                 object.handle = new;
                 object.visit_handles_mut(&mut |handle| {
@@ -579,6 +587,7 @@ pub(super) fn copy_definition(
         let definition = handles[&record.handle];
         crate::scene::block_authoring::refresh_copied_identity(&mut target, definition, name);
     }
+    crate::scene::Scene::register_copied_constraint_networks(&mut target, &handles)?;
     Ok(DefinitionCopy {
         record: handles[&root.handle],
         document: target,

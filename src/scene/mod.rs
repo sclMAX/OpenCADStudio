@@ -8,13 +8,16 @@
 pub mod annotative;
 pub mod assoc_array;
 pub(crate) mod block_metadata;
+pub(crate) mod hyperlink;
 pub mod block_service;
 pub mod block_visibility;
+pub(crate) mod block_construction;
 pub(crate) mod block_authoring;
 pub(crate) mod block_basepoint;
 pub(crate) mod block_lookup;
 pub(crate) mod block_properties_table;
 pub(crate) mod block_actions;
+pub(crate) mod block_parameter_properties;
 pub(crate) mod block_alignment;
 pub(crate) mod block_grips;
 pub(crate) mod block_action_bars;
@@ -81,15 +84,16 @@ mod scene_markers;
 mod selection;
 pub mod viewport_dimension_pick;
 pub mod viewport_ref;
-pub(crate) use selection::{pe_url_description_of, pe_url_of};
+pub(crate) use selection::pe_url_of;
 pub mod parametric_constraints;
 mod parametric_solve;
 
 pub(crate) use boundary::{
     boundary_entities, boundary_entities_from_sources, boundary_faces, boundary_faces_around,
-    boundary_polyline_entities, exact_hatch_paths, hatch_boundary_rings, hatch_path_directions,
-    hatch_path_ring, remap_hatch_associations, ring_source_handles, separated_hatch_path_groups,
-    sources_near_rings, BoundarySource,
+    boundary_polyline_entities, entity_boundary_source_on_plane, exact_hatch_paths,
+    hatch_boundary_rings, hatch_path_directions, hatch_path_ring, live_segments_for_curves,
+    remap_hatch_associations, ring_source_handles, separated_hatch_path_groups, sources_near_rings,
+    BoundarySource,
 };
 
 // Parallel tessellation free functions live in `convert::tess` (alongside the
@@ -1002,6 +1006,19 @@ impl MemoHit {
             MemoHit::Slice(set, start, len) => &set[*start..*start + *len],
         }
     }
+
+    /// The wire at `ordinal` as a shared run reference — the run `Arc` plus
+    /// the wire's index inside it — so an overlay gather can share
+    /// memoized geometry instead of cloning it per query.
+    fn shared_at(&self, ordinal: usize) -> Option<(Arc<Vec<WireModel>>, u32)> {
+        match self {
+            MemoHit::Owned(wires) => wires
+                .get(ordinal)
+                .map(|_| (Arc::clone(wires), ordinal as u32)),
+            MemoHit::Slice(set, start, len) => (ordinal < *len)
+                .then(|| (Arc::clone(set), (start + ordinal) as u32)),
+        }
+    }
 }
 
 /// Hands the set an abandoned resident patch was taking apart back to the
@@ -1021,6 +1038,26 @@ impl Drop for ReclaimOnDecline<'_> {
         }
     }
 }
+
+/// Coalesced geometry-journal replay for the overlay base, keyed by (base
+/// epoch, geometry epoch, space key): the journal changes themselves.
+type OverlayChanges = (u64, u64, u64, Arc<Vec<(Handle, ChangeKind)>>);
+
+/// What a query needs from the immutable overlay base: (base epoch, base
+/// index, geometry-journal changes since it).
+type OverlayBase = (
+    u64,
+    Arc<crate::scene::pick::interaction_index::InteractionIndex>,
+    Arc<Vec<(Handle, ChangeKind)>>,
+);
+
+/// A zero-copy overlay gather: shared wire runs plus the base and changed
+/// slot maps remapping `(handle, ordinal)` keys onto run slots.
+type OverlayGather = (
+    Arc<crate::scene::pick::interaction_index::SharedWireRuns>,
+    HashMap<(u64, u32), u32>,
+    HashMap<(u64, u32), u32>,
+);
 
 /// Kill-switch: `OCS_NO_RESIDENT_MEMO` reverts the resident set to the old
 /// full re-tessellation on every edit, in case a mutation site is ever found
@@ -2387,6 +2424,11 @@ pub struct Scene {
     /// by block record.
     pub visibility_states: HashMap<Handle, usize>,
     pub(crate) block_visibility_reveal: bool,
+    pub(crate) block_construction_hidden: rustc_hash::FxHashSet<Handle>,
+    pub(crate) block_constraint_status_mode: bool,
+    block_constraint_status_colors: [String; 4],
+    constraint_status_cache: RefCell<parametric_solve::status::Cache>,
+    constraint_status_suppressed: std::cell::Cell<bool>,
     /// Currently selected entity handles.
     pub selected: HashSet<Handle>,
     /// Polylines only part of which is selected (Ctrl+click): the picked
@@ -2531,6 +2573,11 @@ pub struct Scene {
             Arc<crate::scene::pick::interaction_index::InteractionIndex>,
         )>,
     >,
+    /// Geometry-journal replay for the overlay base, keyed on (base epoch,
+    /// geometry epoch, space key). Pointer moves consult the overlay base
+    /// several times per gesture; replay the journal once per key instead
+    /// of once per consult.
+    interaction_overlay_changes: RefCell<Option<OverlayChanges>>,
     /// Auxiliary broad phase for hatch-only objects.
     interaction_handle_index_cache: RefCell<
         Option<(
@@ -2681,6 +2728,8 @@ pub struct Scene {
     pub bg_color: [f32; 4],
     /// Custom paper-space background fill color for Wipeout entities.
     pub paper_bg_color: [f32; 4],
+    /// The desk around a layout's sheet (Options › Display).
+    pub desk_bg_color: [f32; 4],
     /// Dense model-space cluster half-span used for viewport recovery.
     pub local_extent_max: f32,
     /// Dense model-space cluster median used for viewport recovery.
@@ -2812,6 +2861,10 @@ pub struct Scene {
     /// Document-wide named-parameter and expression table decoded from
     /// standard associative variables.
     pub(crate) named_parameters: named_parameters::ParameterTable,
+    /// Content hash of the constraint model as of the last
+    /// `sync_native_parametric_graph`, letting geometry-only edits skip the
+    /// graph rebuild. `None` until the first sync records one.
+    native_graph_fingerprint: Option<u64>,
     /// Tessellated block definitions in block-local coords, keyed by render
     /// background and block epoch. Model and Paper adapt black/white colours
     /// differently; retaining both variants prevents a full block rebuild on
@@ -3095,6 +3148,7 @@ impl Scene {
             interaction_index_pending_key: std::cell::Cell::new(None),
             interaction_base_index_cache: RefCell::new(None),
             interaction_overlay_index_cache: RefCell::new(None),
+            interaction_overlay_changes: RefCell::new(None),
             interaction_handle_index_cache: RefCell::new(None),
             sort_cache: RefCell::new(None),
             draw_depth_cache: RefCell::new(None),
@@ -3126,6 +3180,11 @@ impl Scene {
             current_layout: "Model".to_string(),
             block_edit_block: None,
             block_visibility_reveal: false,
+            block_construction_hidden: Default::default(),
+            block_constraint_status_mode: false,
+            block_constraint_status_colors: ["8".into(), "2".into(), "3".into(), "1".into()],
+            constraint_status_cache: Default::default(),
+            constraint_status_suppressed: std::cell::Cell::new(false),
             viewcube_ucs: glam::Mat4::IDENTITY,
             hatches: HashMap::default(),
             meshes: HashMap::default(),
@@ -3136,6 +3195,7 @@ impl Scene {
             active_viewport: None,
             bg_color: [33.0 / 255.0, 40.0 / 255.0, 48.0 / 255.0, 1.0],
             paper_bg_color: [1.0, 1.0, 1.0, 1.0],
+            desk_bg_color: PAPER_DESK_COLOR,
             local_extent_max: 1e9,
             local_center: [0.0, 0.0],
             annotation_scale: 1.0,
@@ -3168,6 +3228,7 @@ impl Scene {
             constraints_epoch: 0,
             glyph_cache: RefCell::new(None),
             named_parameters: named_parameters::ParameterTable::new(),
+            native_graph_fingerprint: None,
             has_associative_centers: std::cell::Cell::new(None),
             has_underlays: std::cell::Cell::new(None),
             has_face3d: std::cell::Cell::new(None),
@@ -3332,7 +3393,7 @@ impl Scene {
         // 1.0). An annotative block scales as ONE unit at the INSERT level, so
         // its internal geometry / text / attributes must NOT be scaled
         // individually because that would apply the same scale twice.
-        let built = cache::block_cache::BlockCache::build(
+        let mut built = cache::block_cache::BlockCache::build(
             &self.document,
             1.0,
             annotation_scale_handle,
@@ -3341,6 +3402,7 @@ impl Scene {
             viewport,
             &self.draw_depth_map(),
         );
+        if self.constraint_shading_active() { built.disable_prototypes(); }
         let arc = Arc::new(built);
         let mut cache = self.block_defn_cache.borrow_mut();
         cache.retain(|_, (epoch, _)| *epoch == self.block_epoch);
@@ -4169,8 +4231,20 @@ impl Scene {
         }
         if !self.parametric_constraints.is_empty() || !self.named_parameters.is_empty() {
             self.refresh_dynamic_dimension_texts();
-            // A restyle changes no constraint, so the stored graph is current.
-            if !appearance_only {
+            // The stored associative graph rebuilds only when the constraint
+            // model actually changed since the last sync — never for a pure
+            // geometry edit. Nothing in the session reads the graph between
+            // edits: glyph placement and the solver run off the runtime
+            // constraint sets, and every consumer of the stored graph —
+            // save/export, parameter and constraint commands, undo replay —
+            // flushes with `sync_native_parametric_graph` itself. Constraint
+            // commands mutate the runtime sets with no explicit flush of
+            // their own, so hashing the model here is what still syncs an
+            // add/remove/toggle/value edit on this same bump. The refresh
+            // runs first because it can rewrite a reference constraint's
+            // parameter, which is itself graph input.
+            let fingerprint = self.constraint_model_fingerprint();
+            if self.native_graph_fingerprint != Some(fingerprint) {
                 self.sync_native_parametric_graph();
             }
         }
@@ -7416,6 +7490,9 @@ impl Scene {
         frozen_layers: Option<&HashSet<Handle>>,
         style_viewport: Option<Handle>,
     ) -> Arc<Vec<WireModel>> {
+        if self.constraint_shading_active() && self.block_edit_block == Some(block) {
+            let _ = self.block_constraint_report(block);
+        }
         // Normalize an inert anno override away so distinct viewport scales
         // share one resident set when annotation can't change the wires.
         let anno_scale_override = if self.annotation_affects_wires() {
@@ -7439,7 +7516,7 @@ impl Scene {
             all_visible,
             frozen_layers,
             style_viewport,
-        );
+        ) ^ if self.constraint_shading_active() { 0xC057_A705_0000_0001 } else { 0 };
         {
             let sets = self.resident_wire_sets.borrow();
             if let Some(set) = sets.get(&key) {
@@ -7457,7 +7534,7 @@ impl Scene {
         // solid, even when the delta journal contains only the section entity.
         // Rebuild the resident set in that case so an incremental patch cannot
         // retain the source solid's uncut edge cache.
-        if self.active_live_section(block).is_none() {
+        if self.active_live_section(block).is_none() && !self.constraint_shading_active() {
             if let Some(arc) = self.try_resident_patch(
                 key,
                 block,
@@ -8368,6 +8445,7 @@ impl Scene {
         &self,
         render_mode_override: Option<codec::entities::ViewportRenderMode>,
     ) -> (Vec<WireModel>, Vec<WireModel>) {
+        let _constraint_display = self.suppress_constraint_shading();
         let apply_mode = |wires: &mut Vec<WireModel>, mode| {
             let flags = view::render::render_mode_flags(mode);
             for wire in wires.iter_mut().filter(|wire| wire.fill_is_3d) {
@@ -8651,6 +8729,9 @@ impl Scene {
     }
 
     fn hatch_models_arc_for_view(&self, requested_tint_selected: bool) -> Arc<Vec<HatchModel>> {
+        if self.constraint_shading_active() {
+            let _ = self.block_constraint_report(self.block_edit_block.unwrap());
+        }
         // Model-space selection is rendered as a tiny overlay. Keep the
         // resident model set stable across select/deselect so its expensive
         // tessellation/style sync and GPU buffers remain warm.
@@ -8665,7 +8746,9 @@ impl Scene {
             0
         };
         let target_block = self.content_render_block_handle();
-        let key = (target_block, self.current_layout.clone());
+        let key = (target_block, if self.constraint_shading_active() {
+            format!("{}:constraint-status", self.current_layout)
+        } else { self.current_layout.clone() });
         {
             let reuse = {
                 let cache = self.hatch_cache.borrow();
@@ -8705,14 +8788,15 @@ impl Scene {
             self.paper_annotation_scale_handle()
         };
         let build_started = crate::perf::enabled().then(iced::time::Instant::now);
-        let arc = Arc::new(self.synced_hatch_models(
+        let models = self.synced_hatch_models(
             target_block,
             None,
             scale,
             self.annotation_all_visible(),
             None,
             tint_selected,
-        ));
+        );
+        let arc = Arc::new(models);
         let build_ms = crate::perf::elapsed_ms(build_started);
         if build_ms >= 1.0 {
             crate::perf_record!(
@@ -9049,8 +9133,13 @@ impl Scene {
     }
 
     pub(super) fn meshes_arc(&self) -> Arc<Vec<MeshLodSet>> {
+        if self.constraint_shading_active() {
+            let _ = self.block_constraint_report(self.block_edit_block.unwrap());
+        }
         let target_block = self.content_render_block_handle();
-        let key = (target_block, self.current_layout.clone());
+        let key = (target_block, if self.constraint_shading_active() {
+            format!("{}:constraint-status", self.current_layout)
+        } else { self.current_layout.clone() });
         {
             let reuse = {
                 let cache = self.mesh_cache.borrow();
@@ -9089,13 +9178,15 @@ impl Scene {
         } else {
             self.paper_annotation_scale_handle()
         };
-        let arc = Arc::new(self.mesh_models(
+        let mut models = self.mesh_models(
             target_block,
             None,
             scale,
             self.annotation_all_visible(),
             None,
-        ));
+        );
+        self.shade_constraint_meshes(target_block, &mut models);
+        let arc = Arc::new(models);
         self.mesh_cache
             .borrow_mut()
             .insert(key, (self.geometry_epoch, Arc::clone(&arc)));
@@ -10341,11 +10432,12 @@ impl Scene {
     /// fills are rendered separately and otherwise never reach TRIM.
     /// Unlike visible_hatches_for_click this never clones GPU hatch models.
     pub fn visible_hatch_handles_for_edit(&self) -> Vec<Handle> {
+        let interactive = self.hatch_interaction_filter();
         self.hatches
             .keys()
             .copied()
             .filter(|handle| {
-                self.hatch_visible_for_interaction(*handle)
+                interactive(*handle)
                     && matches!(self.document.get_entity(*handle), Some(EntityType::Hatch(_)))
                     && !self.is_reference_only(*handle)
             })
@@ -10361,10 +10453,8 @@ impl Scene {
         &self,
         candidate_handles: Option<&HashSet<Handle>>,
     ) -> HashMap<Handle, HatchModel> {
-        let visible = |h: Handle, m: &HatchModel| {
-            self.hatch_visible_for_interaction(h)
-                .then(|| (h, m.clone()))
-        };
+        let interactive = self.hatch_interaction_filter();
+        let visible = |h: Handle, m: &HatchModel| interactive(h).then(|| (h, m.clone()));
         if let Some(handles) = candidate_handles {
             handles
                 .iter()
@@ -10382,31 +10472,39 @@ impl Scene {
         }
     }
 
-    fn hatch_visible_for_interaction(&self, handle: Handle) -> bool {
-        let Some(entity) = self.document.get_entity(handle) else {
-            return false;
-        };
-        // Use the SOLID's WCS-aware wire fill for interaction as well as
-        // drawing. Its cached HatchModel is flattened to XY for plotting and
-        // must not leave an invisible selection target at z=0 (#617).
-        if matches!(entity, EntityType::Solid(_)) {
-            return false;
+    /// Whether a fill takes part in picking. The layout block and annotation
+    /// state each search the document's objects, so they are resolved once
+    /// per filter, not once per fill (#2023).
+    fn hatch_interaction_filter(&self) -> impl Fn(Handle) -> bool + '_ {
+        let scale = self.displayed_annotation_scale_handle();
+        let all_visible = self.annotation_all_visible();
+        let block = self.interaction_block_handle();
+        move |handle| {
+            let Some(entity) = self.document.get_entity(handle) else {
+                return false;
+            };
+            // Use the SOLID's WCS-aware wire fill for interaction as well as
+            // drawing. Its cached HatchModel is flattened to XY for plotting
+            // and must not leave an invisible selection target at z=0 (#617).
+            if matches!(entity, EntityType::Solid(_)) {
+                return false;
+            }
+            let common = entity.common();
+            if self.display_entity_invisible(common)
+                || self.entity_temporarily_hidden(handle)
+                || self.layer_hidden(&common.layer)
+                || self.interaction_layer_frozen(&common.layer)
+                || crate::scene::annotative::annotative_offscale_for(
+                    &self.document,
+                    common,
+                    scale,
+                    all_visible,
+                )
+            {
+                return false;
+            }
+            self.belongs_to_visible_block(handle, common.owner_handle, block)
         }
-        let common = entity.common();
-        if self.display_entity_invisible(common)
-            || self.entity_temporarily_hidden(handle)
-            || self.layer_hidden(&common.layer)
-            || self.interaction_layer_frozen(&common.layer)
-            || crate::scene::annotative::annotative_offscale_for(
-                &self.document,
-                common,
-                self.displayed_annotation_scale_handle(),
-                self.annotation_all_visible(),
-            )
-        {
-            return false;
-        }
-        self.belongs_to_visible_block(handle, common.owner_handle, self.interaction_block_handle())
     }
 
     /// Instanced hatch models keyed by their block-backed host handle.
@@ -10718,13 +10816,7 @@ impl Scene {
 
     const INTERACTION_OVERLAY_MAX_HANDLES: usize = 2_048;
 
-    fn interaction_overlay_base(
-        &self,
-    ) -> Option<(
-        u64,
-        Arc<crate::scene::pick::interaction_index::InteractionIndex>,
-        Vec<(Handle, ChangeKind)>,
-    )> {
+    fn interaction_overlay_base(&self) -> Option<OverlayBase> {
         let space_key = self.interaction_space_key();
         let (epoch, index) = {
             let cache = self.interaction_base_index_cache.borrow();
@@ -10734,7 +10826,21 @@ impl Scene {
             }
             (*epoch, Arc::clone(index))
         };
-        let changes = self.replay_since(epoch)?;
+        {
+            let cached = self.interaction_overlay_changes.borrow();
+            if let Some((base_epoch, geometry_epoch, cached_space, changes)) = cached.as_ref() {
+                if *base_epoch == epoch
+                    && *geometry_epoch == self.geometry_epoch
+                    && *cached_space == space_key
+                {
+                    return (changes.len() <= Self::INTERACTION_OVERLAY_MAX_HANDLES)
+                        .then_some((epoch, index, Arc::clone(changes)));
+                }
+            }
+        }
+        let changes = Arc::new(self.replay_since(epoch)?);
+        *self.interaction_overlay_changes.borrow_mut() =
+            Some((epoch, self.geometry_epoch, space_key, Arc::clone(&changes)));
         (changes.len() <= Self::INTERACTION_OVERLAY_MAX_HANDLES).then_some((epoch, index, changes))
     }
 
@@ -10818,15 +10924,11 @@ impl Scene {
         base_keys: impl IntoIterator<Item = (u64, u32)>,
         changed_keys: impl IntoIterator<Item = (u64, u32)>,
         changes: &[(Handle, ChangeKind)],
-        changed_wires: &[WireModel],
-    ) -> (
-        Arc<Vec<WireModel>>,
-        HashMap<(u64, u32), u32>,
-        HashMap<(u64, u32), u32>,
-    ) {
+        changed_wires: &Arc<Vec<WireModel>>,
+    ) -> OverlayGather {
         let changed: HashSet<Handle> = changes.iter().map(|(handle, _)| *handle).collect();
         let memo = self.resident_tess_memo.borrow();
-        let mut wires = Vec::new();
+        let mut wires = crate::scene::pick::interaction_index::SharedWireRuns::default();
         let mut base_slots = HashMap::default();
         let mut misses: HashMap<Handle, Vec<u32>> = HashMap::default();
         for (handle_value, ordinal) in base_keys {
@@ -10837,12 +10939,12 @@ impl Scene {
             let hit = memo
                 .get(&handle)
                 .and_then(|run| self.resolve_memo_run(handle, run));
-            if let Some(wire) = hit
+            if let Some((run, index)) = hit
                 .as_ref()
-                .and_then(|hit| hit.wires().get(ordinal as usize))
+                .and_then(|hit| hit.shared_at(ordinal as usize))
             {
                 base_slots.insert((handle_value, ordinal), wires.len() as u32);
-                wires.push(wire.clone());
+                wires.push(&run, index);
             } else {
                 misses.entry(handle).or_default().push(ordinal);
             }
@@ -10853,24 +10955,24 @@ impl Scene {
         // handle, then retain only the exact wire ordinals the base index
         // reported.
         for (handle, ordinals) in misses {
-            let entity_wires = self.wire_models_for(&[handle]);
+            let entity_wires = Arc::new(self.wire_models_for(&[handle]));
             for ordinal in ordinals {
-                if let Some(wire) = entity_wires.get(ordinal as usize) {
+                if entity_wires.get(ordinal as usize).is_some() {
                     base_slots.insert((handle.value(), ordinal), wires.len() as u32);
-                    wires.push(wire.clone());
+                    wires.push(&entity_wires, ordinal);
                 }
             }
         }
         let changed_keys: HashSet<(u64, u32)> = changed_keys.into_iter().collect();
         let mut changed_slots = HashMap::default();
         let mut next_ordinal: HashMap<u64, u32> = HashMap::default();
-        for wire in changed_wires {
+        for (position, wire) in changed_wires.iter().enumerate() {
             if let Some(handle) = pipeline::wire_gpu::fast_parse_u64(&wire.name) {
                 let ordinal = next_ordinal.entry(handle).or_default();
                 let key = (handle, *ordinal);
                 if changed_keys.contains(&key) {
                     changed_slots.insert(key, wires.len() as u32);
-                    wires.push(wire.clone());
+                    wires.push(changed_wires, position as u32);
                 }
                 *ordinal += 1;
             }
@@ -11284,8 +11386,9 @@ impl Scene {
             }
         }
         let mut entries: Vec<(u64, [f64; 6])> = Vec::new();
+        let interactive = self.hatch_interaction_filter();
         for (&handle, hatch) in &self.hatches {
-            if !self.hatch_visible_for_interaction(handle) {
+            if !interactive(handle) {
                 continue;
             }
             if let Some([min_x, min_y, max_x, max_y]) = hatch_interaction_aabb(hatch) {
@@ -11614,14 +11717,14 @@ impl Scene {
             .collect();
         let insert_hatches = self.insert_hatches_for_click();
         let meshes = self.interaction_meshes_arc();
+        let interactive = self.hatch_interaction_filter();
         handles.extend(
             self.interaction_handle_index()
                 .query_xy(aabb)
                 .into_iter()
                 .filter_map(|value| {
                     let handle = Handle::new(value);
-                    (self.hatch_visible_for_interaction(handle)
-                        || insert_hatches.contains_key(&handle))
+                    (interactive(handle) || insert_hatches.contains_key(&handle))
                     .then_some(handle)
                 }),
         );
@@ -12346,6 +12449,8 @@ impl Scene {
     ) -> Vec<WireModel> {
         use codec::objects::ObjectType;
 
+        // Each INSERT tessellated below resolves its block's base point.
+        let _owners = block_authoring::DictionaryOwners::publish(&self.document);
         // Skip diagnostic clock reads when PERF is disabled.
         let perf = crate::perf::enabled();
         let t_fn = perf.then(iced::time::Instant::now);
@@ -12602,7 +12707,7 @@ impl Scene {
                 all_visible,
                 bg,
                 avp,
-            );
+            ) ^ if self.constraint_shading_active() { 0xC057_A705_0000_0001 } else { 0 };
             let (memo_cell, guard_cell) = if resident {
                 (&self.resident_tess_memo, &self.resident_tess_guard)
             } else {
@@ -12758,6 +12863,7 @@ impl Scene {
         // mixed set lands in the same place either way.
         let t_colors = perf.then(iced::time::Instant::now);
         crate::scene::view::render::resolve_colors_for_bg(&mut wires, bg);
+        self.shade_constraint_wires(block_handle, &mut wires);
         let colors_ms = crate::perf::elapsed_ms(t_colors);
 
         // Apply draw order via the cached index (O(1) block lookup).
@@ -13763,6 +13869,7 @@ vis_index={:.1} visible_probe={:.1}",
         // Same solid-corner snaps as the resident paths, so one-off consumers
         // (overlay changed-wires, edit previews) agree with hit-test/snap.
         self.attach_solid_snaps(e.common().handle, &mut wires);
+        self.shade_constraint_wires(e.common().owner_handle, &mut wires);
         wires
     }
 
