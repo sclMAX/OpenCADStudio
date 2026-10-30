@@ -796,6 +796,7 @@ async fn load_web_bytes(
     }
     let mut doc = outcome.document;
     normalize_block_origins(&mut doc);
+    crate::scene::center_native::import(&mut doc);
     if name.to_ascii_lowercase().ends_with(".dxf") {
         fix_dxf_layout_plot_settings(&mut doc);
     }
@@ -837,6 +838,7 @@ async fn parse_web_document(name: &str, bytes: &[u8]) -> Result<Document, String
         .map_err(|error| error.message)?;
     let mut doc = outcome.document;
     normalize_block_origins(&mut doc);
+    crate::scene::center_native::import(&mut doc);
     if name.to_ascii_lowercase().ends_with(".dxf") {
         fix_dxf_layout_plot_settings(&mut doc);
     }
@@ -1002,6 +1004,7 @@ pub fn load_bytes_finalized(path: &Path, bytes: Vec<u8>) -> Result<Document, Str
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
     let mut doc = load_bytes(&name, bytes)?;
     normalize_block_origins(&mut doc);
+    crate::scene::center_native::import(&mut doc);
     resolve_raster_image_paths(&mut doc, path.parent());
     doc.source_path = Some(path.to_string_lossy().into_owned());
     // Opening is a field evaluation event (FIELDEVAL bit 1).
@@ -1267,6 +1270,7 @@ fn finalize_loaded_outcome(
 ) -> Result<codec::ReadOutcome, String> {
     let doc = &mut outcome.document;
     normalize_block_origins(doc);
+    crate::scene::center_native::import(doc);
     materialize_missing_block_markers(doc);
     if outcome.stats.source_format == Some(codec::SourceFormat::Dxf) {
         fix_dxf_layout_plot_settings(doc);
@@ -1754,6 +1758,48 @@ pub fn format_for_version(version: codec::DxfVersion, is_dxf: bool) -> String {
         _ => "2018",
     };
     format!("{} {}", if is_dxf { "DXF" } else { "DWG" }, year)
+}
+
+/// Drawing properties (`SummaryInfo`, the DWGPROPS dialog) that saving to
+/// `version` would silently drop. DWG R2000 and older write no SummaryInfo
+/// section at all; DXF R2000 and older write no `$TITLE`…`$CUSTOMPROPERTY`
+/// header variables. The hyperlink base (summary value, else
+/// `header_hyperlink_base`) has its own place: DXF `$HYPERLINKBASE` from R2000
+/// and the DWG R2000 header copy, so it is lost by DXF R14 and older, by DWG
+/// R14 and older, and by DWG R2000 only when the header copy is empty.
+/// Counts the filled-in fields plus every custom property; `0` means the save
+/// loses nothing. "Last saved by" is not counted: it is stamped, not authored,
+/// and would otherwise ask on every save of a drawing nobody filled in.
+pub fn drawing_properties_lost_on_save(
+    info: &codec::document::SummaryInfo,
+    header_hyperlink_base: &str,
+    version: codec::DxfVersion,
+    is_dxf: bool,
+) -> usize {
+    if version >= codec::DxfVersion::AC1018 {
+        return 0;
+    }
+    let mut lost = [
+        &info.title,
+        &info.subject,
+        &info.author,
+        &info.keywords,
+        &info.comments,
+        &info.revision_number,
+    ]
+    .iter()
+    .filter(|value| !value.is_empty())
+    .count()
+        + info.custom_properties.len();
+    let base_lost = if info.hyperlink_base.is_empty() && header_hyperlink_base.is_empty() {
+        false
+    } else if version < codec::DxfVersion::AC1015 {
+        true
+    } else {
+        !is_dxf && header_hyperlink_base.is_empty()
+    };
+    lost += usize::from(base_lost);
+    lost
 }
 
 /// Count of unsupported "raw passthrough" objects/entities — AEC / application
@@ -3326,6 +3372,41 @@ mod prepare_save_tests {
     // The whole point of the split: the inline fallback (`save_to_bytes`) and
     // the worker route (`prepare_document_for_save` → `ocs_save` on the
     // worker) must produce identical bytes for the same input.
+    /// S5: DXF R14 and older have no `$HYPERLINKBASE`; R2000 DXF keeps it.
+    #[test]
+    fn dxf_r14_loses_the_hyperlink_base_but_r2000_keeps_it() {
+        let info = codec::document::SummaryInfo {
+            hyperlink_base: "C:/docs".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            drawing_properties_lost_on_save(&info, "", codec::DxfVersion::AC1014, true),
+            1
+        );
+        assert_eq!(
+            drawing_properties_lost_on_save(&info, "", codec::DxfVersion::AC1015, true),
+            0
+        );
+    }
+
+    /// S5: DWG R2000 stores the header copy of the hyperlink base, so it is
+    /// lost only when that copy is empty; DWG R14 stores neither.
+    #[test]
+    fn dwg_r2000_keeps_the_hyperlink_base_when_the_header_holds_it() {
+        use codec::DxfVersion::{AC1014, AC1015};
+        let mut info = codec::document::SummaryInfo {
+            hyperlink_base: "C:/docs".into(),
+            ..Default::default()
+        };
+        assert_eq!(drawing_properties_lost_on_save(&info, "C:/docs", AC1015, false), 0);
+        assert_eq!(drawing_properties_lost_on_save(&info, "", AC1015, false), 1);
+        assert_eq!(drawing_properties_lost_on_save(&info, "C:/docs", AC1014, false), 1);
+        info.hyperlink_base.clear();
+        assert_eq!(drawing_properties_lost_on_save(&info, "D:/base", AC1015, false), 0);
+        assert_eq!(drawing_properties_lost_on_save(&info, "D:/base", AC1014, true), 1);
+        assert_eq!(drawing_properties_lost_on_save(&info, "", AC1014, true), 0);
+    }
+
     #[test]
     fn save_to_bytes_equals_prepare_then_shared_serialize() {
         let mut doc = Document::new();

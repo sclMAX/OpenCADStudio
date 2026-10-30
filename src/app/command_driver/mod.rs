@@ -920,6 +920,15 @@ impl OpenCADStudio {
                     return task;
                 }
             }
+            CmdResult::ReassociateCenterLine {
+                target,
+                first,
+                second,
+            } => {
+                if let Some(task) = self.handle_reassociate_center_line(target, first, second) {
+                    return task;
+                }
+            }
             CmdResult::EditDimensionBreak {
                 dimensions,
                 operation,

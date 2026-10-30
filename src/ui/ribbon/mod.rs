@@ -292,6 +292,8 @@ pub struct Ribbon {
     pub dim_layer: String,
     /// Annotate > Leaders: MLEADERLAYER (empty: the current layer).
     pub mleader_layer: String,
+    /// Annotate > Centerlines: CENTERLAYER (empty: the current layer).
+    pub center_layer: String,
     /// Open key tips (Alt).
     keytips: Option<keytips::State>,
 }
@@ -427,6 +429,7 @@ impl Ribbon {
             text_height_editing: false,
             text_layer: String::new(),
             dim_layer: String::new(),
+            center_layer: String::new(),
             mleader_layer: String::new(),
             keytips: None,
         }
@@ -1189,6 +1192,14 @@ impl Ribbon {
                 win,
             ));
         }
+        if open_id == widgets::CENTER_LAYER_COMBO {
+            return Some(self.annotation_layer_overlay(
+                widgets::CENTER_LAYER_COMBO,
+                &self.center_layer,
+                Message::RibbonCenterLayer,
+                win,
+            ));
+        }
         if open_id == widgets::MLEADER_LAYER_COMBO {
             return Some(self.annotation_layer_overlay(
                 widgets::MLEADER_LAYER_COMBO,
@@ -1321,6 +1332,11 @@ impl Ribbon {
     /// The colour of the DIMLAYER layer, `None` for Use Current.
     fn dim_layer_color(&self) -> Option<iced::Color> {
         self.layer_color(&self.dim_layer)
+    }
+
+    /// The colour of the CENTERLAYER layer, `None` for Use Current.
+    pub(super) fn center_layer_color(&self) -> Option<iced::Color> {
+        self.layer_color(&self.center_layer)
     }
 
     /// The colour of layer `name`, `None` for Use Current (empty).

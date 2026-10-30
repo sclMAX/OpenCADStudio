@@ -2308,6 +2308,13 @@ pub enum CmdResult {
         source: Handle,
         point: DVec3,
     },
+    /// Attach one smart centre line to two newly selected lines, each given
+    /// with the point it was picked at.
+    ReassociateCenterLine {
+        target: Handle,
+        first: (Handle, DVec3),
+        second: (Handle, DVec3),
+    },
     EditDimensionBreak {
         dimensions: Vec<Handle>,
         operation: DimensionBreakOperation,

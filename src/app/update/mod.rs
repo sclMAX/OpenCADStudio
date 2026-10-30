@@ -267,6 +267,7 @@ impl OpenCADStudio {
             Some(BlockEditPicker) => self.block_edit_picker = None,
             Some(Rename) => self.rename_dialog = None,
             Some(Purge) => self.purge_dialog = None,
+            Some(DrawingProperties) => self.drawing_properties = None,
             Some(SelectSimilarSettings) => self.select_similar_settings = None,
             Some(BlockSaveAs) => self.block_save_as = None,
             Some(BlockVisibility) => self.block_visibility = None,
@@ -477,6 +478,12 @@ impl OpenCADStudio {
         }
         let from_options = self.active_modal == Some(super::ModalKind::Options);
         let mut task = self.update_message(msg);
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            let notices = std::mem::take(&mut tab.scene.center_notices);
+            for notice in notices {
+                self.command_line.push_output(&notice);
+            }
+        }
         // A window opened from Options (shortcuts, aliases, a colour, units,
         // plot, plugins) is its child: closing it comes back to Options.
         if from_options
@@ -591,6 +598,10 @@ impl OpenCADStudio {
             crate::io::drawing_variable(&tab.scene.document, "MLEADERLAYER")
                 .filter(|layer| layer.trim() != ".")
                 .unwrap_or_default();
+        self.ribbon.center_layer = tab.scene.centerline_settings().layer;
+        if self.ribbon.center_layer.trim() == "." {
+            self.ribbon.center_layer.clear();
+        }
     }
 
     fn update_message(&mut self, msg: Message) -> Task<Message> {
@@ -4028,16 +4039,10 @@ impl OpenCADStudio {
                     &source,
                     None,
                 );
-                match self.tabs[i]
+                self.tabs[i]
                     .scene
-                    .set_centerline_setting("CENTERLTYPEFILE", &name)
-                {
-                    Ok(message) => {
-                        self.tabs[i].dirty = true;
-                        self.command_line.push_output(&message);
-                    }
-                    Err(error) => self.command_line.push_error(&error),
-                }
+                    .set_centerline_setting("CENTERLTYPEFILE", &name);
+                self.tabs[i].dirty = true;
                 Task::none()
             }
             #[cfg(target_arch = "wasm32")]
@@ -7627,6 +7632,11 @@ impl OpenCADStudio {
                 let value = if layer.is_empty() { ".".to_string() } else { layer };
                 self.dispatch_command(&format!("MLEADERLAYER {value}"))
             }
+            Message::RibbonCenterLayer(layer) => {
+                self.ribbon.close_dropdown();
+                let value = if layer.is_empty() { ".".to_string() } else { layer };
+                self.dispatch_command(&format!("CENTERLAYER {value}"))
+            }
             Message::RibbonTextLayer(layer) => {
                 self.ribbon.close_dropdown();
                 let value = if layer.is_empty() { ".".to_string() } else { layer };
@@ -8931,6 +8941,16 @@ impl OpenCADStudio {
             }
 
             Message::PropAttrCommit(tag) => self.on_prop_attr_commit(tag),
+
+            Message::PropPluginParamInput { name, value } => {
+                self.tabs[self.active_tab]
+                    .properties
+                    .edit_buf
+                    .insert(crate::ui::properties::plugin_param_edit_key(&name), value);
+                Task::none()
+            }
+
+            Message::PropPluginParamCommit(name) => self.on_prop_plugin_param_commit(name),
 
             Message::PropPointerPressed => {
                 // A press anywhere ends typing in QuickCalc; its own
@@ -11932,6 +11952,7 @@ impl OpenCADStudio {
             Message::BlockEditPickerApply => self.apply_bedit_dialog(),
             Message::Rename(msg) => self.on_rename_dialog(msg),
             Message::Purge(msg) => self.on_purge_dialog(msg),
+            Message::DwgProps(msg) => self.on_drawing_properties(msg),
             Message::SelectSimilarSettingsToggle(bit) => {
                 if let Some(mode) = self.select_similar_settings.as_mut() {
                     *mode ^= bit;

@@ -414,6 +414,9 @@ pub enum FieldKey {
     BlockParameter(crate::scene::model::object::BlockParameterKey),
     /// A block attribute value field, keyed by its tag.
     Attr(String),
+    /// A plugin class parameter value field (API v14), keyed by the
+    /// declared parameter name.
+    PluginParam(String),
     /// One column of one named-parameter row, keyed by its stable
     /// `ParameterTable::iter()` position (see `PropValue::ParamRow`'s doc
     /// comment for why index rather than name).
@@ -429,6 +432,7 @@ impl FieldKey {
             FieldKey::Geom(field) => prop_geom_field_id(field),
             FieldKey::BlockParameter(key) => iced::widget::Id::from(format!("props-block-{}-{}-{}-{}-{:?}", key.document, key.definition, key.insert, key.parameter, key.component)),
             FieldKey::Attr(tag) => prop_attr_field_id(tag),
+            FieldKey::PluginParam(name) => prop_plugin_param_field_id(name),
             FieldKey::Param(index, field) => prop_param_field_id(*index, *field),
         }
     }
@@ -451,6 +455,18 @@ pub fn prop_param_field_id(
 /// tag. Kept in one place so the live-input handler and the row renderer agree.
 pub fn attr_edit_key(tag: &str) -> FieldKey {
     FieldKey::Attr(tag.to_string())
+}
+
+/// Edit-buffer / active-field key for a plugin class parameter value field,
+/// keyed by the declared parameter name (the AttrText precedent).
+pub fn plugin_param_edit_key(name: &str) -> FieldKey {
+    FieldKey::PluginParam(name.to_string())
+}
+
+/// Text-input widget id for a plugin class parameter value field, keyed by
+/// the declared parameter name.
+pub fn prop_plugin_param_field_id(name: &str) -> iced::widget::Id {
+    iced::widget::Id::from(format!("props-plugin-param-field-{name}"))
 }
 
 /// Text-input widget id for a geometry/common editable value field. The same
@@ -495,6 +511,11 @@ pub fn build_field_key_map(sections: &[PropSection]) -> HashMap<iced::widget::Id
                     Some(FieldKey::Geom(prop.field))
                 }
                 PropValue::AttrText { tag, .. } => Some(FieldKey::Attr(tag.clone())),
+                PropValue::PluginParam {
+                    name,
+                    editable: true,
+                    ..
+                } => Some(FieldKey::PluginParam(name.clone())),
                 PropValue::BlockNumber { key, .. } => Some(FieldKey::BlockParameter(*key)),
                 _ => None,
             };
@@ -1054,6 +1075,17 @@ impl PropertiesPanel {
             }
             PropValue::HatchPatternChoice(current) => self.render_hatch_pattern_row(label, current),
             PropValue::AttrText { tag, value } => self.render_attr_row(tag, value),
+            PropValue::PluginParam {
+                name,
+                value,
+                editable,
+            } => {
+                if *editable {
+                    self.render_plugin_param_row(name, value)
+                } else {
+                    render_ro_row(label, value)
+                }
+            }
             PropValue::EntityLink {
                 id,
                 handles,
@@ -1563,6 +1595,37 @@ impl PropertiesPanel {
     /// text box edits the value. Routing rides the tag (a runtime string), so
     /// this uses the dedicated `PropAttr*` messages instead of the geometry
     /// path whose field key is `&'static str`. The row label is the tag itself.
+    fn render_plugin_param_row<'a>(
+        &'a self,
+        name: &'a str,
+        value: &'a str,
+    ) -> Element<'a, Message> {
+        let key = plugin_param_edit_key(name);
+        let display = self
+            .edit_buf
+            .get(&key)
+            .map(|s| s.as_str())
+            .unwrap_or(value);
+
+        let active = self.active_field.as_ref() == Some(&key);
+        let name_for_input = name.to_string();
+        let ti = text_input("", display)
+            .id(prop_plugin_param_field_id(name))
+            .on_input(move |v| {
+                Message::PropPluginParamInput {
+                    name: name_for_input.clone(),
+                    value: v,
+                }
+            })
+            .on_submit(Message::PropPluginParamCommit(name.to_string()))
+            .size(FONT_SZ)
+            .style(text_input_style)
+            .padding([3, 6])
+            .width(Length::Fill);
+
+        prop_row_with_active(name, ti.into(), active)
+    }
+
     fn render_attr_row<'a>(&'a self, tag: &'a str, entity_val: &'a str) -> Element<'a, Message> {
         let key = attr_edit_key(tag);
         let display = self

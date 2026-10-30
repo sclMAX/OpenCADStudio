@@ -3,6 +3,16 @@
 
 pub(super) fn message_attribute(source: &str) -> Option<(&'static str, &'static str)> {
     match source {
+        "Cross size" => Some(("center-props", "cross-size")),
+        "Cross gap" => Some(("center-props", "cross-gap")),
+        "Left extension" => Some(("center-props", "left-extension")),
+        "Right extension" => Some(("center-props", "right-extension")),
+        "Top extension" => Some(("center-props", "top-extension")),
+        "Bottom extension" => Some(("center-props", "bottom-extension")),
+        "Show extension" => Some(("center-props", "show-extension")),
+        "Start extension" => Some(("center-props", "start-extension")),
+        "End extension" => Some(("center-props", "end-extension")),
+        "Centerline" => Some(("center-props", "centerline")),
         "Import Styles" => Some(("style-manager", "import-styles")),
         "Select Drawing to Import Styles From" => Some(("style-manager", "select-drawing-to-import-styles-from")),
         "Select the styles to import" => Some(("style-manager", "select-the-styles-to-import")),

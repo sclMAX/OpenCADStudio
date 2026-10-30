@@ -2488,6 +2488,8 @@ pub fn tessellate(
                 station_pieces,
                 source_length,
                 plinegen,
+                separate_runs,
+                solid,
             } => {
                 let (local_pts, local_pts_low) = points_to_ds(points);
                 let key_vertices = te
@@ -2501,7 +2503,7 @@ pub fn tessellate(
                     &point_segments,
                     &station_pieces,
                 );
-                return vec![WireModel {
+                let base = WireModel {
                     bg_adapt: None,
                     point_marker: None,
                     taper_widths: Vec::new(),
@@ -2537,7 +2539,57 @@ pub fn tessellate(
                     fill_tris_low: Vec::new(),
 
                     ..Default::default()
-                }];
+                };
+                let mut wires = Vec::new();
+                if separate_runs {
+                    let mut start = 0;
+                    while start < base.points.len() {
+                        let end = base.points[start..]
+                            .iter()
+                            .position(|point| point[0].is_nan())
+                            .map_or(base.points.len(), |offset| start + offset);
+                        if end > start + 1 {
+                            // Snap and pick data ride on one wire only.
+                            wires.push(WireModel {
+                                points: base.points[start..end].to_vec(),
+                                points_low: base.points_low[start..end].to_vec(),
+                                pattern_stations: Vec::new(),
+                                plinegen: true,
+                                snap_pts: Vec::new(),
+                                tangent_geoms: Vec::new(),
+                                key_vertices: Vec::new(),
+                                ..base.clone()
+                            });
+                        }
+                        start = end + 1;
+                    }
+                } else if !base.points.is_empty() {
+                    wires.push(base.clone());
+                }
+                if !solid.is_empty() || (separate_runs && wires.is_empty()) {
+                    let (solid_pts, solid_pts_low) = points_to_ds(solid);
+                    let mut solid_wire = WireModel {
+                        points: solid_pts,
+                        points_low: solid_pts_low,
+                        pattern_stations: Vec::new(),
+                        pattern_length: 0.0,
+                        pattern: [0.0; 8],
+                        ..base
+                    };
+                    if !separate_runs {
+                        solid_wire.snap_pts = Vec::new();
+                        solid_wire.tangent_geoms = Vec::new();
+                        solid_wire.key_vertices = Vec::new();
+                    }
+                    wires.push(solid_wire);
+                } else if separate_runs {
+                    if let Some(first) = wires.first_mut() {
+                        first.snap_pts = base.snap_pts;
+                        first.tangent_geoms = base.tangent_geoms;
+                        first.key_vertices = base.key_vertices;
+                    }
+                }
+                return wires;
             }
 
             RenderObject::SegmentedLines(points) => {

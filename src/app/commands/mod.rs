@@ -8,6 +8,7 @@ mod attman;
 mod block_cmdline;
 mod blocks;
 mod blockvars;
+mod center_vars;
 mod purge;
 pub(crate) use purge::purge_pass;
 mod block_editor_vars;

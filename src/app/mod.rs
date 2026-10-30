@@ -64,6 +64,7 @@ mod options_session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod plugin_host;
 mod presspull_ops;
+mod drawing_properties;
 mod purge_dialog;
 mod rename_dialog;
 mod properties;
@@ -706,6 +707,7 @@ pub(super) struct OpenCADStudio {
     block_definition_open_editor: Option<String>,
     block_edit_picker: Option<crate::ui::window::block_edit_picker::State>,
     rename_dialog: Option<crate::ui::window::rename::State>,
+    drawing_properties: Option<crate::ui::window::drawing_properties::State>,
     purge_dialog: Option<crate::ui::window::purge::State>,
     /// The Purge dialog's choice, for the PURGE it runs.
     purge_only: Option<purge_dialog::PurgeOnly>,
@@ -1071,6 +1073,14 @@ pub(super) struct OpenCADStudio {
     /// (and on cancel), never a history step of their own.
     #[cfg(not(target_arch = "wasm32"))]
     plugin_grip_live_originals: Vec<(codec::Handle, codec::EntityType)>,
+    /// The descriptor-backed grip drag's host state (API v14, additive):
+    /// Some while a drag re-derives its Begin answer's live design per
+    /// coalesced cursor move. Data-only; the machinery lives in the
+    /// native-only drag lifecycle (`update/plugin_grips.rs`). Configured
+    /// out on wasm together with the machinery: the type names the host
+    /// module's wire types, which the wasm build does not compile.
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_grip_descriptor_drag: Option<crate::plugin::grip_points::DescriptorGripDrag>,
     /// The grip-settle watchdog floor: [`SETTLE_WATCHDOG`] in production;
     /// tests lower it to exercise the strike ledger with millisecond
     /// budgets instead of real seconds.
@@ -2848,6 +2858,7 @@ pub enum ModalKind {
     BlockEditPicker,
     Rename,
     Purge,
+    DrawingProperties,
     SelectSimilarSettings,
     BlockSaveAs,
     BlockVisibility,
@@ -3580,6 +3591,7 @@ pub enum Message {
     BlockEditPickerApply,
     Rename(crate::ui::window::rename::RenameMsg),
     Purge(crate::ui::window::purge::PurgeMsg),
+    DwgProps(crate::ui::window::drawing_properties::DwgPropsMsg),
     /// Select Similar settings: flip one SELECTSIMILARMODE bit.
     SelectSimilarSettingsToggle(u16),
     SelectSimilarSettingsOk,
@@ -4410,6 +4422,14 @@ pub enum Message {
     },
     /// User committed a block-attribute value edit (Enter pressed).
     PropAttrCommit(String),
+    /// User is typing in a plugin class parameter value field (API v14,
+    /// live buffer update), keyed by the declared parameter name.
+    PropPluginParamInput {
+        name: String,
+        value: String,
+    },
+    /// User committed a plugin class parameter value edit (Enter pressed).
+    PropPluginParamCommit(String),
     /// Reports the currently keyboard-focused widget (if any) after a
     /// [`sync_active_field_task`](crate::ui::properties::sync_active_field_task)
     /// sweep, so the update handler can keep the active-row marker reconciled
@@ -5264,6 +5284,8 @@ pub enum Message {
     RibbonDimLayer(String),
     /// Annotate > Leaders: MLEADERLAYER picked (empty: Use Current).
     RibbonMLeaderLayer(String),
+    /// Annotate > Centerlines: CENTERLAYER picked (empty: Use Current).
+    RibbonCenterLayer(String),
     /// Result of the ATTACH file picker.
     AttachPickResult(Result<std::path::PathBuf, String>),
     /// An edit in the Attach External Reference dialog.
@@ -5457,6 +5479,7 @@ impl OpenCADStudio {
             block_definition_open_editor: None,
             block_edit_picker: None,
             rename_dialog: None,
+            drawing_properties: None,
             purge_dialog: None,
             purge_only: None,
             select_similar_settings: None,
@@ -5630,6 +5653,8 @@ impl OpenCADStudio {
             plugin_grip_deliveries: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             plugin_grip_live_originals: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_grip_descriptor_drag: None,
             #[cfg(not(target_arch = "wasm32"))]
             plugin_grip_settle_watchdog: crate::app::update::SETTLE_WATCHDOG,
             #[cfg(not(target_arch = "wasm32"))]

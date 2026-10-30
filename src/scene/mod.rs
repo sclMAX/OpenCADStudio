@@ -54,6 +54,7 @@ mod camera_ops;
 #[cfg(test)]
 mod reference_only_tests;
 pub use camera_ops::{add_background, copy_background, erase_background};
+pub(crate) mod center_native;
 pub(crate) mod centerline;
 pub(crate) mod centermark;
 pub(crate) mod dimension_assoc;
@@ -2887,6 +2888,9 @@ pub struct Scene {
     /// Centre-mark source → carrier lines. See
     /// [`Self::associative_centerline_source_cache`].
     associative_centermark_source_cache: RefCell<Option<HashMap<Handle, Vec<Handle>>>>,
+    /// Messages for the command line about centre objects an edit just
+    /// detached from their sources; the app prints and clears them.
+    pub(crate) center_notices: Vec<String>,
     /// Conservative association hint: unknown until scanned, then updated from
     /// changed entities. Retaining `true` after deletion only costs an extra scan.
     has_associative_centers: std::cell::Cell<Option<bool>>,
@@ -3324,6 +3328,7 @@ impl Scene {
             associative_hatch_source_cache: RefCell::new(None),
             associative_centerline_source_cache: RefCell::new(None),
             associative_centermark_source_cache: RefCell::new(None),
+            center_notices: Vec::new(),
             parametric_constraints: Vec::new(),
             constraint_name_format: 2,
             dynamic_constraint_display: true,
@@ -4387,6 +4392,7 @@ impl Scene {
             // same order and see the same accumulated list.
             let mut refreshed_handles: Option<HashSet<Handle>> = None;
             if self.associative_centers_possible(&changes) {
+                self.note_center_disassociations(&changes);
                 let refreshed = self.refresh_associative_centerlines(&changes);
                 Self::absorb_refreshed(&mut changes, &mut refreshed_handles, refreshed);
                 let refreshed = self.refresh_associative_center_marks(&changes);

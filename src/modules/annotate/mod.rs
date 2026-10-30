@@ -217,41 +217,13 @@ impl CadModule for AnnotateModule {
                     ],
                 },
                 // ── Centerlines ───────────────────────────────────────────────
+                // Center Mark and Centerline; the slide-out holds the layer
+                // new centre objects go on (CENTERLAYER).
                 RibbonGroup {
                     title: "Centerlines",
                     tools: vec![
                         RibbonItem::LargeTool(dimcenter::tool()),
                         RibbonItem::LargeTool(centerline::tool()),
-                        RibbonItem::Dropdown {
-                            id: "ANNOTATE_CENTER_ASSOCIATIVITY",
-                            icon: crate::modules::IconKind::Svg(include_bytes!(
-                                "../../../assets/icons/line.svg"
-                            )),
-                            items: vec![
-                                (
-                                    "CENTERREASSOCIATE",
-                                    "Reassociate Center Object",
-                                    crate::modules::IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/line.svg"
-                                    )),
-                                ),
-                                (
-                                    "CENTERDISASSOCIATE",
-                                    "Disassociate Center Object",
-                                    crate::modules::IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/line.svg"
-                                    )),
-                                ),
-                                (
-                                    "CENTERRESET",
-                                    "Reset Center Object",
-                                    crate::modules::IconKind::Svg(include_bytes!(
-                                        "../../../assets/icons/line.svg"
-                                    )),
-                                ),
-                            ],
-                            default: "CENTERREASSOCIATE",
-                        },
                     ],
                 },
                 // ── Leaders ──────────────────────────────────────────────────

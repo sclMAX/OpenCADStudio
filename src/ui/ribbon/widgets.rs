@@ -1439,11 +1439,13 @@ pub(super) fn render_large_with<'a>(
 pub(crate) const DIM_LAYER_COMBO: &str = "DIM_LAYER_COMBO";
 /// Annotate > Leaders: the multileader layer list's id.
 pub(crate) const MLEADER_LAYER_COMBO: &str = "MLEADER_LAYER_COMBO";
+/// Annotate > Centerlines slide-out: the center layer list's id.
+pub(crate) const CENTER_LAYER_COMBO: &str = "CENTER_LAYER_COMBO";
 
 /// A layer list of the Annotate panels (`id`): the layer new annotations of
 /// its kind go on (DIMLAYER, MLEADERLAYER), with its colour; "Use Current"
 /// when it is the current layer.
-fn layer_combo<'a>(
+pub(super) fn layer_combo<'a>(
     id: &'static str,
     layer: &str,
     color: Option<iced::Color>,

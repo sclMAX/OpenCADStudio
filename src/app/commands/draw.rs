@@ -473,63 +473,85 @@ impl OpenCADStudio {
             "CENTERLINE" => {
                 use crate::modules::draw::draw::centerline::CenterLineCommand;
                 let settings = self.tabs[i].scene.centerline_settings();
-                let new_cmd = CenterLineCommand::new(settings);
+                let names = self.tabs[i].scene.layer_names_for_center();
+                let new_cmd = CenterLineCommand::new(settings, names);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "CENTERRESET" => {
-                let handles = self.tabs[i].scene.selected_handles_in_order();
+            // CENTERRESET / CENTERDISASSOCIATE work on the preselected centre
+            // objects, or ask for them.
+            "CENTERRESET" | "CENTERDISASSOCIATE"
+                if !self.tabs[i]
+                    .scene
+                    .selected_handles_in_order()
+                    .iter()
+                    .any(|handle| self.tabs[i].scene.is_center_object(*handle)) =>
+            {
+                use crate::modules::draw::select::SelectObjectsCommand;
+                let (prompt, apply) = if cmd == "CENTERRESET" {
+                    (crate::tr!("center-cmd", "reset-select"), "_CENTERRESET_APPLY")
+                } else {
+                    (
+                        crate::tr!("center-cmd", "disassociate-select"),
+                        "_CENTERDISASSOCIATE_APPLY",
+                    )
+                };
+                let prompt: &'static str = Box::leak(prompt.into_boxed_str());
+                let select = SelectObjectsCommand::filtered(
+                    cmd,
+                    apply,
+                    prompt,
+                    crate::scene::centerline::is_center_carrier,
+                );
+                self.command_line.push_info(&select.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(select));
+            }
+
+            "CENTERRESET" | "_CENTERRESET_APPLY" => {
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_handles_in_order()
+                    .into_iter()
+                    .filter(|handle| self.tabs[i].scene.is_center_object(*handle))
+                    .collect();
+                self.tabs[i].scene.deselect_all();
+                // An empty selection ends the command without a report.
+                if handles.is_empty() {
+                    return Some(self.finish_dispatch(cmd));
+                }
                 self.push_undo_snapshot(i, "CENTERRESET");
                 let count = self.tabs[i].scene.reset_centerlines(&handles)
                     + self.tabs[i].scene.reset_center_marks(&handles);
                 if count > 0 {
                     self.tabs[i].dirty = true;
                 }
-                self.command_line.push_output(&crate::tf!(
-                    "CENTERRESET: {count} center object(s) updated."
-                ));
+                self.command_line
+                    .push_output(&crate::tr!("center-cmd", "reset-done", count = count));
             }
 
             "CENTERREASSOCIATE" => {
-                let handles = self.tabs[i].scene.selected_handles_in_order();
-                let mark_targets: Vec<_> = handles
-                    .iter()
-                    .copied()
-                    .filter(|handle| {
-                        let Some(codec::EntityType::Line(line)) =
-                            self.tabs[i].scene.document.get_entity(*handle)
-                        else {
-                            return false;
-                        };
-                        codec::entities::CenterMarkAssociation::read(&line.common.extended_data)
-                            .is_some()
-                    })
-                    .collect();
-                if mark_targets.len() == 1 && handles.len() == 1 {
-                    use crate::modules::draw::draw::dimcenter::CenterMarkReassociateCommand;
-                    let new_cmd = CenterMarkReassociateCommand::new(mark_targets[0]);
-                    self.command_line.push_info(&new_cmd.prompt());
-                    self.tabs[i].active_cmd = Some(Box::new(new_cmd));
-                    return Some(self.finish_dispatch(cmd));
-                }
-                self.push_undo_snapshot(i, "CENTERREASSOCIATE");
-                let count = self.tabs[i]
-                    .scene
-                    .set_centerline_association(&handles, true)
-                    + self.tabs[i]
-                        .scene
-                        .set_center_mark_association(&handles, true);
-                if count > 0 {
-                    self.tabs[i].dirty = true;
-                }
-                self.command_line.push_output(&crate::tf!(
-                    "CENTERREASSOCIATE: {count} center object(s) associated."
-                ));
+                use crate::modules::draw::draw::dimcenter::CenterReassociateCommand;
+                let new_cmd = CenterReassociateCommand::new();
+                self.command_line.push_info(&new_cmd.prompt());
+                self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }
 
-            "CENTERDISASSOCIATE" => {
-                let handles = self.tabs[i].scene.selected_handles_in_order();
+            "CENTERDISASSOCIATE" | "_CENTERDISASSOCIATE_APPLY" => {
+                let handles: Vec<_> = self.tabs[i]
+                    .scene
+                    .selected_handles_in_order()
+                    .into_iter()
+                    .filter(|handle| self.tabs[i].scene.is_center_object(*handle))
+                    .collect();
+                self.tabs[i].scene.deselect_all();
+                if handles.is_empty() {
+                    return Some(self.finish_dispatch(cmd));
+                }
+                let was_associated: Vec<(bool, bool)> = handles
+                    .iter()
+                    .filter_map(|handle| self.tabs[i].scene.center_object_state(*handle))
+                    .collect();
                 self.push_undo_snapshot(i, "CENTERDISASSOCIATE");
                 let count = self.tabs[i]
                     .scene
@@ -540,9 +562,17 @@ impl OpenCADStudio {
                 if count > 0 {
                     self.tabs[i].dirty = true;
                 }
-                self.command_line.push_output(&crate::tf!(
-                    "CENTERDISASSOCIATE: {count} center object(s) detached."
-                ));
+                self.command_line
+                    .push_output(&crate::tr!("center-cmd", "disassociate-done", count = count));
+                for (mark, associated) in was_associated {
+                    if associated {
+                        self.command_line.push_output(&if mark {
+                            crate::tr!("center-cmd", "mark-disassociated")
+                        } else {
+                            crate::tr!("center-cmd", "line-disassociated")
+                        });
+                    }
+                }
             }
 
             "DIMCENTER" => {
@@ -555,7 +585,8 @@ impl OpenCADStudio {
             "CENTERMARK" => {
                 use crate::modules::draw::draw::dimcenter::CenterMarkCommand;
                 let settings = self.tabs[i].scene.centerline_settings();
-                let new_cmd = CenterMarkCommand::new(settings);
+                let names = self.tabs[i].scene.layer_names_for_center();
+                let new_cmd = CenterMarkCommand::new(settings, names);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }

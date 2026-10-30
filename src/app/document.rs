@@ -218,6 +218,12 @@ pub(super) struct DocumentTab {
     /// display state only — never persisted, never host-interpreted.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) plugin_grips: crate::plugin::grip_points::PluginGripStore,
+    /// Plugin-declared entity class registry (API v14): tab-scoped
+    /// display-session state — entries die with their plugin (re-declared
+    /// per load) and are never persisted; the staged instances stamp XDATA
+    /// identity keys + record linkages instead.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) plugin_classes: crate::plugin::plugin_classes::PluginClassStore,
     /// DIRTY REGION accumulation (API v13): the identity set of what plugin
     /// and built-in paths changed since the previous boundary notification —
     /// `DocumentChangedRegions` carries it so boundary work is O(changed),
@@ -792,6 +798,8 @@ impl DocumentTab {
             selected_grip_handles: vec![],
             #[cfg(not(target_arch = "wasm32"))]
             plugin_grips: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_classes: Default::default(),
             plugin_dirty_entities: Default::default(),
             plugin_dirty_records: Default::default(),
             plugin_dirty_overflow: false,

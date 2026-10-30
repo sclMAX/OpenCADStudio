@@ -230,6 +230,10 @@ const DIMENSION_TOOLS: &[Tool] = &[
 ];
 pub(super) const DIMENSIONS_PANEL_ID: &str = "dimensions_extension";
 
+/// Annotate > Centerlines slide-out: the center layer list (drawn by
+/// `centerlines_overlay`).
+pub(super) const CENTERLINES_PANEL_ID: &str = "centerlines_extension";
+
 const PANELS: &[Panel] = &[
     Panel {
         id: PANEL_ID,
@@ -287,6 +291,13 @@ const PANELS: &[Panel] = &[
         title: "Dimensions",
         tools: DIMENSION_TOOLS,
     },
+    Panel {
+        id: CENTERLINES_PANEL_ID,
+        anchor: Some("CENTERMARK"),
+        title_id: "centerlines_extension_title",
+        title: "Centerlines",
+        tools: &[],
+    },
 ];
 
 /// Command, label and icon of every tool in the expanded Draw and Modify
@@ -321,7 +332,7 @@ pub(super) fn parent_panel(id: &str) -> Option<&'static str> {
 fn panel_for_group(title: &str, group_ids: &[&'static str]) -> Option<Panel> {
     PANELS.iter().copied().find(|panel| {
         panel.title == title
-            && !panel.tools.is_empty()
+            && (!panel.tools.is_empty() || panel.id == CENTERLINES_PANEL_ID)
             && panel
                 .anchor
                 .is_none_or(|anchor| group_ids.contains(&anchor))
@@ -689,6 +700,30 @@ fn text_overlay<'a>(ribbon: &Ribbon, panel: Panel, win: (f32, f32)) -> Element<'
     dropdown_backdrop(position_ribbon_dropdown(body.into(), false, left, top))
 }
 
+/// The Centerlines slide-out: the center layer list (CENTERLAYER: Use
+/// Current, or a layer of the drawing).
+fn centerlines_overlay<'a>(ribbon: &Ribbon, panel: Panel, win: (f32, f32)) -> Element<'a, Message> {
+    let width: f32 = 220.0_f32.min((win.0 - 8.0).max(120.0));
+    let (_, x, anchor_top) = ribbon.dd_anchor(panel.id, width, win.0);
+    let left = x.clamp(0.0, (win.0 - width).max(0.0));
+    let top = anchor_top.min((win.1 - 80.0).max(0.0));
+    let combo = super::widgets::layer_combo(
+        super::widgets::CENTER_LAYER_COMBO,
+        &ribbon.center_layer,
+        ribbon.center_layer_color(),
+        false,
+        format!("{}\n{} CENTERLAYER", t!("Center Layer"), t!("Command:")),
+    );
+    let body = container(column![combo].spacing(4).padding(6))
+        .width(width)
+        .style(|theme: &Theme| {
+            let mut style = popup_panel_style(theme);
+            style.border.color = theme.palette().primary.base.color;
+            style
+        });
+    dropdown_backdrop(position_ribbon_dropdown(body.into(), false, left, top))
+}
+
 /// A slide-out listing each tool as icon and label, one per row.
 fn labeled_overlay<'a>(ribbon: &Ribbon, panel: Panel, win: (f32, f32)) -> Element<'a, Message> {
     let width: f32 = 200.0_f32.min((win.0 - 8.0).max(120.0));
@@ -746,6 +781,9 @@ pub(super) fn overlay<'a>(ribbon: &Ribbon, id: &str, win: (f32, f32)) -> Element
     }
     if panel.id == TEXT_PANEL_ID {
         return text_overlay(ribbon, panel, win);
+    }
+    if panel.id == CENTERLINES_PANEL_ID {
+        return centerlines_overlay(ribbon, panel, win);
     }
     let tools = panel.tools;
     let width = (7.0 * (CELL + GAP) - GAP + 12.0).min((win.0 - 8.0).max(CELL + 12.0));

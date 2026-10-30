@@ -1387,6 +1387,15 @@ impl OpenCADStudio {
                     Task::none()
                 } else {
                     self.prepare_native_save(i);
+                    // allow_lossy already acknowledged the drawing properties a
+                    // DWG/DXF version drops; a script must not be stopped by that
+                    // warning. Converter losses keep their own confirmation.
+                    let converter = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| ocs_save::external_format(e).is_some());
+                    self.conversion_loss_allowed =
+                        !converter && req["allow_lossy"].as_bool() == Some(true);
                     self.queue_native_save(
                         i,
                         path,
@@ -2179,6 +2188,69 @@ mod tests {
             "{qsave}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windowed_save_with_allow_lossy_does_not_wait_for_the_loss_dialog() {
+        // DWG R2000 cannot store drawing properties; a script that acknowledged
+        // losses with allow_lossy must not be parked behind the confirmation.
+        for allow_lossy in [false, true] {
+            let mut app = OpenCADStudio::new_for_test();
+            app.main_window = Some(iced::window::Id::unique());
+            assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+            let i = app.active_tab;
+            app.tabs[i].scene.document.summary_info.custom_properties =
+                vec![("Client".into(), "ACME".into())];
+            let path = std::env::temp_dir().join(format!(
+                "ocs_allow_lossy_{}_{allow_lossy}.dwg",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let _ = request(
+                &mut app,
+                json!({"op":"save","path":path,"overwrite":true,
+                       "target_version":"2000","allow_lossy":allow_lossy}),
+            );
+            assert_eq!(
+                app.active_modal == Some(crate::app::ModalKind::ConversionLoss),
+                !allow_lossy,
+                "allow_lossy={allow_lossy}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn windowed_save_with_allow_lossy_still_asks_before_a_converter_loses_content() {
+        // allow_lossy only waives the drawing-properties warning; a converter
+        // target keeps its parked loss prompt.
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let i = app.active_tab;
+        app.tabs[i].scene.document.summary_info.custom_properties =
+            vec![("Client".into(), "ACME".into())];
+        // IFCX has no ray: a real converter loss.
+        app.tabs[i]
+            .scene
+            .document
+            .add_entity(codec::entities::EntityType::Ray(codec::entities::Ray::new(
+                codec::types::Vector3::ZERO,
+                codec::types::Vector3::UNIT_X,
+            )))
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ocs_allow_lossy_converter_{}.ifcx",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = request(
+            &mut app,
+            json!({"op":"save","path":path,"overwrite":true,"allow_lossy":true}),
+        );
+        let asked = app.active_modal == Some(crate::app::ModalKind::ConversionLoss);
+        let _ = std::fs::remove_file(&path);
+        assert!(asked, "converter target must still ask");
     }
 
     #[test]

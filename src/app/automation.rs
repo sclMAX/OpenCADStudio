@@ -728,6 +728,9 @@ impl OpenCADStudio {
     /// Handle one JSON request line and return the JSON response.
     #[cfg(any(test, not(target_arch = "wasm32")))]
     pub(crate) fn automation_op(&mut self, line: &str) -> Value {
+        // The plugin pump exists only on native targets (the plugins are
+        // native processes); on wasm this is a no-op.
+        #[cfg(not(target_arch = "wasm32"))]
         self.pump_plugin_requests();
         if let Ok(req) = serde_json::from_str::<Value>(line) {
             if req["protocol"].is_number() {

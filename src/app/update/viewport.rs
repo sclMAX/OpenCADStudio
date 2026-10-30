@@ -8986,6 +8986,28 @@ properties={:.1}ms picked={}",
                 .take_undo_recording()
                 .map(|recording| recording.into_recorded_images())
                 .unwrap_or_default();
+            // A grip that detaches a centre object says so, as moving it does.
+            for (handle, original) in &originals {
+                let codec::EntityType::Line(line) = original else {
+                    continue;
+                };
+                let data = &line.common.extended_data;
+                let was_associated = codec::entities::CenterMarkAssociation::read(data)
+                    .map(|association| association.associated)
+                    .or_else(|| {
+                        codec::entities::CenterLineAssociation::read(data)
+                            .map(|association| association.associated)
+                    });
+                if was_associated == Some(true) {
+                    if let Some((mark, false)) = self.tabs[i].scene.center_object_state(*handle) {
+                        self.command_line.push_output(&if mark {
+                            crate::tr!("center-cmd", "mark-disassociated")
+                        } else {
+                            crate::tr!("center-cmd", "line-disassociated")
+                        });
+                    }
+                }
+            }
             if !originals.is_empty() {
                 let mut before: Vec<_> = originals
                     .into_iter()

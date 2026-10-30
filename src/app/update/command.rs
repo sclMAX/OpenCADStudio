@@ -4679,6 +4679,42 @@ impl OpenCADStudio {
         Task::none()
     }
 
+    /// Commit one plugin class parameter's edit (API v14): the stamped
+    /// selection writes through the session's class-parameter path — one
+    /// undo step inside the record update, the declaring plugin re-stages
+    /// from the record's dirty notification; a refusal (unknown or
+    /// non-editable parameter, unparseable value, unresolved record)
+    /// reports and changes nothing. The section binds to one entity and
+    /// exists only on the native build (the wasm build has no plugin
+    /// registry the section could bind to), so the wasm route stays inert.
+    pub(super) fn on_prop_plugin_param_commit(&mut self, name: String) -> Task<Message> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let i = self.active_tab;
+            self.tabs[i].properties.active_field = None;
+            let key = crate::ui::properties::plugin_param_edit_key(&name);
+            let handles = self.property_target_handles(i);
+            if handles.len() != 1 {
+                return Task::none();
+            }
+            let Some(value) = self.tabs[i].properties.edit_buf.remove(&key) else {
+                return Task::none();
+            };
+            let result;
+            {
+                let mut host = crate::app::plugin_host::HostSession::new(self, i);
+                result = host.update_plugin_class_instance_parameter(handles[0], &name, &value);
+            }
+            if let Err(err) = result {
+                self.command_line.push_error(&err);
+            }
+            self.refresh_properties();
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = name;
+        Task::none()
+    }
+
     /// Open the attribute editor dialog for the given INSERT, loading a working
     /// copy of its attribute values. No-op (with a hint) when the block has no
     /// attributes. Entry points: double-clicking such a block, or ATTEDIT.

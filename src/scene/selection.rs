@@ -837,6 +837,12 @@ impl Scene {
                                     QSelectValueEditor::Choice(vec!["false".into(), "true".into()])
                                 }
                                 PropValue::AttrText { .. } => QSelectValueEditor::Text,
+                                PropValue::PluginParam { .. } => {
+                                    // A class parameter's record value is text to the
+                                    // quick-select reader; the committed edit stays on
+                                    // the class's own record path (API v14).
+                                    QSelectValueEditor::Text
+                                }
                                 PropValue::BlockNumber { .. }
                                 | PropValue::BlockChoice { .. }
                                 | PropValue::Stepper { .. }
@@ -1030,6 +1036,7 @@ impl Scene {
                     PropValue::HatchPatternChoice(s) => s,
                     PropValue::BoolToggle { value, .. } => value.to_string(),
                     PropValue::AttrText { value, .. } => value,
+                    PropValue::PluginParam { value, .. } => value,
                     PropValue::Stepper { display, .. } => display,
                     PropValue::BlockNumber { .. }
                     | PropValue::BlockChoice { .. }

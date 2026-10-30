@@ -517,6 +517,7 @@ const CODES: &[(&str, &str, &str)] = &[
     ("annotate", "Centerlines", "CE"),
     ("annotate", "CENTERMARK", "CM"),
     ("annotate", "CENTERLINE", "CL"),
+    ("centerlines_extension", super::widgets::CENTER_LAYER_COMBO, "CA"),
     ("annotate", "MLEADER", "ML"),
     ("annotate", "MLEADER_STYLE_COMBO", "MY"),
     ("annotate", super::widgets::MLEADER_LAYER_COMBO, "MU"),
@@ -957,6 +958,9 @@ impl Ribbon {
                 },
             })
             .collect();
+        if open == draw_panel::CENTERLINES_PANEL_ID {
+            tips.push(dropdown_tip(open, super::widgets::CENTER_LAYER_COMBO));
+        }
         if open == draw_panel::REFERENCE_PANEL_ID {
             tips.push(Tip {
                 anchor: item_anchor(open, XREF_FADE),

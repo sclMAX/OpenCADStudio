@@ -825,7 +825,7 @@ fn register_array_classes(document: &mut Document) {
     }
 }
 
-fn next_anonymous_name(document: &Document) -> String {
+pub(crate) fn next_anonymous_name(document: &Document) -> String {
     let next = document
         .block_records
         .iter()
@@ -835,7 +835,7 @@ fn next_anonymous_name(document: &Document) -> String {
     format!("*U{next}")
 }
 
-fn associative(
+pub(crate) fn associative(
     handle: Handle,
     owner: Handle,
     dxf_name: &str,
@@ -883,9 +883,15 @@ fn child_dictionary(document: &mut Document, parent: Handle, key: &str) -> Handl
 /// The network holding the actions of model space, created with the root
 /// network above it when the drawing has none.
 fn model_space_network(document: &mut Document) -> Handle {
-    const KEY: &str = "ACAD_ASSOCNETWORK";
     let model = document.header.model_space_block_handle;
-    let scope = document.ensure_extension_dictionary(model);
+    block_network(document, model)
+}
+
+/// The network holding the actions of the space (block record) `owner`,
+/// created with the root network above it when the drawing has none.
+pub(crate) fn block_network(document: &mut Document, owner: Handle) -> Handle {
+    const KEY: &str = "ACAD_ASSOCNETWORK";
+    let scope = document.ensure_extension_dictionary(owner);
     let holder = child_dictionary(document, scope, KEY);
     if let Some(network) = dictionary_entry(document, holder, KEY).filter(|handle| {
         matches!(
