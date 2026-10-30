@@ -2,7 +2,7 @@ use super::*;
 
 // Sort tables belong to the block's extension dictionary. Reserve real handles
 // and reconnect older unattached tables without losing their existing entries.
-fn ensure_draw_order_table(doc: &mut codec::CadDocument, block: codec::Handle) -> codec::Handle {
+fn ensure_draw_order_table(doc: &mut codec::Document, block: codec::Handle) -> codec::Handle {
     use codec::objects::{Dictionary, ObjectType, SortEntitiesTable};
 
     // Older commands inserted objects using the unreserved next-handle value.
@@ -717,6 +717,21 @@ impl OpenCADStudio {
                     self.tabs[i].active_cmd = Some(Box::new(cmd));
                     return Some(Task::none());
                 }
+                // From the sheet with several viewports, ask which one the
+                // objects go into; Ctrl+R or a double-click makes it current.
+                if self.tabs[i].scene.active_viewport.is_none()
+                    && self.tabs[i].scene.viewport_list().len() > 1
+                {
+                    use crate::command::ValuePromptCommand;
+                    self.chspace_pending = Some(handles);
+                    let c = ValuePromptCommand::new(
+                        "CHSPACE_TARGET",
+                        "CHSPACE  Set the TARGET viewport active and press ENTER to continue:",
+                    );
+                    self.command_line.push_info(&c.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(c));
+                    return Some(Task::none());
+                }
                 let scene = &self.tabs[i].scene;
                 let to_paper = scene.active_viewport.is_some();
                 let frame = match scene.active_viewport {
@@ -744,67 +759,23 @@ impl OpenCADStudio {
                     );
                     return Some(Task::none());
                 };
-                use crate::command::EntityTransform as T;
-                let z = glam::DVec3::Z;
-                let steps = if to_paper {
-                    [
-                        T::Translate((-frame.model_target).extend(0.0)),
-                        T::Rotate {
-                            center: glam::DVec3::ZERO,
-                            axis: z,
-                            angle_rad: frame.twist,
-                        },
-                        T::Scale {
-                            center: glam::DVec3::ZERO,
-                            factor: frame.scale,
-                        },
-                        T::Translate(frame.paper_center.extend(0.0)),
-                    ]
-                } else {
-                    [
-                        T::Translate((-frame.paper_center).extend(0.0)),
-                        T::Scale {
-                            center: glam::DVec3::ZERO,
-                            factor: 1.0 / frame.scale,
-                        },
-                        T::Rotate {
-                            center: glam::DVec3::ZERO,
-                            axis: z,
-                            angle_rad: -frame.twist,
-                        },
-                        T::Translate(frame.model_target.extend(0.0)),
-                    ]
+                self.chspace_through(i, handles, to_paper, frame);
+            }
+
+            cmd if cmd == "CHSPACE_TARGET" || cmd.starts_with("CHSPACE_TARGET ") => {
+                let Some(handles) = self.chspace_pending.take() else {
+                    return Some(Task::none());
                 };
-                self.push_undo_snapshot(i, "CHSPACE");
-                let scene = &mut self.tabs[i].scene;
-                let entities: Vec<codec::EntityType> = handles
-                    .iter()
-                    .filter_map(|h| scene.document.get_entity(*h).cloned())
-                    .collect();
-                scene.deselect_all();
-                scene.erase_entities(&handles);
-                // The clones land in the other space: the sheet with no active
-                // viewport, the model with one.
-                let active = scene.active_viewport;
-                scene.active_viewport = if to_paper { None } else { Some(frame.viewport) };
-                let moved: Vec<codec::Handle> = entities
-                    .into_iter()
-                    .map(|e| scene.add_entity_clone(e))
-                    .collect();
-                scene.active_viewport = active;
-                for step in &steps {
-                    scene.transform_entities(&moved, step);
-                }
-                self.tabs[i].dirty = true;
-                let count = moved.len();
-                self.command_line.push_output(
-                    if to_paper {
-                        crate::tf!("CHSPACE: {count} object(s) changed to paper space.")
-                    } else {
-                        crate::tf!("CHSPACE: {count} object(s) changed to model space.")
-                    }
-                    .as_ref(),
-                );
+                let scene = &self.tabs[i].scene;
+                let Some(frame) = scene.active_viewport.and_then(|vp| scene.viewport_frame(vp))
+                else {
+                    self.command_line.push_error(
+                        crate::t!("CHSPACE: No plan-view viewport to change space through.")
+                            .as_ref(),
+                    );
+                    return Some(Task::none());
+                };
+                self.chspace_through(i, handles, false, frame);
             }
 
             // ── Viewport arrangement shortcuts ────────────────────────────
@@ -1773,7 +1744,7 @@ impl CadCommand for DrawOrderCommand {
 /// Insert the selected block next to the extremal reference in effective draw
 /// order. Renumber the ordered siblings to avoid ties or saturated sort keys.
 fn assign_relative_group_keys(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     block: codec::Handle,
     selected: &[codec::Handle],
     references: &[codec::Handle],
@@ -1854,7 +1825,7 @@ fn assign_relative_group_keys(
 /// shifted by `n` so lifted siblings keep their relative order. Locked-layer
 /// entities are never moved or lifted.
 fn assign_back_group_keys(
-    doc: &codec::CadDocument,
+    doc: &codec::Document,
     block_handle: codec::Handle,
     group: &[codec::Handle],
     floor: u64,
@@ -3226,5 +3197,79 @@ mod tests {
             .is_some_and(
                 |command| command.name() == "DRAWORDER" && command.is_selection_gathering()
             ));
+    }
+}
+
+impl OpenCADStudio {
+    /// CHSPACE's move: `handles` to the other space through `frame`, keeping
+    /// their apparent size and place.
+    fn chspace_through(
+        &mut self,
+        i: usize,
+        handles: Vec<codec::Handle>,
+        to_paper: bool,
+        frame: crate::scene::viewport_ref::ViewportFrame,
+    ) {
+        use crate::command::EntityTransform as T;
+        let z = glam::DVec3::Z;
+        let steps = if to_paper {
+            [
+                T::Translate((-frame.model_target).extend(0.0)),
+                T::Rotate {
+                    center: glam::DVec3::ZERO,
+                    axis: z,
+                    angle_rad: frame.twist,
+                },
+                T::Scale {
+                    center: glam::DVec3::ZERO,
+                    factor: frame.scale,
+                },
+                T::Translate(frame.paper_center.extend(0.0)),
+            ]
+        } else {
+            [
+                T::Translate((-frame.paper_center).extend(0.0)),
+                T::Scale {
+                    center: glam::DVec3::ZERO,
+                    factor: 1.0 / frame.scale,
+                },
+                T::Rotate {
+                    center: glam::DVec3::ZERO,
+                    axis: z,
+                    angle_rad: -frame.twist,
+                },
+                T::Translate(frame.model_target.extend(0.0)),
+            ]
+        };
+        self.push_undo_snapshot(i, "CHSPACE");
+        let scene = &mut self.tabs[i].scene;
+        let entities: Vec<codec::EntityType> = handles
+            .iter()
+            .filter_map(|h| scene.document.get_entity(*h).cloned())
+            .collect();
+        scene.deselect_all();
+        scene.erase_entities(&handles);
+        // The clones land in the other space: the sheet with no active
+        // viewport, the model with one.
+        let active = scene.active_viewport;
+        scene.active_viewport = if to_paper { None } else { Some(frame.viewport) };
+        let moved: Vec<codec::Handle> = entities
+            .into_iter()
+            .map(|e| scene.add_entity_clone(e))
+            .collect();
+        scene.active_viewport = active;
+        for step in &steps {
+            scene.transform_entities(&moved, step);
+        }
+        self.tabs[i].dirty = true;
+        let count = moved.len();
+        self.command_line.push_output(
+            if to_paper {
+                crate::tf!("CHSPACE: {count} object(s) changed to paper space.")
+            } else {
+                crate::tf!("CHSPACE: {count} object(s) changed to model space.")
+            }
+            .as_ref(),
+        );
     }
 }

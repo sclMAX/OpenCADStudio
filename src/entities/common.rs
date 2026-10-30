@@ -75,7 +75,7 @@ thread_local! {
 }
 
 /// Record which text styles fix their height, from the drawing's style table.
-pub fn set_fixed_text_heights(document: &codec::CadDocument) {
+pub fn set_fixed_text_heights(document: &codec::Document) {
     FIXED_TEXT_HEIGHTS.with(|cell| {
         let mut map = cell.borrow_mut();
         map.clear();

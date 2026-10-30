@@ -545,7 +545,7 @@ fn apply_transform(line: &mut Line, t: &EntityTransform) {
 }
 
 impl RenderConvertible for Line {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
         Some(to_render(self))
     }
 }

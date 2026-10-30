@@ -446,8 +446,9 @@ impl OpenCADStudio {
                     self.merge_clipboard_deps(i);
                     // Recreate any block definition the clipboard's INSERTs
                     // reference, so nested blocks inside the new wrapper block
-                    // don't render empty. (#135 / #158)
-                    self.merge_clipboard_blocks(i);
+                    // don't render empty (#135 / #158), and the multileader
+                    // styles the wrapped multileaders point at.
+                    let mleaders = self.merge_clipboard_blocks(i);
                     // Recreate each entity's xdictionary graph (XCLIP filters)
                     // and stamp the new root onto the wrapped entity, so the
                     // block's nested insert keeps its clip. (#xclip-paste)
@@ -455,6 +456,9 @@ impl OpenCADStudio {
                     let name = self.unique_block_name("Block");
                     let base = self.clipboard_base;
                     let mut entities = self.clipboard.clone();
+                    for entity in &mut entities {
+                        super::super::command_driver::clipboard::remap_mleader(entity, &mleaders);
+                    }
                     for (&idx, &root) in &ext_roots {
                         if let Some(e) = entities.get_mut(idx) {
                             e.common_mut().xdictionary_handle = Some(root);
@@ -2341,7 +2345,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut host_doc = codec::CadDocument::new();
+        let mut host_doc = codec::Document::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -2371,7 +2375,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = codec::CadDocument::new();
+        let mut xref_doc = codec::Document::new();
         xref_doc
             .layers
             .add(codec::tables::Layer::new("WALLS"))
@@ -2407,7 +2411,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = codec::CadDocument::new();
+        let mut xref_doc = codec::Document::new();
         let mut line = codec::entities::Line::new();
         line.common.plotstyle_flags = 0b11;
         line.common.plotstyle_handle = Some(xref_doc.allocate_handle());
@@ -2461,7 +2465,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut host_doc = codec::CadDocument::new();
+        let mut host_doc = codec::Document::new();
         let mut inner = BlockRecord::new("INNER");
         inner.flags.is_xref = true;
         inner.xref_path = "inner.dwg".to_string();
@@ -2645,7 +2649,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut xref_doc = codec::CadDocument::new();
+        let mut xref_doc = codec::Document::new();
         xref_doc
             .layers
             .add(codec::tables::Layer::new("WALLS"))

@@ -67,8 +67,8 @@ use codec::entities::EntityType;
 // The path-based readers are native-only; web parsing runs through the
 // parse worker / the xref bytes registry instead.
 #[cfg(not(target_arch = "wasm32"))]
-use codec::io::dwg::DwgReader;
-use codec::{CadDocument, DwgWriter, DxfWriter};
+use codec::DwgReader;
+use codec::{Document, DwgWriter, DxfWriter};
 #[cfg(not(target_arch = "wasm32"))]
 use codec::{DwgReadOptions, DxfReader, DxfReaderConfiguration};
 use std::path::{Path, PathBuf};
@@ -196,7 +196,7 @@ impl From<&str> for OpenLoadError {
 /// the parser thread starts.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn pick_open_path() -> Option<(PathBuf, u64)> {
-    let handle = crate::sys::file_dialog()
+    let mut dialog = crate::sys::file_dialog()
         .set_title(crate::t!("Open CAD file").as_ref())
         .add_filter(
             crate::t!("CAD Files").as_ref(),
@@ -213,7 +213,11 @@ pub async fn pick_open_path() -> Option<(PathBuf, u64)> {
         .add_filter(
             crate::t!("Backup / Autosave").as_ref(),
             &["bak", "sv$", "BAK"],
-        )
+        );
+    for format in ocs_save::external_formats() {
+        dialog = dialog.add_filter(format.name(), format.extensions());
+    }
+    let handle = dialog
         .add_filter(crate::t!("All Files").as_ref(), &["*"])
         .pick_file()
         .await?;
@@ -329,7 +333,7 @@ pub async fn open_path_with_phase(
     path: PathBuf,
     progress: Arc<OpenProgressState>,
     model_bg: [f32; 4],
-) -> Result<(String, PathBuf, CadDocument, DerivedCaches), OpenLoadError> {
+) -> Result<(String, PathBuf, Document, DerivedCaches), OpenLoadError> {
     open_path_with_phase_attempt(path, progress, model_bg, OpenAttempt::Strict).await
 }
 
@@ -338,7 +342,7 @@ pub async fn open_path_with_phase(
     _path: PathBuf,
     _progress: Arc<OpenProgressState>,
     _model_bg: [f32; 4],
-) -> Result<(String, PathBuf, CadDocument, DerivedCaches), OpenLoadError> {
+) -> Result<(String, PathBuf, Document, DerivedCaches), OpenLoadError> {
     Err(OpenLoadError::from(
         "filesystem path opening is unavailable on this target",
     ))
@@ -351,7 +355,7 @@ pub async fn recover_path_with_phase(
     model_bg: [f32; 4],
     initial_error: String,
     initial_stats: Option<codec::ReadStats>,
-) -> Result<(String, PathBuf, CadDocument, DerivedCaches), OpenLoadError> {
+) -> Result<(String, PathBuf, Document, DerivedCaches), OpenLoadError> {
     open_path_with_phase_attempt(
         path,
         progress,
@@ -392,7 +396,7 @@ async fn open_path_with_phase_attempt(
     progress: Arc<OpenProgressState>,
     model_bg: [f32; 4],
     attempt: OpenAttempt,
-) -> Result<(String, PathBuf, CadDocument, DerivedCaches), OpenLoadError> {
+) -> Result<(String, PathBuf, Document, DerivedCaches), OpenLoadError> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -605,7 +609,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 pub struct WebOpenOutcome {
     pub name: String,
     pub size_bytes: u64,
-    pub result: Result<(String, PathBuf, CadDocument, DerivedCaches), OpenLoadError>,
+    pub result: Result<(String, PathBuf, Document, DerivedCaches), OpenLoadError>,
     pub recovery_bytes: Option<Arc<[u8]>>,
     pub cache_bytes: Option<Arc<[u8]>>,
     pub record_recent: bool,
@@ -758,7 +762,7 @@ async fn load_web_bytes(
     recovery_mode: bool,
     initial_error: &str,
     mut initial_stats: Option<codec::ReadStats>,
-) -> Result<(String, PathBuf, CadDocument, DerivedCaches), OpenLoadError> {
+) -> Result<(String, PathBuf, Document, DerivedCaches), OpenLoadError> {
     progress.set(crate::app::OPEN_PHASE_PARSING, 1000, 0, 1);
     let (outcome, mut source_sha256) =
         match web_worker::parse_document(name, bytes, recovery_mode, initial_error).await {
@@ -793,7 +797,6 @@ async fn load_web_bytes(
     let mut doc = outcome.document;
     normalize_block_origins(&mut doc);
     if name.to_ascii_lowercase().ends_with(".dxf") {
-        fix_dxf_dimension_rotations(&mut doc);
         fix_dxf_layout_plot_settings(&mut doc);
     }
     fix_viewport_status_flags(&mut doc);
@@ -828,14 +831,13 @@ async fn load_web_bytes(
 /// file) from bytes on the parse worker, with the same post-parse fixups
 /// `load_web_bytes` applies — the byte-level counterpart of `load_file`.
 #[cfg(target_arch = "wasm32")]
-async fn parse_web_document(name: &str, bytes: &[u8]) -> Result<CadDocument, String> {
+async fn parse_web_document(name: &str, bytes: &[u8]) -> Result<Document, String> {
     let (outcome, _) = web_worker::parse_document(name, bytes, false, "")
         .await
         .map_err(|error| error.message)?;
     let mut doc = outcome.document;
     normalize_block_origins(&mut doc);
     if name.to_ascii_lowercase().ends_with(".dxf") {
-        fix_dxf_dimension_rotations(&mut doc);
         fix_dxf_layout_plot_settings(&mut doc);
     }
     fix_viewport_status_flags(&mut doc);
@@ -853,7 +855,7 @@ pub async fn pick_and_parse_web(
     title: &str,
     filter_label: &str,
     extensions: &[&str],
-) -> Result<Option<(String, CadDocument)>, String> {
+) -> Result<Option<(String, Document)>, String> {
     let Some(handle) = crate::sys::file_dialog()
         .set_title(title)
         .add_filter(filter_label, extensions)
@@ -874,7 +876,7 @@ pub async fn pick_and_parse_web(
 /// picker (Data Extraction's multi-file source list). Same normalization as
 /// every other web-opened drawing.
 #[cfg(target_arch = "wasm32")]
-pub async fn parse_drawing_bytes_web(name: &str, bytes: &[u8]) -> Result<CadDocument, String> {
+pub async fn parse_drawing_bytes_web(name: &str, bytes: &[u8]) -> Result<Document, String> {
     parse_web_document(name, bytes).await
 }
 
@@ -886,7 +888,7 @@ pub async fn parse_drawing_bytes_web(name: &str, bytes: &[u8]) -> Result<CadDocu
 /// back as `NotFound` for the open handler to warn about.
 #[cfg(target_arch = "wasm32")]
 async fn resolve_web_xrefs(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     progress: Arc<OpenProgressState>,
 ) -> Vec<crate::io::xref::XrefInfo> {
     let pending: Vec<String> = doc
@@ -956,7 +958,7 @@ pub async fn pick_and_register_xref_web() -> Result<PathBuf, String> {
 
 /// Parse a drawing from bytes using its name or recovery-file signature.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
+pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<Document, String> {
     use std::io::Cursor;
     let ext = name.rsplit('.').next().unwrap_or_default().to_lowercase();
     let format = if matches!(ext.as_str(), "bak" | "sv$") {
@@ -981,7 +983,6 @@ pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
                 .map_err(|e| e.to_string())?
                 .read()
                 .map_err(|e| e.to_string())?;
-            fix_dxf_dimension_rotations(&mut doc);
             fix_dxf_layout_plot_settings(&mut doc);
             fix_viewport_status_flags(&mut doc);
             fix_double_placed_dimension_pictures(&mut doc);
@@ -994,7 +995,7 @@ pub fn load_bytes(name: &str, bytes: Vec<u8>) -> Result<CadDocument, String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_bytes_finalized(path: &Path, bytes: Vec<u8>) -> Result<CadDocument, String> {
+pub fn load_bytes_finalized(path: &Path, bytes: Vec<u8>) -> Result<Document, String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1031,7 +1032,7 @@ fn sniff_dwg_or_dxf_bytes(bytes: &[u8]) -> &'static str {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_file(path: &Path) -> Result<CadDocument, String> {
+pub fn load_file(path: &Path) -> Result<Document, String> {
     load_file_with_progress(path, None).map(|outcome| outcome.document)
 }
 
@@ -1044,7 +1045,7 @@ pub fn load_file(path: &Path) -> Result<CadDocument, String> {
 /// compiling and say why they cannot run, instead of each having to know that
 /// the web has no files.
 #[cfg(target_arch = "wasm32")]
-pub fn load_file(_path: &Path) -> Result<CadDocument, String> {
+pub fn load_file(_path: &Path) -> Result<Document, String> {
     Err(crate::t!("Opening a drawing by path is not available in the browser.").into_owned())
 }
 
@@ -1246,9 +1247,16 @@ fn read_file_attempt(
     match effective.as_str() {
         "dwg" | "dwt" | "dws" => read_dwg_path(path, progress, failsafe),
         "dxf" => read_dxf_path(path, failsafe),
-        _ => Err(ReaderFailure::terminal(format!(
-            "Unsupported file format: .{ext}"
-        ))),
+        other => match ocs_save::external_format(other) {
+            Some(format) => std::fs::read(path)
+                .map_err(|e| ReaderFailure::terminal(e.to_string()))
+                .and_then(|bytes| {
+                    ocs_save::read_external(format, &bytes).map_err(ReaderFailure::terminal)
+                }),
+            None => Err(ReaderFailure::terminal(format!(
+                "Unsupported file format: .{ext}"
+            ))),
+        },
     }
 }
 
@@ -1261,7 +1269,6 @@ fn finalize_loaded_outcome(
     normalize_block_origins(doc);
     materialize_missing_block_markers(doc);
     if outcome.stats.source_format == Some(codec::SourceFormat::Dxf) {
-        fix_dxf_dimension_rotations(doc);
         fix_dxf_layout_plot_settings(doc);
     }
     fix_viewport_status_flags(doc);
@@ -1296,7 +1303,7 @@ fn read_dwg_path(
         // fault — or refuses to open under a third-party lock — falls back
         // to one in-memory snapshot read below.
         if !cloud_placeholder(path) {
-            match DwgReader::from_mmap(path) {
+            match codec::acadrust::DwgReader::from_mmap(path).map(DwgReader::from) {
                 Ok(mut reader) => {
                     reader.options = options.clone();
                     if let Some(progress) = &progress {
@@ -1415,7 +1422,7 @@ fn read_dxf_path(path: &Path, failsafe: bool) -> Result<codec::ReadOutcome, Read
 /// on the structural BLOCK entity. Rendering, picking, exploding and nested
 /// insertion can then share the ordinary zero-origin transform without each
 /// path having to reinterpret this compatibility field.
-fn normalize_block_origins(doc: &mut CadDocument) {
+fn normalize_block_origins(doc: &mut Document) {
     use codec::types::Vector3;
     use codec::EntityType;
 
@@ -1474,7 +1481,7 @@ fn normalize_block_origins(doc: &mut CadDocument) {
 /// resave stays handle-stable; otherwise a fresh handle is minted and the
 /// record is pointed at it.
 #[cfg(not(target_arch = "wasm32"))]
-fn materialize_missing_block_markers(doc: &mut CadDocument) {
+fn materialize_missing_block_markers(doc: &mut Document) {
     use codec::entities::{Block, BlockEnd};
     use codec::{EntityType, Handle};
 
@@ -1551,7 +1558,7 @@ fn materialize_missing_block_markers(doc: &mut CadDocument) {
 /// Native-only: its callers resolve against a real folder; web images bind
 /// through the name-keyed byte registry instead.
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_raster_image_paths(doc: &mut CadDocument, base_dir: Option<&Path>) {
+fn resolve_raster_image_paths(doc: &mut Document, base_dir: Option<&Path>) {
     use codec::objects::ObjectType;
     use codec::EntityType;
     use std::collections::HashMap;
@@ -1637,6 +1644,17 @@ pub const SAVE_FORMAT_OPTIONS: &[&str] = &[
     "DXF 2013", "DXF 2010", "DXF 2007", "DXF 2004", "DXF 2000", "DXF R14", "DWT 2018",
 ];
 
+/// The Save As format list: the DWG/DXF targets, then each listed converter.
+pub fn save_format_options() -> Vec<String> {
+    let converters = ocs_save::external_formats().iter().map(|format| format.name());
+    SAVE_FORMAT_OPTIONS
+        .iter()
+        .copied()
+        .chain(converters)
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn canonical_save_format(format: &str) -> &'static str {
     SAVE_FORMAT_OPTIONS
         .iter()
@@ -1645,7 +1663,7 @@ pub fn canonical_save_format(format: &str) -> &'static str {
         .unwrap_or(DEFAULT_SAVE_FORMAT)
 }
 
-pub fn source_is_dxf(path: Option<&Path>, document: &CadDocument) -> bool {
+pub fn source_is_dxf(path: Option<&Path>, document: &Document) -> bool {
     match path
         .and_then(Path::extension)
         .and_then(|extension| extension.to_str())
@@ -1654,6 +1672,8 @@ pub fn source_is_dxf(path: Option<&Path>, document: &CadDocument) -> bool {
     {
         Some("dxf") => true,
         Some("dwg") => false,
+        // A converter's own file is neither; it is not read as DXF.
+        Some(extension) if ocs_save::external_format(extension).is_some() => false,
         _ => document.dwg_source_version.is_none(),
     }
 }
@@ -1661,6 +1681,14 @@ pub fn source_is_dxf(path: Option<&Path>, document: &CadDocument) -> bool {
 /// Parse a format string like "DWG 2013" or "DXF 2007" into
 /// `(extension, DxfVersion)`.  Falls back to ("dwg", AC1032) for unknown strings.
 pub fn parse_save_format(format: &str) -> (&'static str, codec::DxfVersion) {
+    // A converter writes its own format; the DXF version does not apply.
+    if let Some(converter) = ocs_save::external_formats()
+        .iter()
+        .find(|converter| converter.name().eq_ignore_ascii_case(format))
+    {
+        let ext = converter.extensions().first().copied().unwrap_or("dwg");
+        return (ext, codec::DxfVersion::AC1032);
+    }
     use codec::DxfVersion;
     let f = format.to_ascii_uppercase();
     let is_dxf = f.starts_with("DXF");
@@ -1734,7 +1762,7 @@ pub fn format_for_version(version: codec::DxfVersion, is_dxf: bool) -> String {
 /// DXF). Returns 0 for a same-version DWG save, where they round-trip verbatim.
 /// Used to warn the user before a lossy Save-As.
 pub fn dropped_on_save_count(
-    doc: &codec::CadDocument,
+    doc: &codec::Document,
     target_version: codec::DxfVersion,
     is_dxf: bool,
 ) -> usize {
@@ -1854,7 +1882,9 @@ fn validate_save_extension(path: &Path) -> Result<(), SaveFailure> {
         .extension()
         .map(|value| value.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if matches!(extension.as_str(), "dwg" | "dxf" | "dwt" | "sv$") {
+    if matches!(extension.as_str(), "dwg" | "dxf" | "dwt" | "sv$")
+        || ocs_save::external_format(&extension).is_some()
+    {
         return Ok(());
     }
 
@@ -1911,7 +1941,7 @@ mod save_failure_tests {
                 .as_nanos()
         ));
 
-        let error = save_as_version(&codec::CadDocument::new(), &path, codec::DxfVersion::AC1032)
+        let error = save_as_version(&codec::Document::new(), &path, codec::DxfVersion::AC1032)
             .unwrap_err();
 
         assert_eq!(
@@ -1937,12 +1967,13 @@ mod save_failure_tests {
         std::fs::write(&path, b"new").unwrap();
 
         let error = super::save_owned_as_version_atomic(
-            codec::CadDocument::new(),
+            codec::Document::new(),
             &path,
             codec::DxfVersion::AC1032,
             false,
             Some(expected),
             None,
+            false,
         )
         .unwrap_err();
 
@@ -1971,12 +2002,13 @@ mod save_failure_tests {
         std::fs::rename(&replacement, &path).unwrap();
 
         let error = super::save_owned_as_version_atomic(
-            codec::CadDocument::new(),
+            codec::Document::new(),
             &path,
             codec::DxfVersion::AC1032,
             false,
             Some(expected),
             Some(reader),
+            false,
         )
         .unwrap_err();
 
@@ -2051,7 +2083,8 @@ pub async fn pick_plot_style() -> Result<Option<plot_style::PlotStyleTable>, Str
     {
         let name = handle.file_name();
         let bytes: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(handle.read().await);
-        let table = plot_style::PlotStyleTable::from_bytes(&name, &bytes)?;
+        let table = plot_style::PlotStyleTable::from_bytes(&name, &bytes)
+            .map_err(|e| e.to_string())?;
         plot_style::register_session_table(&name, bytes);
         Ok(Some(table))
     }
@@ -2164,14 +2197,14 @@ pub async fn pick_embedded_image_file() -> Result<ole_embed::EmbeddedImage, Stri
 /// Save `doc` to `path` with the given DXF version, overriding `doc.version`.
 /// Format is auto-detected from the extension (dwg / dxf).
 pub fn save_as_version(
-    doc: &CadDocument,
+    doc: &Document,
     path: &Path,
     version: codec::DxfVersion,
 ) -> Result<(), String> {
     let clone_started = iced::time::Instant::now();
     let snapshot = doc.clone();
     let clone_ms = clone_started.elapsed().as_secs_f64() * 1000.0;
-    save_owned_as_version_inner(snapshot, path, version, false, clone_ms, |_| Ok(()))
+    save_owned_as_version_inner(snapshot, path, version, false, false, clone_ms, |_| Ok(()))
         .map_err(|error| error.to_string())
 }
 
@@ -2181,14 +2214,15 @@ pub fn save_as_version(
 /// complete file exists, so a failed save cannot truncate the previous drawing.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_owned_as_version_atomic(
-    doc: CadDocument,
+    doc: Document,
     path: &Path,
     version: codec::DxfVersion,
     backup: bool,
     expected_fingerprint: Option<edit_lock::FileFingerprint>,
     verify_reader: Option<std::fs::File>,
+    allow_loss: bool,
 ) -> Result<(), SaveFailure> {
-    save_owned_as_version_inner(doc, path, version, backup, 0.0, move |path| {
+    save_owned_as_version_inner(doc, path, version, backup, allow_loss, 0.0, move |path| {
         let Some(expected) = expected_fingerprint else {
             return Ok(());
         };
@@ -2207,10 +2241,11 @@ pub fn save_owned_as_version_atomic(
 }
 
 fn save_owned_as_version_inner<F>(
-    mut doc: CadDocument,
+    mut doc: Document,
     path: &Path,
     version: codec::DxfVersion,
     backup: bool,
+    allow_loss: bool,
     clone_ms: f64,
     before_replace: F,
 ) -> Result<(), SaveFailure>
@@ -2233,12 +2268,20 @@ where
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let write_started = iced::time::Instant::now();
+    if ext == "dxf" {
+        crate::entities::spline::complete_nurbs_for_dxf(&mut doc);
+    }
     let result = match ext.as_str() {
         "dxf" => DxfWriter::new(&doc)
             .write_to_file(&temp_path)
             .map_err(|e| SaveFailure::other(e.to_string())),
-        _ => DwgWriter::write_to_file(&temp_path, &doc)
-            .map_err(|e| SaveFailure::other(e.to_string())),
+        other => match ocs_save::external_format(other) {
+            Some(format) => ocs_save::write_external(&doc, format, allow_loss)
+                .and_then(|bytes| std::fs::write(&temp_path, bytes).map_err(|e| e.to_string()))
+                .map_err(SaveFailure::other),
+            None => DwgWriter::write_to_file(&temp_path, &doc)
+                .map_err(|e| SaveFailure::other(e.to_string())),
+        },
     };
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temp_path);
@@ -2358,7 +2401,7 @@ fn replace_save_file_inner(temp_path: &Path, path: &Path) -> std::io::Result<()>
 }
 
 /// Save using the document's existing version.
-pub fn save(doc: &CadDocument, path: &Path) -> Result<(), String> {
+pub fn save(doc: &Document, path: &Path) -> Result<(), String> {
     save_as_version(doc, path, doc.version)
 }
 
@@ -2376,7 +2419,7 @@ pub fn save(doc: &CadDocument, path: &Path) -> Result<(), String> {
 /// identical.
 #[allow(dead_code)] // web/wasm build only; unused in the native target
 pub fn save_to_bytes(
-    doc: &CadDocument,
+    doc: &Document,
     ext: &str,
     version: codec::DxfVersion,
 ) -> Result<Vec<u8>, String> {
@@ -2408,7 +2451,7 @@ pub fn save_to_bytes(
 /// second clone and the live document is never touched. Both
 /// [`save_to_bytes`] and the web worker offload call this exactly once per
 /// save, so there is one implementation of the preparation for every target.
-pub fn prepare_document_for_save(mut doc: CadDocument, version: codec::DxfVersion) -> CadDocument {
+pub fn prepare_document_for_save(mut doc: Document, version: codec::DxfVersion) -> Document {
     let perf = crate::perf::enabled();
     doc.version = version;
     let styles_started = perf.then(iced::time::Instant::now);
@@ -2437,9 +2480,15 @@ pub fn prepare_document_for_save(mut doc: CadDocument, version: codec::DxfVersio
 /// unavailable.
 #[cfg(target_arch = "wasm32")]
 pub async fn serialize_prepared_document(
-    prepared: &CadDocument,
+    prepared: &Document,
     ext: &str,
+    allow_conversion_loss: bool,
 ) -> Result<Vec<u8>, String> {
+    // A converter writes inline: the worker only carries the DWG/DXF writers,
+    // and the user's "Save anyway" lives on this side.
+    if let Some(format) = ocs_save::external_format(ext) {
+        return ocs_save::write_external(prepared, format, allow_conversion_loss);
+    }
     let encoded = match ocs_save::encode_request(prepared, ext) {
         Ok(encoded) => encoded,
         // The worker cannot help if the document cannot even be encoded —
@@ -2460,38 +2509,43 @@ pub async fn serialize_prepared_document(
 // so without this the current-style markers (and any code keyed on the name)
 // fall back to "Standard". Only overrides when the handle resolves, leaving the
 // DXF-provided names intact.
-fn fix_current_style_names(doc: &mut CadDocument) {
+fn fix_current_style_names(doc: &mut Document) {
     use codec::objects::ObjectType;
 
-    let h = doc.header.current_text_style_handle;
-    if h.is_valid() {
-        if let Some(name) = doc
-            .text_styles
-            .iter()
-            .find(|s| s.handle == h)
-            .map(|s| s.name.clone())
-        {
-            doc.header.current_text_style_name = name;
+    {
+        // The style tables and the header are separate fields of the acadrust
+        // document; borrow them through it, not through the whole Document.
+        let doc: &mut codec::CadDocument = &mut *doc;
+        let h = doc.header.current_text_style_handle;
+        if h.is_valid() {
+            if let Some(name) = doc
+                .text_styles
+                .iter()
+                .find(|s| s.handle == h)
+                .map(|s| s.name.clone())
+            {
+                doc.header.current_text_style_name = name;
+            }
         }
-    }
-    let h = doc.header.current_dimstyle_handle;
-    if h.is_valid() {
-        if let Some(name) = doc
-            .dim_styles
-            .iter()
-            .find(|s| s.handle == h)
-            .map(|s| s.name.clone())
-        {
-            doc.header.current_dimstyle_name = name;
+        let h = doc.header.current_dimstyle_handle;
+        if h.is_valid() {
+            if let Some(name) = doc
+                .dim_styles
+                .iter()
+                .find(|s| s.handle == h)
+                .map(|s| s.name.clone())
+            {
+                doc.header.current_dimstyle_name = name;
+            }
         }
-    }
-    let h = doc.header.current_multiline_style_handle;
-    if h.is_valid() {
-        if let Some(name) = doc.objects.values().find_map(|o| match o {
-            ObjectType::MLineStyle(s) if s.handle == h => Some(s.name.clone()),
-            _ => None,
-        }) {
-            doc.header.multiline_style = name;
+        let h = doc.header.current_multiline_style_handle;
+        if h.is_valid() {
+            if let Some(name) = doc.objects.values().find_map(|o| match o {
+                ObjectType::MLineStyle(s) if s.handle == h => Some(s.name.clone()),
+                _ => None,
+            }) {
+                doc.header.multiline_style = name;
+            }
         }
     }
 
@@ -2500,12 +2554,12 @@ fn fix_current_style_names(doc: &mut CadDocument) {
     // them — they live in the variable dictionary as DICTIONARYVAR entries
     // keyed "CTABLESTYLE" / "CMLEADERSTYLE". Resolve from there when present;
     // a missing entry simply leaves the existing value untouched.
-    if let Some(v) = vardict_value(doc, "CTABLESTYLE") {
+    if let Some(v) = drawing_variable(doc, "CTABLESTYLE") {
         if !v.is_empty() {
             doc.header.current_table_style_name = v;
         }
     }
-    if let Some(v) = vardict_value(doc, "CMLEADERSTYLE") {
+    if let Some(v) = drawing_variable(doc, "CMLEADERSTYLE") {
         if !v.is_empty() {
             doc.header.current_mleader_style_name = v;
         }
@@ -2513,48 +2567,21 @@ fn fix_current_style_names(doc: &mut CadDocument) {
     reflect_sketch_settings(doc);
 }
 
-/// Find the handle of the `DictionaryVariable` registered under `name` in any
-/// of the document's dictionaries (the variable dictionary).
-fn vardict_handle(doc: &CadDocument, name: &str) -> Option<codec::Handle> {
-    use codec::objects::ObjectType;
-    doc.objects.values().find_map(|o| {
-        let entries = match o {
-            ObjectType::Dictionary(d) => &d.entries,
-            ObjectType::DictionaryWithDefault(d) => &d.entries,
-            _ => return None,
-        };
-        entries
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, h)| *h)
-    })
+/// A system variable stored in the drawing's variable dictionary.
+pub(crate) fn drawing_variable(doc: &Document, name: &str) -> Option<String> {
+    doc.drawing_variable(name).map(str::to_string)
 }
 
-/// Look up a system-variable value stored in the document's variable
-/// dictionary.
-fn vardict_value(doc: &CadDocument, name: &str) -> Option<String> {
-    use codec::objects::ObjectType;
-    let handle = vardict_handle(doc, name)?;
-    match doc.objects.get(&handle) {
-        Some(ObjectType::DictionaryVariable(v)) => Some(v.value.clone()),
-        _ => None,
-    }
-}
-
-pub(crate) fn drawing_variable(doc: &CadDocument, name: &str) -> Option<String> {
-    vardict_value(doc, name)
-}
-
-fn reflect_sketch_settings(doc: &mut CadDocument) {
-    let sketch_type = vardict_value(doc, "SKPOLY")
+fn reflect_sketch_settings(doc: &mut Document) {
+    let sketch_type = drawing_variable(doc, "SKPOLY")
         .and_then(|value| value.parse::<i16>().ok())
         .unwrap_or(doc.header.sketch_type)
         .clamp(0, 2);
-    let increment = vardict_value(doc, "SKETCHINC")
+    let increment = drawing_variable(doc, "SKETCHINC")
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(doc.header.sketch_increment);
-    let tolerance = vardict_value(doc, "SKTOLERANCE")
+    let tolerance = drawing_variable(doc, "SKTOLERANCE")
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
         .unwrap_or(doc.header.sketch_tolerance);
@@ -2573,45 +2600,14 @@ fn reflect_sketch_settings(doc: &mut CadDocument) {
 
 /// Write a drawing variable, creating the variable dictionary and record when
 /// needed so new drawings preserve the value too.
-pub(crate) fn set_drawing_variable(doc: &mut CadDocument, name: &str, value: &str) {
-    use codec::objects::{Dictionary, DictionaryVariable, ObjectType};
-    if let Some(h) = vardict_handle(doc, name) {
-        if let Some(ObjectType::DictionaryVariable(v)) = doc.objects.get_mut(&h) {
-            v.value = value.to_string();
-        }
-        return;
-    }
-
-    let root = crate::scene::annotative::root_named_dict_handle(doc);
-    let variable_dictionary = crate::scene::annotative::as_dict(doc, root)
-        .and_then(|dictionary| dictionary.get("AcDbVariableDictionary"))
-        .filter(|handle| matches!(doc.objects.get(handle), Some(ObjectType::Dictionary(_))))
-        .unwrap_or_else(|| {
-            let handle = doc.allocate_handle();
-            let mut dictionary = Dictionary::new();
-            dictionary.handle = handle;
-            dictionary.owner = root;
-            doc.objects
-                .insert(handle, ObjectType::Dictionary(dictionary));
-            if let Some(ObjectType::Dictionary(root_dictionary)) = doc.objects.get_mut(&root) {
-                root_dictionary.add_entry("AcDbVariableDictionary", handle);
-            }
-            handle
-        });
-
-    let handle = doc.allocate_handle();
-    let mut variable = DictionaryVariable::new(name, value);
-    variable.handle = handle;
-    variable.owner_handle = variable_dictionary;
-    doc.objects
-        .insert(handle, ObjectType::DictionaryVariable(variable));
-    if let Some(ObjectType::Dictionary(dictionary)) = doc.objects.get_mut(&variable_dictionary) {
-        dictionary.add_entry(name, handle);
-    }
+pub(crate) fn set_drawing_variable(doc: &mut Document, name: &str, value: &str) {
+    // The codec follows the header's root pointer; repair a stale one first.
+    crate::scene::annotative::root_named_dict_handle(doc);
+    doc.set_drawing_variable(name, value);
 }
 
 pub(crate) fn set_sketch_settings(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     sketch_type: i16,
     increment: f64,
     tolerance: f64,
@@ -2638,8 +2634,8 @@ pub(crate) fn set_sketch_settings(
 /// The layout tab that was active when the drawing was saved — the `CTAB`
 /// system variable (stored in the variable dictionary as a `DICTIONARYVAR`).
 /// `None` when the file recorded no current tab.
-pub fn saved_active_layout(doc: &CadDocument) -> Option<String> {
-    vardict_value(doc, "CTAB").filter(|s| !s.is_empty())
+pub fn saved_active_layout(doc: &Document) -> Option<String> {
+    drawing_variable(doc, "CTAB").filter(|s| !s.is_empty())
 }
 
 /// Record `name` as the active layout tab (`CTAB`) so the next save round-trips
@@ -2647,7 +2643,7 @@ pub fn saved_active_layout(doc: &CadDocument) -> Option<String> {
 /// creates one under the root named-object dictionary when the drawing never
 /// carried it (e.g. a document authored here from scratch) — otherwise the exact
 /// paper layout would be lost and reopening fell back to the first paper tab.
-pub fn set_saved_active_layout(doc: &mut CadDocument, name: &str) {
+pub fn set_saved_active_layout(doc: &mut Document, name: &str) {
     set_drawing_variable(doc, "CTAB", name);
 }
 
@@ -2663,7 +2659,7 @@ pub fn set_saved_active_layout(doc: &mut CadDocument, name: &str) {
 ///
 /// DXF additionally writes its own header vars from the names, so this keeps
 /// every representation consistent.
-fn sync_current_styles_on_save(doc: &mut CadDocument) {
+fn sync_current_styles_on_save(doc: &mut Document) {
     use codec::objects::ObjectType;
 
     // The renderer uses a closed filled arrow when a referenced block is
@@ -2724,7 +2720,7 @@ fn sync_current_styles_on_save(doc: &mut CadDocument) {
 
 /// Recovery runs the codec's repair and reports what it did, and what it
 /// left, through the drawing's notifications.
-pub(crate) fn repair_drawing(doc: &mut CadDocument) {
+pub(crate) fn repair_drawing(doc: &mut Document) {
     let repair = doc.repair();
     for action in &repair.actions {
         doc.notifications.notify(
@@ -2745,7 +2741,7 @@ pub(crate) fn repair_drawing(doc: &mut CadDocument) {
 /// (DXF 54), so the picture drew turned about the origin, away from the
 /// dimension. A picture that lies at the definition point as stored, and
 /// far from it once placed, drops its placement.
-fn fix_double_placed_dimension_pictures(doc: &mut CadDocument) {
+fn fix_double_placed_dimension_pictures(doc: &mut Document) {
     let mut doubled = Vec::new();
     for entity in doc.entities() {
         let EntityType::Dimension(dimension) = entity else {
@@ -2807,7 +2803,7 @@ fn fix_double_placed_dimension_pictures(doc: &mut CadDocument) {
 /// but the real DXF/DWG spec uses bit 15 (0x8000) → viewport on and bit 14 (0x4000) → locked.
 /// Files from AutoCAD and other tools always set bit 15 for active viewports, leaving bit 0
 /// clear, so opencadcodec reads every such viewport as off.  Correct that here after loading.
-fn fix_viewport_status_flags(doc: &mut CadDocument) {
+fn fix_viewport_status_flags(doc: &mut Document) {
     for entity in doc.entities_mut() {
         if let EntityType::Viewport(vp) = entity {
             let bits = vp.status.to_bits();
@@ -2821,27 +2817,12 @@ fn fix_viewport_status_flags(doc: &mut CadDocument) {
     }
 }
 
-/// The opencadcodec DXF reader still stores Shape rotation directly from group
-/// code 50 in degrees, while DWG and our own creation code store radians.
-/// Dimension angles and ATTRIB/ATTDEF rotation are converted inside the
-/// reader, so arms for them here would convert twice.
-fn fix_dxf_dimension_rotations(doc: &mut CadDocument) {
-    for entity in doc.entities_mut() {
-        match entity {
-            EntityType::Shape(s) => {
-                s.rotation = s.rotation.to_radians();
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Recover integer-valued AcDbPlotSettings fields that opencadcodec can leave at
 /// their defaults when a DXF writer right-aligns the value with leading spaces.
 /// The raw pairs are preserved on Layout, so trim and parse those authoritative
 /// values after loading. In particular, losing code 73 turns a 90°/270° sheet
 /// back to 0° and makes a landscape layout render as portrait (#505).
-fn fix_dxf_layout_plot_settings(doc: &mut CadDocument) {
+fn fix_dxf_layout_plot_settings(doc: &mut Document) {
     use codec::objects::{ObjectType, PlotFlags};
 
     for object in doc.objects.values_mut() {
@@ -2910,8 +2891,8 @@ mod dimension_arrow_save_tests {
         Handle,
     };
 
-    fn document_with_missing_arrows() -> CadDocument {
-        let mut doc = CadDocument::new();
+    fn document_with_missing_arrows() -> Document {
+        let mut doc = Document::new();
         let mut style = DimStyle::new("MissingArrows");
         style.handle = doc.allocate_handle();
         style.dimblk = Handle::new(0xDEAD);
@@ -3037,7 +3018,7 @@ mod layer_roundtrip_tests {
     // Add `count` new layers the way the UI does (allocate_handle, then add),
     // round-trip through `ext`, and return whether every one survived.
     fn roundtrip_layers(ext: &str, count: usize) -> bool {
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         crate::io::linetypes::populate_document(&mut doc);
         let names: Vec<String> = (0..count).map(|n| format!("Layer{}", n + 1)).collect();
         for name in &names {
@@ -3123,8 +3104,8 @@ mod pre_r2000_layer_plot_tests {
     use codec::tables::layer::Layer as DocLayer;
     use codec::types::DxfVersion;
 
-    fn drawing_with_layers() -> CadDocument {
-        let mut doc = CadDocument::new();
+    fn drawing_with_layers() -> Document {
+        let mut doc = Document::new();
         crate::io::linetypes::populate_document(&mut doc);
         for name in ["COARSE", "FINE"] {
             let mut layer = DocLayer::new(name);
@@ -3255,7 +3236,7 @@ mod prepare_save_tests {
     // stamp, style sync and dimension baking all happen on the clone only.
     #[test]
     fn prepare_stamps_version_and_leaves_live_document_untouched() {
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         doc.version = codec::DxfVersion::AC1027;
         let prepared = prepare_document_for_save(doc.clone(), codec::DxfVersion::AC1032);
         assert_eq!(prepared.version, codec::DxfVersion::AC1032);
@@ -3267,7 +3248,7 @@ mod prepare_save_tests {
     // while the live document keeps its previous marker.
     #[test]
     fn prepare_syncs_current_style_markers() {
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         crate::io::linetypes::populate_document(&mut doc);
         let mut style = TextStyle::new("ANNOT");
         style.handle = doc.allocate_handle();
@@ -3285,7 +3266,7 @@ mod prepare_save_tests {
     // point mirrored into `base` — while the live document keeps neither.
     #[test]
     fn prepare_bakes_missing_dimension_blocks() {
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         crate::io::linetypes::populate_document(&mut doc);
         let mut dim =
             DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));
@@ -3328,7 +3309,7 @@ mod prepare_save_tests {
     // worker) must produce identical bytes for the same input.
     #[test]
     fn save_to_bytes_equals_prepare_then_shared_serialize() {
-        let mut doc = CadDocument::new();
+        let mut doc = Document::new();
         crate::io::linetypes::populate_document(&mut doc);
         let mut dim =
             DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));

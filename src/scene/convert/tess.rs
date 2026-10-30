@@ -5,7 +5,7 @@ use super::super::*;
 /// layer is locked, so locked objects read as non-editable (they stay visible
 /// and snappable). No-op for unlocked layers.
 fn fade_if_locked(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     e: &EntityType,
     color: [f32; 4],
     bg: [f32; 4],
@@ -43,7 +43,7 @@ pub(crate) struct BlockObjectOptions {
 }
 
 fn block_object_style(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     insert: &codec::entities::Insert,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -54,6 +54,9 @@ fn block_object_style(
     let mut layer =
         view::render::layer_render_style_viewport(document, &insert.common.layer, active_viewport);
     layer.color = view::render::adapt_to_bg(layer.color, bg_color);
+    if view::render::layer_locked(document, &entity) {
+        layer.color = crate::scene::cache::block_cache::fade_toward_bg(layer.color, bg_color);
+    }
     let layer_aci = document
         .layers
         .get(&insert.common.layer)
@@ -67,8 +70,10 @@ fn block_object_style(
         .get(&insert.common.layer)
         .map(|layer| layer.is_plottable)
         .unwrap_or(true);
+    let color = view::render::adapt_to_bg(color, bg_color);
+    let color = fade_if_locked(document, &entity, color, bg_color);
     BlockObjectStyle {
-        color: view::render::adapt_to_bg(color, bg_color),
+        color,
         aci,
         pattern_length,
         pattern,
@@ -81,7 +86,7 @@ fn block_object_style(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_block_object(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     insert: &codec::entities::Insert,
     owner: Handle,
     selected: bool,
@@ -202,7 +207,7 @@ pub(crate) fn expand_block_object(
 /// `None` when any link is missing (DXF files, older DWGs) — the caller then
 /// falls back to a geometric heuristic.
 fn section_arrow_dir_from_views(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     s: &codec::entities::SectionSymbol,
 ) -> Option<[f64; 2]> {
     use codec::types::Handle as AHandle;
@@ -283,7 +288,7 @@ fn section_arrow_dir_from_views(
 ///   ([`section_arrow_dir_from_views`]); only when that chain is unavailable
 ///   does it fall back to the 90°-CCW rotation of END-A→END-B.
 fn section_symbol_wires(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     s: &codec::entities::SectionSymbol,
     style: Option<&codec::entities::SectionViewStyle>,
     h: Handle,
@@ -476,7 +481,7 @@ struct ProxyInherit {
 /// resolve against its sub-entity layer (ByLayer) or the proxy entity itself
 /// (ByBlock); primitives sharing a style share one wire.
 fn proxy_preview_wires(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     e: &EntityType,
     dec: &convert::proxy_graphics::Decoded,
     own: ProxyInherit,
@@ -631,7 +636,7 @@ fn proxy_preview_wires(
 /// (so DIMCLRT / DIMSTYLE colours win over the synthetic Text's defaults).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tessellate_entity_dim_text(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     selected: &HashSet<Handle>,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -669,7 +674,7 @@ pub(crate) fn tessellate_entity_dim_text(
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tessellate_entity(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     selected: &HashSet<Handle>,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -729,7 +734,7 @@ pub(crate) fn tessellate_entity(
 }
 #[allow(clippy::too_many_arguments)]
 fn tessellate_entity_inner(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     selected: &HashSet<Handle>,
     active_viewport: Option<Handle>,
     bg_color: [f32; 4],
@@ -1925,7 +1930,7 @@ pub(crate) fn entity_bounds(e: &codec::EntityType) -> ([f64; 3], [f64; 3]) {
 /// [`entity_bounds`] with the document, for entities whose extent is not
 /// stored on the entity: an underlay spans its page (or its clip).
 pub(crate) fn entity_bounds_in(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     e: &codec::EntityType,
 ) -> ([f64; 3], [f64; 3]) {
     if let codec::EntityType::Underlay(underlay) = e {
@@ -1937,7 +1942,7 @@ pub(crate) fn entity_bounds_in(
 }
 
 /// [`entity_aabb`] with the document (see [`entity_bounds_in`]).
-pub(crate) fn entity_aabb_in(document: &codec::CadDocument, e: &codec::EntityType) -> [f32; 4] {
+pub(crate) fn entity_aabb_in(document: &codec::Document, e: &codec::EntityType) -> [f32; 4] {
     if let codec::EntityType::Underlay(underlay) = e {
         if let Some((min, max)) = crate::entities::underlay::world_bounds(underlay, document) {
             return [min[0] as f32, min[1] as f32, max[0] as f32, max[1] as f32];

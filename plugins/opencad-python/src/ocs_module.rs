@@ -51,7 +51,7 @@ mod ocs {
         Ok(())
     }
 
-    fn top_level_blocks(document: &codec::CadDocument) -> std::collections::HashSet<Handle> {
+    fn top_level_blocks(document: &codec::Document) -> std::collections::HashSet<Handle> {
         let mut blocks: std::collections::HashSet<Handle> = document
             .objects
             .values()
@@ -1640,9 +1640,15 @@ mod ocs {
             "cancel" => R::Cancel,
             other => return Err(vm.new_value_error(format!("ocs.command_step: unknown step {other:?}"))),
         };
-        let outcome = host_ctx::with_host(|host| host.run_command(request))
-            .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
-            .map_err(|error| vm.new_runtime_error(format!("ocs.command_step: {error}")))?;
+        let starts = matches!(request, R::Run { .. } | R::Start { .. });
+        let outcome = host_ctx::with_host(|host| {
+            if starts {
+                host_ctx::split_undo_group(host);
+            }
+            host.run_command(request)
+        })
+        .ok_or_else(|| vm.new_runtime_error("ocs: not running inside a PY_ command".to_owned()))?
+        .map_err(|error| vm.new_runtime_error(format!("ocs.command_step: {error}")))?;
         let dict = vm.ctx.new_dict();
         let strings = |items: &[String]| -> PyObjectRef {
             PyObjectRef::from(vm.ctx.new_list(items.iter().map(|v| vm.new_pyobj(v.clone())).collect()))
@@ -5274,7 +5280,7 @@ mod ocs {
         #[test]
         fn phase_seven_kinds_survive_dwg_round_trip() {
             with_vm(|vm| {
-                let mut doc = codec::CadDocument::new();
+                let mut doc = codec::Document::new();
                 let mut handles = Vec::new();
                 for kind in ["Ray", "XLine", "Solid", "Face3D"] {
                     let input = vm.ctx.new_dict();
@@ -5574,7 +5580,7 @@ mod ocs {
         /// The concrete Phase 1 acceptance test: create, read,
         /// edit, delete, save, and reopen a Line and an Ellipse, with common
         /// properties preserved — exercised against a real
-        /// `codec::CadDocument` and a real DWG round trip (not a fake
+        /// `codec::Document` and a real DWG round trip (not a fake
         /// `HostApi`; `dict_to_entity`/`apply_dict_to_entity`/`entity_to_dict`
         /// are exactly what a live `HostApi`-backed `ocs.add`/`ocs.update`/
         /// `ocs.get_entity` call into, so this covers the same logic without
@@ -5582,7 +5588,7 @@ mod ocs {
         #[test]
         fn line_and_ellipse_survive_create_read_edit_delete_save_reopen() {
             with_vm(|vm| {
-                let mut doc = codec::CadDocument::new();
+                let mut doc = codec::Document::new();
                 // A layer must exist in the document's layer table before an
                 // entity can reference it — same requirement `set_entity_layer`
                 // above already enforces for a live document. Without this,

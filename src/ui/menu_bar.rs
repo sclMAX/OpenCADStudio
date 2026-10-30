@@ -73,6 +73,7 @@ const MENUS: &[(&str, Entries)] = &[
         "Format",
         &[
             ("Layer", "LAYER"),
+            ("Layer Walk", "LAYWALK"),
             ("Color", "COLOR"),
             ("Linetype", "LINETYPE"),
             ("Text Style", "STYLE"),
@@ -232,7 +233,7 @@ pub fn view<'a>() -> Element<'a, Message> {
             )
         })
         .collect();
-    MenuBar::new(roots)
+    let bar = MenuBar::new(roots)
         .close_on_item_click_global(true)
         .style(|theme: &Theme, _| {
             let palette = theme.palette();
@@ -250,8 +251,15 @@ pub fn view<'a>() -> Element<'a, Message> {
                 path: Background::Color(palette.primary.weak.color),
                 path_border: Border::default(),
             }
-        })
+        });
+    // The bar keeps its own width: stretched to Fill, it widens its last menu
+    // title to the right edge and that menu then opens there (#2235).
+    container(bar)
         .width(Fill)
+        .style(|theme: &Theme| {
+            container::Style::default()
+                .background(theme.palette().background.weakest.color)
+        })
         .into()
 }
 

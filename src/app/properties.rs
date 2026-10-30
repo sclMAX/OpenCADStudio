@@ -445,12 +445,12 @@ impl OpenCADStudio {
             let xd = &source_entity.common().extended_data;
             if !xd.is_empty() && !matches!(source_entity, codec::EntityType::Ole2Frame(_)) {
                 let mut xd_props = Vec::new();
-                // A hyperlink shows on its own row.
-                for rec in xd
-                    .records()
-                    .iter()
-                    .filter(|rec| rec.application_name != crate::scene::hyperlink::APP)
-                {
+                // A hyperlink shows on its own row; inspection data is the
+                // dimension's own.
+                for rec in xd.records().iter().filter(|rec| {
+                    rec.application_name != crate::scene::hyperlink::APP
+                        && rec.application_name != crate::entities::dim_inspect::APP
+                }) {
                     let value_text = rec
                         .values
                         .iter()
@@ -582,14 +582,19 @@ impl OpenCADStudio {
                     _ => None,
                 })
                 .collect();
-            // A leader with no linetype handle draws ByBlock; expose that
-            // as the first option so the default is selectable.
-            let ltype_names: Vec<String> = std::iter::once("ByBlock".to_string())
+            // ByLayer and ByBlock lead the list once (a leader with no
+            // linetype handle draws ByBlock), then the drawing's linetypes.
+            let ltype_names: Vec<String> = ["ByLayer".to_string(), "ByBlock".to_string()]
+                .into_iter()
                 .chain(
                     doc.line_types
                         .iter()
                         .map(|l| l.name.clone())
-                        .filter(|n| !n.is_empty()),
+                        .filter(|n| {
+                            !n.is_empty()
+                                && !n.eq_ignore_ascii_case("ByLayer")
+                                && !n.eq_ignore_ascii_case("ByBlock")
+                        }),
                 )
                 .collect();
             // Arrowheads are blocks; the closed-filled default has no
@@ -1540,7 +1545,7 @@ impl OpenCADStudio {
                 | codec::EntityType::Insert(_)
                 | codec::EntityType::Leader(_)
                 | codec::EntityType::Hatch(_) => Some(("annotative", None)),
-                codec::EntityType::MultiLeader(_) => Some(("enable_annotation_scale", None)),
+                codec::EntityType::MultiLeader(_) => Some(("annotative", None)),
                 codec::EntityType::Dimension(_) => Some(("annotative", Some("style_name"))),
                 codec::EntityType::Tolerance(_) => Some(("annotative", Some("tol_dim_style"))),
                 codec::EntityType::Table(_) => Some(("annotative", Some("tbl_style_handle"))),
@@ -1612,7 +1617,8 @@ impl OpenCADStudio {
                         | codec::EntityType::Insert(_)
                         | codec::EntityType::Leader(_)
                         | codec::EntityType::Hatch(_)
-                        | codec::EntityType::Dimension(_) => {
+                        | codec::EntityType::Dimension(_)
+                        | codec::EntityType::MultiLeader(_) => {
                             set_row_value(&mut sections, "annotative", yes_no_choice(is_anno))
                         }
                         _ => set_row(
@@ -2165,7 +2171,7 @@ impl OpenCADStudio {
                                                     .document
                                                     .current_entity_transparency(),
                                             ),
-                                        options: vec!["ByLayer".to_string(), "ByBlock".to_string()],
+                                        options: crate::scene::creation_style::transparency_options(),
                                     },
                                 },
                                 read_only(
@@ -3476,40 +3482,50 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
             None
         };
         if let codec::EntityType::Table(table) = &mut entity {
+            if let Some(settings) = table
+                .name
+                .strip_prefix(crate::modules::annotate::data_link::EXTRACTION_PENDING)
+                .map(str::to_string)
+            {
+                table.name.clear();
+                let link = crate::app::annotation_data::add_extraction_link(
+                    &mut self.tabs[i].scene.document,
+                    &settings,
+                );
+                crate::modules::annotate::data_link::link_cells(table, link, 1);
+            }
             const PREFIX: &str = "__OPENCAD_LINK_PENDING__";
             if let Some(path) = table.name.strip_prefix(PREFIX).map(str::to_string) {
-                use codec::entities::table::CellStateFlags;
-                use codec::objects::{ClassObject, ClassObjectData, DataLink, ObjectType};
                 let document = &mut self.tabs[i].scene.document;
-                let link_handle = document.allocate_handle();
-                let mut object = ClassObject::new(ClassObjectData::DataLink(DataLink {
-                    data_adapter: "CSV".to_string(),
-                    description: path.clone(),
-                    tooltip: path.clone(),
-                    connection_string: path.clone(),
-                    status_flags: 1,
-                    update_status: "Linked".to_string(),
-                    ..DataLink::default()
-                }));
-                object.handle = link_handle;
-                document
-                    .objects
-                    .insert(link_handle, ObjectType::ClassObject(object));
-                let rows = table.row_count() as i32;
-                let columns = table.column_count() as i32;
-                for row in &mut table.rows {
-                    for cell in &mut row.cells {
-                        cell.has_linked_data = true;
-                        cell.data_link_handle = Some(link_handle);
-                        cell.data_link_rows = rows;
-                        cell.data_link_columns = columns;
-                        cell.state.insert(
-                            CellStateFlags::LINKED
-                                | CellStateFlags::CONTENT_LOCKED
-                                | CellStateFlags::FORMAT_LOCKED,
-                        );
-                    }
+                let stem = std::path::Path::new(&path)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Data Link")
+                    .to_string();
+                let names = crate::app::annotation_data::data_link_entries(document);
+                let mut name = stem.clone();
+                let mut n = 1;
+                while names.iter().any(|(known, _)| known.eq_ignore_ascii_case(&name)) {
+                    n += 1;
+                    name = format!("{stem} ({n})");
                 }
+                let mut link = codec::objects::DataLink::default();
+                crate::app::annotation_data::set_spreadsheet_link(
+                    &mut link,
+                    &crate::app::annotation_data::SpreadsheetLinkSettings {
+                        path: &path,
+                        stored_path: &path,
+                        sheet: "",
+                        kind: crate::ui::window::annotation_data::LinkRange::EntireSheet,
+                        range: None,
+                        path_option: 1,
+                        allow_write: false,
+                        use_source_formatting: true,
+                        keep_source_formatting: true,
+                    },
+                );
+                let link_handle = crate::app::annotation_data::add_data_link(document, &name, link);
+                crate::modules::annotate::data_link::link_cells(table, link_handle, 0);
                 table.name = std::path::Path::new(&path)
                     .file_stem()
                     .and_then(|value| value.to_str())
@@ -3539,9 +3555,30 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         if let Some(layer) = explicit_mleader_layer {
             entity.as_entity_mut().set_layer(layer);
         } else if !preserve_entity_layer {
-            let layer = &self.tabs[i].active_layer;
+            // DIMLAYER and MLEADERLAYER put new dimensions and
+            // multileaders on their own layers.
+            let xref = match &entity {
+                codec::EntityType::Insert(insert) => self.tabs[i]
+                    .scene
+                    .document
+                    .block_records
+                    .get(&insert.block_name)
+                    .is_some_and(|record| record.flags.is_xref),
+                _ => false,
+            };
+            let layer = if matches!(entity, codec::EntityType::Dimension(_)) {
+                self.new_dimension_layer(i)
+            } else if matches!(entity, codec::EntityType::MultiLeader(_)) {
+                self.new_mleader_layer(i)
+            } else if matches!(entity, codec::EntityType::Hatch(_)) {
+                self.new_variable_layer(i, "HATCHLAYER")
+            } else if xref {
+                self.new_variable_layer(i, "XREFLAYER")
+            } else {
+                self.tabs[i].active_layer.clone()
+            };
             if layer != "0" || entity.as_entity().layer().is_empty() {
-                entity.as_entity_mut().set_layer(layer.clone());
+                entity.as_entity_mut().set_layer(layer);
             }
         }
 
@@ -3712,6 +3749,25 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         } else {
             Some(self.tabs[i].scene.add_entity(entity))
         };
+
+        // A linked table is one of its data link's connected objects.
+        if let Some(handle) = new_handle {
+            let link = match self.tabs[i].scene.document.get_entity(handle) {
+                Some(codec::EntityType::Table(table)) => table
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .find_map(|cell| cell.data_link_handle),
+                _ => None,
+            };
+            if let Some(link) = link {
+                crate::app::annotation_data::connect_data_link(
+                    &mut self.tabs[i].scene.document,
+                    link,
+                    handle,
+                );
+            }
+        }
 
         if needs_annotation_context {
             if let (Some(handle), Some(scale)) = (
@@ -4018,7 +4074,7 @@ pub(super) fn aggregate_sections(
 }
 
 fn aggregate_solid_history_sections(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     handles: &[Handle],
 ) -> Vec<crate::scene::model::object::PropSection> {
     let mut sections = handles
@@ -4627,7 +4683,7 @@ pub(crate) fn dimtad_from_label(label: &str) -> i16 {
 /// Resolve a dimension style by name (case-insensitive), falling back to
 /// "Standard" when the name is blank.
 fn find_dim_style<'a>(
-    doc: &'a codec::CadDocument,
+    doc: &'a codec::Document,
     name: &str,
 ) -> Option<&'a codec::tables::DimStyle> {
     doc.dim_styles.iter().find(|s| {
@@ -4694,7 +4750,7 @@ pub(crate) fn arrowhead_label(name: &str) -> String {
 
 /// The leader's arrowhead label, resolved from the dim style's DIMLDRBLK block.
 fn leader_arrow_label(
-    doc: &codec::CadDocument,
+    doc: &codec::Document,
     ds: &codec::tables::DimStyle,
     arrow_enabled: bool,
 ) -> String {

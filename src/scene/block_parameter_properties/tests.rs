@@ -6,7 +6,7 @@ use crate::scene::{
 use codec::entities::{Insert, Line};
 use codec::types::Vector3;
 
-fn fixture(kind: usize, action: bool) -> (CadDocument, Handle, Handle, Parameter) {
+fn fixture(kind: usize, action: bool) -> (Document, Handle, Handle, Parameter) {
     let mut scene = Scene::new();
     scene.define_block_raw(
         "VALUES",
@@ -80,7 +80,7 @@ fn fixture(kind: usize, action: bool) -> (CadDocument, Handle, Handle, Parameter
         .unwrap();
     (scene.document, def, insert, p)
 }
-fn key(doc: &CadDocument, insert: Handle, component: Component) -> Key {
+fn key(doc: &Document, insert: Handle, component: Component) -> Key {
     properties(doc, None, 42, insert)
         .into_iter()
         .find_map(|row| match row.value {
@@ -93,7 +93,7 @@ fn key(doc: &CadDocument, insert: Handle, component: Component) -> Key {
         })
         .unwrap()
 }
-fn numeric(doc: &CadDocument, insert: Handle, component: Component) -> f64 {
+fn numeric(doc: &Document, insert: Handle, component: Component) -> f64 {
     properties(doc, None, 42, insert)
         .into_iter()
         .find_map(|row| match row.value {

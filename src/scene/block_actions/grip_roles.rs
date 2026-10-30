@@ -69,7 +69,7 @@ fn displacement(p: &Parameter, connections: &[BlockConnection]) -> u8 {
     }
 }
 
-pub(crate) fn mask(doc: &CadDocument, definition: Handle, parameter: &Parameter) -> u8 {
+pub(crate) fn mask(doc: &Document, definition: Handle, parameter: &Parameter) -> u8 {
     actions(doc, definition)
         .into_iter()
         .filter(|(_, _, kind, node)| *node == parameter.id && compatible(parameter, *kind))

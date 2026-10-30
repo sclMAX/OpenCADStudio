@@ -1,7 +1,7 @@
 use super::*;
 use crate::scene::block_actions as actions;
 
-pub(super) fn setup() -> (CadDocument, Handle, Handle, Handle, Vec<Handle>) {
+pub(super) fn setup() -> (Document, Handle, Handle, Handle, Vec<Handle>) {
     let (mut doc, def) = fixture();
     for end in [2., 3.] {
         distance::create(
@@ -35,7 +35,7 @@ pub(super) fn setup() -> (CadDocument, Handle, Handle, Handle, Vec<Handle>) {
     (doc, def, lookup, insert, inputs)
 }
 
-pub(super) fn values(doc: &CadDocument, def: Handle, insert: Handle) -> Vec<f64> {
+pub(super) fn values(doc: &Document, def: Handle, insert: Handle) -> Vec<f64> {
     actions::all_parameters(doc, def)
         .iter()
         .map(|p| {

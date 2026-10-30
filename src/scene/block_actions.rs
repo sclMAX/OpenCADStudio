@@ -6,7 +6,7 @@ use codec::objects::{
     BlockMoveAction, BlockPolarStretchAction, BlockStretchAction, DynamicBlockData, ObjectType,
 };
 use codec::types::{Transform, Vector3};
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 use glam::DVec3;
 pub(crate) mod grip_roles;
 pub(crate) mod instance;
@@ -121,7 +121,7 @@ impl Value {
     }
 }
 
-pub(crate) fn all_parameters(doc: &CadDocument, definition: Handle) -> Vec<Parameter> {
+pub(crate) fn all_parameters(doc: &Document, definition: Handle) -> Vec<Parameter> {
     let mut result = parameters(doc, definition, Kind::Move);
     result.extend(parameters(doc, definition, Kind::Rotate));
     result.extend(parameters(doc, definition, Kind::Flip));
@@ -130,7 +130,7 @@ pub(crate) fn all_parameters(doc: &CadDocument, definition: Handle) -> Vec<Param
 }
 
 /// Resolve native action association for runtime grip interaction.
-pub(crate) fn has_action(doc: &CadDocument, definition: Handle, parameter: Handle) -> bool {
+pub(crate) fn has_action(doc: &Document, definition: Handle, parameter: Handle) -> bool {
     let Some(p) = all_parameters(doc, definition).into_iter().find(|p| p.handle == parameter) else { return false; };
     actions(doc, definition).iter().any(|(_, _, _, node)| *node == p.id)
 }
@@ -147,7 +147,7 @@ pub(crate) fn compatible(p: &Parameter, kind: Kind) -> bool {
     }
 }
 
-fn flip_component(doc: &CadDocument, p: &Parameter) -> Result<Handle, &'static str> {
+fn flip_component(doc: &Document, p: &Parameter) -> Result<Handle, &'static str> {
     let Some(ObjectType::DynamicBlock(o)) = doc.objects.get(&p.handle) else {
         return Err("Missing Flip parameter.");
     };
@@ -179,7 +179,7 @@ fn flip_component(doc: &CadDocument, p: &Parameter) -> Result<Handle, &'static s
     Ok(candidates[0])
 }
 
-pub(crate) fn value(doc: &CadDocument, p: &Parameter) -> Result<Value, &'static str> {
+pub(crate) fn value(doc: &Document, p: &Parameter) -> Result<Value, &'static str> {
     if !p.flip {
         return Ok(Value::Point(current(doc, p)));
     }
@@ -198,7 +198,7 @@ pub(crate) fn value(doc: &CadDocument, p: &Parameter) -> Result<Value, &'static 
 }
 
 pub(crate) fn set_value(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     p: &Parameter,
     value: Value,
 ) -> Result<(), &'static str> {
@@ -259,7 +259,7 @@ pub(crate) fn grip_direction(p: &Parameter, value: Value) -> Option<DVec3> {
     Some(if flipped { -across } else { across })
 }
 
-pub(crate) fn parameters(doc: &CadDocument, definition: Handle, kind: Kind) -> Vec<Parameter> {
+pub(crate) fn parameters(doc: &Document, definition: Handle, kind: Kind) -> Vec<Parameter> {
     let Ok(Some(graph)) = authoring::graph(doc, definition) else {
         return vec![];
     };
@@ -442,7 +442,7 @@ pub(crate) fn supported(e: &EntityType) -> bool {
 }
 #[cfg(test)]
 pub(crate) fn create(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     kind: Kind,
     parameter: Handle,
@@ -456,7 +456,7 @@ pub(crate) fn create(
 
 #[cfg(test)]
 pub(crate) fn create_array(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     parameter: Handle,
     targets: &[Handle],
@@ -479,7 +479,7 @@ pub(crate) fn create_array(
 
 #[cfg(test)]
 pub(crate) fn create_with_frame(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     kind: Kind,
     parameter: Handle,
@@ -495,7 +495,7 @@ pub(crate) fn create_with_frame(
 
 #[cfg(test)]
 pub(crate) fn create_with_options(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     kind: Kind,
     parameter: Handle,
@@ -510,7 +510,7 @@ pub(crate) fn create_with_options(
 }
 
 pub(crate) fn create_with_frame_points(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     kind: Kind,
     parameter: Handle,
@@ -774,7 +774,7 @@ fn action_move_delta(
 /// Retarget an existing native action, retaining identity, graph and options.
 #[cfg(test)]
 pub(crate) fn retarget(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     handle: Handle,
     targets: &[Handle],
@@ -789,7 +789,7 @@ pub(crate) fn validate_frame_points(points: &[DVec3]) -> Result<(), &'static str
 }
 
 pub(crate) fn retarget_frame_points(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     handle: Handle,
     targets: &[Handle],
@@ -910,7 +910,7 @@ pub(crate) fn retarget_frame_points(
 }
 
 pub(crate) fn actions(
-    doc: &CadDocument,
+    doc: &Document,
     definition: Handle,
 ) -> Vec<(Handle, &BlockAction, Kind, i32)> {
     let Ok(Some(graph)) = authoring::graph(doc, definition) else {
@@ -965,7 +965,7 @@ pub(crate) fn actions(
         .collect()
 }
 /// Drop erased objects from action targets without replacing graph nodes.
-pub(crate) fn prune_erased_targets(doc: &mut CadDocument, definition: Handle) {
+pub(crate) fn prune_erased_targets(doc: &mut Document, definition: Handle) {
     let mut live = authoring::members(doc, definition)
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1005,7 +1005,7 @@ pub(crate) fn prune_erased_targets(doc: &mut CadDocument, definition: Handle) {
     }
 }
 
-pub(crate) fn frame_outline(doc: &CadDocument, handle: Handle) -> Vec<Vector3> {
+pub(crate) fn frame_outline(doc: &Document, handle: Handle) -> Vec<Vector3> {
     let Some(ObjectType::DynamicBlock(o)) = doc.objects.get(&handle) else {
         return vec![];
     };
@@ -1018,7 +1018,7 @@ pub(crate) fn frame_outline(doc: &CadDocument, handle: Handle) -> Vec<Vector3> {
     stretch::outline(&a.points, a.action.display_location.z)
 }
 
-pub(crate) fn reframe(doc: &mut CadDocument, definition: Handle, t: &Transform) -> usize {
+pub(crate) fn reframe(doc: &mut Document, definition: Handle, t: &Transform) -> usize {
     let handles = actions(doc, definition)
         .iter()
         .map(|(h, _, _, _)| *h)
@@ -1081,7 +1081,7 @@ pub(crate) fn reframe_value(eval: &mut codec::objects::BlockEvalExpression, plan
     }
 }
 
-pub(crate) fn current(doc: &CadDocument, p: &Parameter) -> DVec3 {
+pub(crate) fn current(doc: &Document, p: &Parameter) -> DVec3 {
     let Some(ObjectType::DynamicBlock(object)) = doc.objects.get(&p.handle) else {
         return p.end;
     };
@@ -1102,7 +1102,7 @@ pub(crate) fn current(doc: &CadDocument, p: &Parameter) -> DVec3 {
 /// Visibility can give the test INSERT an anonymous representation. Keep its
 /// parallel members in sync, retaining their own handles and visibility flags.
 pub(crate) fn sync_representation(
-    doc: &mut CadDocument,
+    doc: &mut Document,
     definition: Handle,
     name: &str,
 ) -> Result<(), &'static str> {
@@ -1157,8 +1157,8 @@ pub(crate) fn sync_representation(
 /// avoids incremental drift and makes repeated changes/order independent.
 #[cfg(test)]
 pub(crate) fn evaluate(
-    doc: &mut CadDocument,
-    baseline: &CadDocument,
+    doc: &mut Document,
+    baseline: &Document,
     definition: Handle,
     parameter: Handle,
     position: DVec3,
@@ -1168,8 +1168,8 @@ pub(crate) fn evaluate(
 
 #[cfg(test)]
 pub(crate) fn evaluate_value(
-    doc: &mut CadDocument,
-    baseline: &CadDocument,
+    doc: &mut Document,
+    baseline: &Document,
     definition: Handle,
     parameter: Handle,
     input: Value,
@@ -1178,8 +1178,8 @@ pub(crate) fn evaluate_value(
 }
 
 pub(crate) fn rebuild(
-    doc: &mut CadDocument,
-    baseline: &CadDocument,
+    doc: &mut Document,
+    baseline: &Document,
     definition: Handle,
 ) -> Result<(), &'static str> {
     let Some(p) = all_parameters(baseline, definition).into_iter().next() else {
@@ -1198,8 +1198,8 @@ struct Evaluation<'a> {
 }
 
 pub(crate) fn evaluate_framed(
-    doc: &mut CadDocument,
-    baseline: &CadDocument,
+    doc: &mut Document,
+    baseline: &Document,
     definition: Handle,
     parameter: Handle,
     input: Value,
@@ -1212,8 +1212,8 @@ pub(crate) fn evaluate_framed(
 }
 
 pub(crate) fn rebuild_framed(
-    doc: &mut CadDocument,
-    baseline: &CadDocument,
+    doc: &mut Document,
+    baseline: &Document,
     definition: Handle,
     frames: &std::collections::BTreeMap<Handle, instance::ParameterFrame>,
 ) -> Result<(), &'static str> {
@@ -1225,8 +1225,8 @@ pub(crate) fn rebuild_framed(
 }
 
 fn evaluate_impl(
-    doc: &mut CadDocument,
-    baseline: &CadDocument,
+    doc: &mut Document,
+    baseline: &Document,
     definition: Handle,
     parameter: Handle,
     input: Value,
@@ -1620,7 +1620,7 @@ fn evaluate_impl(
     Ok(true)
 }
 
-fn supported_parameter(doc: &CadDocument, handle: Handle) -> bool {
+fn supported_parameter(doc: &Document, handle: Handle) -> bool {
     let Some(ObjectType::DynamicBlock(o)) = doc.objects.get(&handle) else {
         return false;
     };
@@ -1719,7 +1719,7 @@ pub(crate) fn constrain_angle(value: f64, set: &codec::objects::BlockParameterVa
 }
 
 pub(super) fn constrain_parameter_position(
-    doc: &CadDocument,
+    doc: &Document,
     p: &Parameter,
     mut position: DVec3,
 ) -> Result<DVec3, &'static str> {

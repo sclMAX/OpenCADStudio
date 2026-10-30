@@ -149,7 +149,7 @@ fn adjacent(value: f64, up: bool) -> f64 {
 /// One row's resolved numeric inputs. Range variables are seeded from the
 /// current frame; reverse selection clamps them before dependent formulas run.
 pub(super) fn row(
-    document: &CadDocument,
+    document: &Document,
     definition: Handle,
     table: &BlockLookupAction,
     row: usize,
@@ -250,8 +250,8 @@ fn resolve_row(
 }
 
 pub(super) fn actual_inputs(
-    document: &CadDocument,
-    baseline: Option<&CadDocument>,
+    document: &Document,
+    baseline: Option<&Document>,
     definition: Handle,
     insert: Handle,
     table: &BlockLookupAction,
@@ -315,7 +315,7 @@ pub(super) fn valid_cell(source: &str) -> Result<(), &'static str> {
 }
 
 pub(super) fn validate_context(
-    document: &CadDocument,
+    document: &Document,
     definition: Handle,
     table: &BlockLookupAction,
     original: Option<&BlockLookupAction>,
@@ -382,7 +382,7 @@ pub(super) fn constant_value(source: &str) -> Option<f64> {
 /// Intersect an interval with native bounds/list/increment constraints before
 /// dependent formulas read the chosen range value.
 fn range_value(
-    document: &CadDocument,
+    document: &Document,
     definition: Handle,
     column: &BlockLookupColumn,
     cell: &Cell,

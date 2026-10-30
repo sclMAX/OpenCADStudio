@@ -5,7 +5,7 @@ use crate::scene::{
     block_orientation_parameter as orientation,
 };
 
-fn fixture(kind: Kind, family: distance::Kind) -> (CadDocument, Handle, Parameter, Handle) {
+fn fixture(kind: Kind, family: distance::Kind) -> (Document, Handle, Parameter, Handle) {
     let (mut doc, definition, targets) = super::super::tests::fixture();
     let handle = if matches!(kind, Kind::Rotate | Kind::Flip) {
         orientation::create(

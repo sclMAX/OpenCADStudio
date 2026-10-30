@@ -1031,6 +1031,7 @@ pub fn view_window<'a>(
         on_new: Message::MLeaderStyleDialogNew,
         on_copy: Message::MLeaderStyleDialogCopy,
         on_delete: Message::MLeaderStyleDialogDelete,
+        on_import: None,
         on_select: Message::MLeaderStyleDialogSelect,
         on_set_current: Message::MLeaderStyleDialogSetCurrent,
         on_apply: Message::MLeaderStyleApply,

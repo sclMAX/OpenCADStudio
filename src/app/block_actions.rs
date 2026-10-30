@@ -168,7 +168,7 @@ impl OpenCADStudio {
         self.tabs[self.active_tab].active_cmd = Some(Box::new(command));
         Task::none()
     }
-    pub(super) fn apply_action_document(&mut self, i: usize, mut staged: codec::CadDocument) {
+    pub(super) fn apply_action_document(&mut self, i: usize, mut staged: codec::Document) {
         let doc = &mut self.tabs[i].scene.document;
         let changes = staged
             .entities()

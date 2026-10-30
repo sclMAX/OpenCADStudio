@@ -2131,6 +2131,39 @@ mod block_base_point_tests {
             "the selection is a dynamic-block reference"
         );
     }
+
+    /// The visibility grip opens a list, so its triangle points down like a
+    /// list arrow, even on a rotated reference (the fixture turns it 30 deg).
+    #[test]
+    fn visibility_grip_points_down() {
+        let mut app = OpenCADStudio::new_for_test();
+        let handle = block_and_instance_with_base(&mut app, "VIS_DOWN");
+        let i = app.active_tab;
+        let def_block = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .get("VIS_DOWN")
+            .expect("the block record")
+            .handle;
+        let mut param = codec::objects::BlockVisibilityParameter::default();
+        param.owner = def_block;
+        param.def_point = Vector3::new(12.0, 3.0, 0.0);
+        app.tabs[i]
+            .scene
+            .document
+            .block_visibility_params
+            .insert(codec::Handle::new(0x70), param);
+        app.tabs[i].selected_handle = Some(handle);
+
+        app.refresh_visibility_grip([0.0, 0.0, 0.0]);
+
+        let grip = app.tabs[i]
+            .selected_grips
+            .last()
+            .expect("the visibility lookup grip");
+        assert_eq!(grip.dir, Some(glam::DVec3::NEG_Y));
+    }
 }
 
 #[cfg(test)]

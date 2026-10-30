@@ -51,7 +51,7 @@ fn edit(app: &mut OpenCADStudio, field: &'static str, value: &str) {
     let _ = app.update(Message::PropGeomCommit(field));
 }
 
-fn labels(doc: &codec::CadDocument, def: Handle, parameter: Handle) -> Vec<String> {
+fn labels(doc: &codec::Document, def: Handle, parameter: Handle) -> Vec<String> {
     metadata::read(doc, def, parameter)
         .unwrap()
         .text

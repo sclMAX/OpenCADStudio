@@ -1,6 +1,6 @@
 //! Native parameter text and visibility metadata, validated against definition ownership.
 use codec::objects::{DynamicBlockData as Data, ObjectType};
-use codec::{CadDocument, Handle};
+use codec::{Document, Handle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Field {
@@ -49,7 +49,7 @@ pub(crate) struct Metadata<'a> {
 }
 
 fn object(
-    document: &CadDocument,
+    document: &Document,
     definition: Handle,
     handle: Handle,
 ) -> Result<&ObjectType, &'static str> {
@@ -236,7 +236,7 @@ fn describe(object: &ObjectType) -> Result<Metadata<'_>, &'static str> {
     Ok(Metadata { text, visible })
 }
 pub(crate) fn read(
-    document: &CadDocument,
+    document: &Document,
     definition: Handle,
     handle: Handle,
 ) -> Result<Metadata<'_>, &'static str> {
@@ -278,13 +278,13 @@ fn text_mut(object: &mut ObjectType, field: Field) -> Option<&mut String> {
         _ => None,
     }
 }
-fn sync_visibility(document: &mut CadDocument, handle: Handle) {
+fn sync_visibility(document: &mut Document, handle: Handle) {
     if let Some(ObjectType::BlockVisibilityParameter(parameter)) = document.objects.get(&handle) {
         super::super::block_visibility::store(document, parameter.clone());
     }
 }
 pub(crate) fn set_text(
-    document: &mut CadDocument,
+    document: &mut Document,
     definition: Handle,
     handle: Handle,
     field: Field,
@@ -344,7 +344,7 @@ pub(crate) fn set_text(
     Ok(true)
 }
 pub(crate) fn set_visible(
-    document: &mut CadDocument,
+    document: &mut Document,
     definition: Handle,
     handle: Handle,
     value: bool,

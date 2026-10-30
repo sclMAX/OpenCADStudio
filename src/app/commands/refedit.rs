@@ -796,7 +796,7 @@ impl OpenCADStudio {
                 && name[..prefix.len()].eq_ignore_ascii_case(prefix))
             .then(|| name[prefix.len()..].to_string())
         };
-        let exists = |document: &codec::CadDocument, kind: SymbolKind, name: &str| match kind {
+        let exists = |document: &codec::Document, kind: SymbolKind, name: &str| match kind {
             SymbolKind::Layer => document.layers.contains(name),
             SymbolKind::Linetype => document.line_types.contains(name),
             SymbolKind::TextStyle => document.text_styles.contains(name),

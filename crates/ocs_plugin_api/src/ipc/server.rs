@@ -3,7 +3,7 @@
 use crate::host::HostApi;
 use crate::ipc::protocol::{PluginRequest, PluginResponse};
 
-fn addressable_document_snapshot(host: &dyn HostApi) -> codec::CadDocument {
+fn addressable_document_snapshot(host: &dyn HostApi) -> codec::Document {
     let mut snapshot = host.document().clone();
     let attributes = host
         .document()
@@ -81,6 +81,15 @@ pub fn handle_plugin_request(
             host.push_undo(&label);
             PluginResponse::Ok
         }
+        BeginUndoGroup { label } => {
+            host.begin_undo_group(&label);
+            PluginResponse::Ok
+        }
+        EndUndoGroup => {
+            host.end_undo_group();
+            PluginResponse::Ok
+        }
+        QueryEntities { query } => PluginResponse::EntityPage(host.query_entities(&query)),
         SetDirty => {
             host.set_dirty();
             PluginResponse::Ok
@@ -221,6 +230,14 @@ pub fn handle_plugin_request(
         ListXRecordsWithEntries { dictionary_path } => {
             let path: Vec<&str> = dictionary_path.iter().map(|s| s.as_str()).collect();
             PluginResponse::ListXRecordsWithEntriesResult(host.list_xrecords_with_entries(&path))
+        }
+        ShowDialog(dialog) => PluginResponse::DialogResult(host.show_dialog(dialog)),
+        RegisterPanel(panel) => PluginResponse::PanelRegistered(host.register_panel(panel)),
+        UpdatePanel { panel_id, values } => {
+            PluginResponse::PanelUpdated(host.update_panel(&panel_id, values))
+        }
+        TogglePanel { panel_id, show } => {
+            PluginResponse::PanelToggled(host.toggle_panel(&panel_id, show))
         }
     }
 }

@@ -1874,7 +1874,7 @@ pub(crate) fn adapt_to_paper([r, g, b]: [f32; 3]) -> [f32; 3] {
 ///   A Type3 font synthesized from the SDF atlas would cover those exactly and
 ///   is the natural follow-up; it needs no new layout data.
 /// - `Tf` takes an *em* size but `run.height` is a *cap* height: the em size
-///   is `height / cap_ratio` (per-font OS/2 sCapHeight, 0.72 for Helvetica) so
+///   is `height / cap_ratio` (the face's capital A height, 0.72 for Helvetica) so
 ///   the invisible run aligns with the drawn cap height.
 /// - Width-matching (`Tz`, baked into the `Tm` x-basis — equivalent, and the
 ///   only horizontal scaling printpdf exposes): `k = laid_advance /
@@ -2185,12 +2185,13 @@ fn subset_family(
     // below must be in subset space. Anything unmappable stays out.
     let sub = ttf_parser::Face::parse(&subset_bytes, 0).ok()?;
     let upem = sub.units_per_em().max(1);
-    let cap_ratio = sub
-        .capital_height()
-        .filter(|c| *c > 0)
-        .map(|c| c as f32 / upem as f32)
-        .filter(|r| (0.2..=1.0).contains(r))
-        .unwrap_or(0.7);
+    // The drawn text's capital measure, read from the full face: the subset
+    // may not hold its A.
+    let cap_ratio = Some(
+        crate::scene::text::ttf_glyph::capital_units(&orig) / orig.units_per_em().max(1) as f32,
+    )
+    .filter(|r| (0.2..=1.0).contains(r))
+    .unwrap_or(0.7);
     let mut gid_chars: std::collections::BTreeMap<char, u16> = std::collections::BTreeMap::new();
     let mut width_of: std::collections::BTreeMap<u16, u16> = std::collections::BTreeMap::new();
     for c in chars {

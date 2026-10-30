@@ -822,6 +822,10 @@ impl PropertiesPanel {
         })
         .width(Length::Fill)
         .padding([4, 10]);
+        // The title bar moves the panel.
+        let title = iced::widget::mouse_area(title)
+            .on_press(Message::QuickPropertiesGrab)
+            .interaction(iced::mouse::Interaction::Grab);
 
         let mut sections = column![].spacing(0);
         self.rendering_quick.set(true);
@@ -1516,12 +1520,11 @@ impl PropertiesPanel {
             })
             .width(Length::Fill);
 
-        if !(self.edit_choice_open && self.picker_here()) {
-            return prop_row_with_active(label, head.into(), active);
-        }
-
-        // Open list: all definitions, filtered by any typed text.
-        let filter = typed.map(|s| s.to_lowercase());
+        // Transparency presets remain available while entering a custom value.
+        // Definition/name fields still filter their potentially long lists.
+        let filter = typed
+            .filter(|_| field != "transparency")
+            .map(|s| s.to_lowercase());
         let mut list = column![].spacing(1);
         for opt in options {
             if let Some(f) = &filter {
@@ -1544,12 +1547,13 @@ impl PropertiesPanel {
 
         prop_row_with_active(
             label,
-            crate::ui::color_select::drop_down_below(
+            crate::ui::color_select::editable_drop_down_below(
                 head.into(),
                 popup.into(),
                 None,
                 Length::Shrink,
                 Message::PropEditChoiceToggle,
+                self.edit_choice_open && self.picker_here(),
             ),
             active,
         )
@@ -1879,7 +1883,7 @@ fn coord_suffix(label: &str) -> Option<(&str, usize)> {
 
 /// Length of the coordinate group starting at `idx`: consecutive text rows
 /// labelled "<Base> X", "<Base> Y" and optionally "<Base> Z". 0/1 = no group.
-fn coord_group_len(props: &[crate::scene::model::object::Property], idx: usize) -> usize {
+pub(crate) fn coord_group_len(props: &[crate::scene::model::object::Property], idx: usize) -> usize {
     if matches!(props[idx].field, "pl3_vertex_x" | "pm_vx") {
         return 0;
     }
@@ -1909,12 +1913,12 @@ fn coord_group_len(props: &[crate::scene::model::object::Property], idx: usize) 
     }
 }
 
-fn coord_base(label: &str) -> &str {
+pub(crate) fn coord_base(label: &str) -> &str {
     coord_suffix(label).map(|(b, _)| b).unwrap_or(label)
 }
 
 /// Short component label for an expanded row ("Position X" → indented "X").
-fn coord_component(label: &str) -> &'static str {
+pub(crate) fn coord_component(label: &str) -> &'static str {
     match coord_suffix(label) {
         Some((_, 0)) => "    X",
         Some((_, 1)) => "    Y",
@@ -1979,6 +1983,7 @@ fn render_group_row(
         .width(Length::FillPortion(5))
         .height(Length::Fixed(ROW_H))
         .align_y(iced::Center);
+    let label_col = full_label_tooltip(label_col, base, 16);
 
     // The field copies the value, so the locally-built `joined` is fine here.
     let value_field = crate::ui::read_only::field(&joined, FONT_SZ, Length::Fill);
@@ -2193,6 +2198,35 @@ fn render_params_visibility_toggle_row<'a>(value: bool) -> Element<'a, Message> 
     .into()
 }
 
+/// Wrap a row's name column so hovering it shows the whole name when the
+/// column only fits the first `max` characters of `label`.
+fn full_label_tooltip<'a>(
+    label_col: impl Into<Element<'a, Message>>,
+    label: &'a str,
+    max: usize,
+) -> Element<'a, Message> {
+    if label.chars().count() <= max {
+        return label_col.into();
+    }
+    tooltip(label_col, text(label).size(FONT_SZ), tooltip::Position::Top)
+        .gap(4.0)
+        .padding(6.0)
+        .style(|theme: &Theme| {
+            let palette = theme.palette();
+            container::Style {
+                background: Some(Background::Color(palette.background.base.color)),
+                text_color: Some(palette.background.base.text),
+                border: Border {
+                    color: palette.background.neutral.color,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
 /// Build a label | widget property row.
 fn prop_row_widget<'a>(label: &'a str, widget: Element<'a, Message>) -> Element<'a, Message> {
     prop_row_with_active(label, widget, false)
@@ -2228,6 +2262,7 @@ fn prop_row_with_active<'a>(
         left: 6.0,
         right: 6.0,
     });
+    let label_col = full_label_tooltip(label_col, label, 18);
     let value_col = container(widget)
         .style(move |theme: &Theme| container::Style {
             background: Some(Background::Color(if active {
@@ -2265,6 +2300,14 @@ fn prop_row_with_active<'a>(
 
 // ── Color display helper ──────────────────────────────────────────────────
 
+/// Whether the drawing canvas is light, so colour 7 (white on a dark
+/// canvas) shows black in swatches as it does in the drawing.
+static LIGHT_CANVAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_light_canvas(light: bool) {
+    LIGHT_CANVAS.store(light, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns an (iced::Color swatch_bg, display_label) pair for an AcadColor.
 pub fn acad_color_display(c: AcadColor) -> (Color, &'static str) {
     match c {
@@ -2287,6 +2330,9 @@ pub fn acad_color_display(c: AcadColor) -> (Color, &'static str) {
             },
             "ByBlock",
         ),
+        AcadColor::Index(7) if LIGHT_CANVAS.load(std::sync::atomic::Ordering::Relaxed) => {
+            (Color::BLACK, aci_label(7))
+        }
         AcadColor::Index(i) => {
             let (r, g, b) = codec::types::aci_table::aci_to_rgb(i).unwrap_or((200, 200, 200));
             (
@@ -2360,6 +2406,47 @@ mod tests {
         active_key_focused, attr_edit_key, build_field_key_map, hatch_pattern_matches,
         hatch_preview_scale, prop_attr_field_id, prop_geom_field_id, FieldKey,
     };
+
+    #[test]
+    fn transparency_input_keeps_focus_when_dropdown_opens_and_closes() {
+        use iced::advanced::widget::{tree, Tree};
+        type InputState = iced::widget::text_input::State<
+            <iced::Renderer as iced::advanced::text::Renderer>::Paragraph,
+        >;
+
+        fn input_state(tree: &mut Tree) -> &mut InputState {
+            if tree.tag == tree::Tag::of::<InputState>() {
+                return tree.state.downcast_mut::<InputState>();
+            }
+            let child = tree
+                .children
+                .iter_mut()
+                .find(|child| contains_input(child))
+                .expect("editable transparency input");
+            input_state(child)
+        }
+        fn contains_input(tree: &Tree) -> bool {
+            tree.tag == tree::Tag::of::<InputState>() || tree.children.iter().any(contains_input)
+        }
+
+        let mut panel = super::PropertiesPanel::default();
+        let options = vec!["ByLayer".into(), "ByBlock".into(), "50".into()];
+        let mut row = panel.render_edit_choice_row("Transparency", "transparency", "ByLayer", &options);
+        let mut tree = Tree::new(row.as_widget());
+        tree.diff(row.as_widget_mut());
+        input_state(&mut tree).focus();
+        drop(row);
+        for open in [true, false, true] {
+            panel.edit_choice_open = open;
+            let mut row =
+                panel.render_edit_choice_row("Transparency", "transparency", "ByLayer", &options);
+            tree.diff(row.as_widget_mut());
+            assert!(
+                input_state(&mut tree).is_focused(),
+                "focus lost with dropdown open={open}"
+            );
+        }
+    }
 
     fn sample_sections() -> Vec<crate::scene::model::object::PropSection> {
         use crate::scene::model::object::{PropValue, Property};

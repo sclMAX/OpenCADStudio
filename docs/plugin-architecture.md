@@ -89,9 +89,29 @@ plugin compiles against. Two tiers:
 
 A plugin enables the `host` feature.
 
-### Build-time ABI metadata
+### Compatibility from API v14
 
-For API v4 and later the host records two pieces of build-time metadata that
+A plugin built for API v14 or later runs the runner loop in its own code: the
+host's runner process loads the library and calls its C entry point
+`ocs_plugin_run` (emitted by `export_plugin!`) with the socket name, and the
+plugin talks to the host over IPC from there. No Rust type crosses the library
+boundary, so **the plugin's compiler and codec commit no longer have to match
+the host's**, and `plugin.toml` needs neither `rustc_version` nor
+`acadrust_source`.
+
+What both sides still share is the shape of the codec types they exchange.
+The host passes its fingerprint of those shapes (`version_info::wire_schema`,
+a hash of the embedded type registry) to the runner in `OCS_WIRE_SCHEMA`; a
+plugin whose own fingerprint differs stops with a message naming both. Codec
+commits that do not change those shapes, which is most of them, leave a
+plugin working. Rebuild against a newer `ocs_plugin_api` when the message
+says so.
+
+The gates below apply to API v4 to v13 plugins only.
+
+### Build-time ABI metadata (API v4 to v13)
+
+For API v4 to v13 the host records two pieces of build-time metadata that
 affect whether a prebuilt plugin can safely be loaded:
 
 - `acadrust_source` — the exact git source of the `opencadcodec` crate the host was
@@ -150,11 +170,12 @@ concrete types:
 
 | Category | Methods |
 |----------|---------|
-| Document | `document()` / `document_mut()` return a **local cached copy** of the document (API v3); the first access in a dispatch clones the full `CadDocument` over IPC. Use `add_entity()` / `write_record()` for host-visible mutations. `add_entity()`, `bump_geometry()` |
+| Document | `document()` / `document_mut()` return a **local cached copy** of the document (API v3); the first access in a dispatch clones the full `Document` over IPC. Use `add_entity()` / `write_record()` for host-visible mutations. `add_entity()`, `bump_geometry()` |
+| Query (V14) | `query_entities(json)` returns one page (`EntityPage { entities, count, next_offset }`) of the entities matching a control-API `query` filter: `layer` with `*`/`?` wildcards, `type`, `bounds`, `xdata_app`, `where`, `offset`/`limit`. One IPC message carries at most 64 MiB, so size pages and write batches below it. |
 | XDATA | `read_record(handle, app)`, `write_record(handle, record)`, `remove_record(handle, app)` — keyed by entity handle; `write_record` registers the APPID so data round-trips through DWG/DXF |
 | Tab state | object-safe `plugin_state_any*` helpers exist for in-process use; out-of-process plugins should keep state inside the plugin crate because `dyn Any` is not serializable |
 | Command line | `push_info`, `push_output`, `push_error` |
-| Undo / dirty | `push_undo`, `set_dirty` |
+| Undo / dirty | `push_undo`, `set_dirty`; `begin_undo_group(label)` / `end_undo_group()` (V14) make one undo step of edits spread over several messages, worker-thread writes included |
 | Tab | `tab_index()` |
 | Document identity (V5) | `document_path(tab_id)` returns the saved path for a document tab. |
 | Notifications (V4) | `on_notification` receives `HostNotification::SelectionChangedV4 { tab_id, handles }` when the active tab's selection changes, plus `DocumentChangedV4` / `DocumentTabClosed`. |
@@ -243,14 +264,14 @@ version = "0.1.0"
 description = "…"
 
 [opencad]
-api_version = 5
+api_version = 14
 ribbon_order = 50
 command_prefixes = ["EX_"]
 xdata_apps = []
-# Both are filled at release-build time; see the CI step below.
-rustc_version = "rustc 1.98.0 (hash date)"
-acadrust_source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=<short>#<full-40-char-commit>"
 ```
+
+(API v4 to v13 plugins also declare `rustc_version` and `acadrust_source`,
+filled at release-build time.)
 
 The full, buildable scaffold is in [`docs/plugin-template/`](plugin-template);
 the live reference is the
@@ -657,8 +678,14 @@ dynamic libraries:
 - **Enable/disable** — toggles a loaded plugin's ribbon tab + dispatch without
   uninstalling.
 
-One linked repository is one marketplace entry. Publish separate plugins from
-separate repositories so release and update histories stay unambiguous.
+One linked repository is one marketplace entry. A release can carry more
+plugins than its own: every `<anything>-<platform>.zip` asset (e.g.
+`open-infra-civiel-windows-x86_64.zip`) is a bundle holding one `plugin.toml`
+plus library per plugin, at the zip's root or in one folder per plugin, and
+*Install* installs them along with the release's own library and
+`plugin.toml`. Each plugin keeps its own id, version and API check, and gets
+its own entry under the installed plugins. The release's own `plugin.toml`
+asset is what the release list reads, so keep it on every release.
 
 ---
 
@@ -700,7 +727,7 @@ Done:
 
 Next:
 
-- [ ] Incremental document snapshots instead of cloning `CadDocument` over IPC.
+- [ ] Incremental document snapshots instead of cloning `Document` over IPC.
 - [ ] `#[repr(C)]` vtable / strict handshake for cross-toolchain binaries.
 - [ ] Trust: checksums / signatures before spawning plugin processes.
 - [ ] Interchange (LandXML / SWMM) and live `on_entity_committed` hooks.

@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
 use codec::types::{Color as AcadColor, LineWeight, Transform, Vector3};
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 use kernel::space::{Plane as KernelPlane, Vec3 as KernelVec3};
 
 use crate::scene::convert::tessellate;
@@ -73,6 +73,9 @@ pub struct LocalWire {
     /// equals the sub-entity's resolved colour. For colour-split MTEXT
     /// (`\C`/`\c` inline overrides) each wire carries its own override colour.
     pub color: [f32; 4],
+    /// True when the source entity's own layer is locked. This is applied
+    /// after ByBlock and layer-0 inheritance are resolved at expansion time.
+    pub layer_locked: bool,
     pub contrast_bg: Option<[f32; 4]>,
     pub preserve_color: bool,
     pub canvas_color: bool,
@@ -135,6 +138,8 @@ pub struct NestedRef {
     pub instance_offsets: Vec<[f64; 3]>,
     pub plot_visible: bool,
     pub plot_l0: bool,
+    /// True when this nested INSERT is itself on a locked layer.
+    pub layer_locked: bool,
     /// XCLIP boundary for this nested insert, in the parent defn's local frame
     /// (`None` = unclipped). Baked at build time because the clip's spatial
     /// filter lives in `doc.objects`, which isn't reachable at expand time; on
@@ -261,7 +266,7 @@ impl BlockCache {
     /// Build definitions referenced by block-backed entities. Space records stay
     /// roots so their direct entities preserve individual selection handles.
     pub fn build(
-        doc: &CadDocument,
+        doc: &Document,
         anno_scale: f32,
         annotation_scale_handle: Option<Handle>,
         all_visible: bool,
@@ -318,7 +323,7 @@ impl BlockCache {
     /// Build a small cache rooted at one block. Used only when a synthetic or
     /// newly-added Insert is not present in the resident cache yet.
     pub fn build_for_block(
-        doc: &CadDocument,
+        doc: &Document,
         block_name: &str,
         anno_scale: f32,
         annotation_scale_handle: Option<Handle>,
@@ -460,7 +465,7 @@ impl BlockCache {
     }
 }
 
-fn block_object_names(doc: &CadDocument, entity: &EntityType, anno_scale: f32) -> Vec<String> {
+fn block_object_names(doc: &Document, entity: &EntityType, anno_scale: f32) -> Vec<String> {
     crate::scene::render_graph::entity_render_block_uses(doc, entity, anno_scale)
         .into_iter()
         .filter(|block_use| !block_use.block.is_null())
@@ -469,7 +474,7 @@ fn block_object_names(doc: &CadDocument, entity: &EntityType, anno_scale: f32) -
 }
 
 /// Collect block definitions needed by rendered representations.
-fn collect_referenced_blocks(doc: &CadDocument, anno_scale: f32) -> Vec<String> {
+fn collect_referenced_blocks(doc: &Document, anno_scale: f32) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::default();
     let mut queue: Vec<String> = Vec::new();
 
@@ -498,7 +503,7 @@ fn collect_referenced_blocks(doc: &CadDocument, anno_scale: f32) -> Vec<String> 
     seen.into_iter().collect()
 }
 
-fn referenced_block_tree(doc: &CadDocument, root: &str, anno_scale: f32) -> Vec<String> {
+fn referenced_block_tree(doc: &Document, root: &str, anno_scale: f32) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::default();
     let mut queue = vec![root.to_string()];
     seen.insert(root.to_string());
@@ -535,7 +540,7 @@ fn nested_attachment_transform(nref: &NestedRef, offset: [f64; 3]) -> Transform 
 }
 
 fn build_defn(
-    doc: &CadDocument,
+    doc: &Document,
     block_name: &str,
     anno_scale: f32,
     annotation_scale_handle: Option<Handle>,
@@ -576,7 +581,15 @@ fn build_defn(
         // leaves its members to the insert's layer. The defn cache is rebuilt on
         // every layer off/freeze toggle (bump_geometry bumps block_epoch), so
         // baking the visibility here stays in sync.
-        if crate::scene::render_graph::block_member_layer_hidden(doc, &entity.common().layer) {
+        // The defn cache is space-shared: a session LAYWALK never enters
+        // here (`None`), so one walked space cannot bake its hides into the
+        // block definitions every other space draws. Graph walks apply the
+        // walk per instance instead.
+        if crate::scene::render_graph::block_member_layer_hidden(
+            doc,
+            &entity.common().layer,
+            None,
+        ) {
             continue;
         }
         // Annotative scale representation: bake only the current scale's copy
@@ -687,7 +700,7 @@ fn inline_wire_point_cost(wire: &LocalWire) -> Option<usize> {
 fn build_nested_ref(
     nested_ins: &codec::entities::Insert,
     scale_policy: crate::scene::BlockScalePolicy,
-    doc: &CadDocument,
+    doc: &Document,
     anno_scale: f32,
     bg_color: [f32; 4],
     viewport: Option<Handle>,
@@ -730,6 +743,10 @@ fn build_nested_ref(
         instance_offsets: crate::scene::render_graph::array_offsets(nested_ins),
         plot_visible,
         plot_l0,
+        layer_locked: crate::scene::view::render::layer_locked(
+            doc,
+            &EntityType::Insert(nested_ins.clone()),
+        ),
         clip_poly,
         local_rank: depth_map
             .get(&nested_ins.common.handle.value())
@@ -739,7 +756,7 @@ fn build_nested_ref(
 }
 
 fn tessellate_sub_local(
-    doc: &CadDocument,
+    doc: &Document,
     sub: &EntityType,
     anno_scale: f32,
     annotation_scale_handle: Option<Handle>,
@@ -766,6 +783,7 @@ fn tessellate_sub_local(
     let _ = bg_color;
 
     let has_book_color = crate::scene::view::render::has_resolved_book_color(doc, sub);
+    let layer_locked = crate::scene::view::render::layer_locked(doc, sub);
     let color_is_byblock = !has_book_color && sub.common().color == AcadColor::ByBlock;
     let lt_is_byblock = sub.common().linetype.eq_ignore_ascii_case("byblock");
     let lw_is_byblock = matches!(sub.common().line_weight, LineWeight::ByBlock);
@@ -905,6 +923,7 @@ fn tessellate_sub_local(
             pick_tris: wire.pick_tris,
             pick_tris_low: wire.pick_tris_low,
             color: wire.color,
+            layer_locked,
             contrast_bg,
             preserve_color,
             canvas_color,
@@ -1029,7 +1048,7 @@ pub fn aabb_disjoint_xy(a: [f32; 4], b: [f32; 4]) -> bool {
 /// Returns `None` if no defn is cached for `ins.block_name`. Returns
 /// `Some(empty)` if the defn exists but is empty.
 pub fn expand_insert(
-    doc: &CadDocument,
+    doc: &Document,
     cache: &BlockCache,
     ins: &codec::entities::Insert,
     ins_handle: Handle,
@@ -1100,6 +1119,10 @@ pub fn expand_insert(
                 bg_color,
                 anno_scale,
                 suppress_root_points,
+                crate::scene::view::render::layer_locked(
+                    doc,
+                    &EntityType::Insert(ins.clone()),
+                ),
             ))
         } else {
             None
@@ -1204,6 +1227,10 @@ pub fn expand_insert(
         world_per_pixel: None,
         is_xref,
         bg_color,
+        insert_layer_locked: crate::scene::view::render::layer_locked(
+            doc,
+            &EntityType::Insert(ins.clone()),
+        ),
     };
     if offsets.len() > 1 {
         let first_xform = cell_xform(&offsets[0]);
@@ -1313,6 +1340,7 @@ fn expansion_prototype_key(
     bg_color: [f32; 4],
     anno_scale: f32,
     suppress_root_points: bool,
+    insert_layer_locked: bool,
 ) -> ExpansionPrototypeKey {
     let matrix = &transform.matrix.m;
     let linear = [
@@ -1336,6 +1364,7 @@ fn expansion_prototype_key(
     insert_style.extend(ins_layer.pat.map(f32::to_bits));
     insert_style.push(ins_layer.lw_px.to_bits());
     insert_style.push(ins_layer_plottable as u32);
+    insert_style.push(insert_layer_locked as u32);
     insert_style.push(pslt_factor.to_bits());
     insert_style.extend(bg_color.map(f32::to_bits));
     insert_style.push(anno_scale.to_bits());
@@ -1488,6 +1517,8 @@ struct ExpandCtx<'a> {
     // which geometry comes from an external reference.
     is_xref: bool,
     bg_color: [f32; 4],
+    /// True when the current INSERT is on a locked layer.
+    insert_layer_locked: bool,
 }
 
 fn nested_prototype_key(
@@ -1520,6 +1551,7 @@ fn nested_prototype_key(
     style.push(ctx.l0.lw_px.to_bits());
     style.push(ctx.l0_plottable as u32);
     style.push(ctx.plot_visible as u32);
+    style.push(ctx.insert_layer_locked as u32);
     style.push(ctx.pslt_factor.to_bits());
     style.extend(ctx.bg_color.map(f32::to_bits));
     NestedPrototypeKey {
@@ -2054,6 +2086,7 @@ fn expand_defn(
                     world_per_pixel: ctx.world_per_pixel,
                     is_xref: ctx.is_xref,
                     bg_color: ctx.bg_color,
+                    insert_layer_locked: ctx.insert_layer_locked || nref.layer_locked,
                 };
                 for offset in &nref.instance_offsets {
                     let attachment_transform =
@@ -2301,10 +2334,18 @@ fn resolve_wire_color(lw: &LocalWire, ctx: &ExpandCtx) -> [f32; 4] {
         };
     }
     if ctx.is_xref && !ctx.selected {
-        xref_fade(color, ctx.bg_color)
-    } else {
-        color
+        color = xref_fade(color, ctx.bg_color);
     }
+    // ByBlock and layer-0 colours may already inherit the faded INSERT style.
+    // Do not fade those a second time; an explicitly coloured child still
+    // needs the current INSERT-layer fade applied here.
+    let inherited_color = lw.color_is_byblock || lw.color_l0;
+    if !ctx.selected
+        && (lw.layer_locked || (ctx.insert_layer_locked && !inherited_color))
+    {
+        color = fade_toward_bg(color, ctx.bg_color);
+    }
+    color
 }
 
 /// Effective linetype scale along this wire after an INSERT transform.
@@ -3087,6 +3128,7 @@ fn emit_wire(
                 uv: tv.uv,
                 color: [rgb[0], rgb[1], rgb[2], final_color[3]],
                 draw_depth: tv.draw_depth,
+                pen: tv.pen,
             });
     }
     // Searchable runs follow the same insert transform: origin via the full
@@ -3304,6 +3346,7 @@ mod bg_resolution_tests {
             uv: [0.0; 2],
             color,
             draw_depth: 0.0,
+            pen: 0.0,
         }];
         e
     }
@@ -3391,7 +3434,7 @@ mod compact_nested_tests {
     use codec::entities::{Insert, Line};
     use codec::tables::BlockRecord;
 
-    fn add_block(document: &mut CadDocument, name: &str) -> Handle {
+    fn add_block(document: &mut Document, name: &str) -> Handle {
         let mut block = BlockRecord::new(name);
         block.handle = document.allocate_handle();
         let handle = block.handle;
@@ -3399,14 +3442,14 @@ mod compact_nested_tests {
         handle
     }
 
-    fn add_owned(document: &mut CadDocument, owner: Handle, mut entity: EntityType) {
+    fn add_owned(document: &mut Document, owner: Handle, mut entity: EntityType) {
         entity.common_mut().owner_handle = owner;
         document.add_entity(entity).unwrap();
     }
 
     #[test]
     fn repeated_small_nested_lines_fold_into_parent_batches() {
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let leaf = add_block(&mut document, "LEAF");
         for y in 0..6 {
             add_owned(
@@ -3499,7 +3542,7 @@ mod compact_nested_tests {
         use codec::entities::{LwPolyline, LwVertex};
         use codec::types::Vector2;
 
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let arrow = add_block(&mut document, "FLE");
         let mut tip = LwPolyline::new();
         let mut start = LwVertex::new(Vector2::new(0.0, 0.0));
@@ -3658,7 +3701,7 @@ mod metrics_depth_tests {
     use codec::entities::{Insert, Line};
     use codec::tables::BlockRecord;
 
-    fn add_block(document: &mut CadDocument, name: &str) -> Handle {
+    fn add_block(document: &mut Document, name: &str) -> Handle {
         let mut block = BlockRecord::new(name);
         block.handle = document.allocate_handle();
         let handle = block.handle;
@@ -3666,7 +3709,7 @@ mod metrics_depth_tests {
         handle
     }
 
-    fn add_owned(document: &mut CadDocument, owner: Handle, mut entity: EntityType) {
+    fn add_owned(document: &mut Document, owner: Handle, mut entity: EntityType) {
         entity.common_mut().owner_handle = owner;
         document.add_entity(entity).unwrap();
     }
@@ -3679,7 +3722,7 @@ mod metrics_depth_tests {
     #[test]
     fn a_deep_insert_chain_computes_metrics_without_overflowing_the_stack() {
         const DEPTH: usize = 20_000;
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let mut prev = add_block(&mut document, "B0");
         for i in 1..=DEPTH {
             let cur = add_block(&mut document, &format!("B{i}"));
@@ -3725,7 +3768,7 @@ mod metrics_depth_tests {
     #[test]
     fn metrics_below_the_depth_cap_are_still_fully_aggregated() {
         const DEPTH: usize = 10;
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let mut prev = add_block(&mut document, "B0");
         for i in 1..=DEPTH {
             let cur = add_block(&mut document, &format!("B{i}"));
@@ -3770,7 +3813,7 @@ mod metrics_depth_tests {
     fn locked_cyclic_block_document_renders_without_hanging_and_warns_once() {
         // Document built in code with pre-existing cycle:
         // A contains B, B contains A
-        let mut document = CadDocument::new();
+        let mut document = Document::new();
         let blk_a = add_block(&mut document, "CYC_A");
         let blk_b = add_block(&mut document, "CYC_B");
 

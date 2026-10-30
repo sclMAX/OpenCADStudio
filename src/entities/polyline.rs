@@ -38,7 +38,7 @@ fn tessellate_polyline(pl: &Polyline) -> RenderEntity {
 }
 
 impl RenderConvertible for Polyline {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
         Some(tessellate_polyline(self))
     }
 }
@@ -500,7 +500,7 @@ fn centerline_metadata_2d(
 }
 
 impl RenderConvertible for Polyline2D {
-    fn to_render(&self, document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
         let mut render = tessellate_polyline2d(self, document.header.fill_mode);
         // Arc segments offer their centres and quadrants.
         if self.vertices.iter().any(|v| v.bulge != 0.0) {
@@ -1098,7 +1098,7 @@ fn tessellate_polyline3d(pl: &Polyline3D) -> RenderEntity {
 }
 
 impl RenderConvertible for Polyline3D {
-    fn to_render(&self, _document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, _document: &codec::Document) -> Option<RenderEntity> {
         Some(tessellate_polyline3d(self))
     }
 }

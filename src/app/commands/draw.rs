@@ -756,7 +756,11 @@ impl OpenCADStudio {
                     glam::DVec3::from_array(storage.y_axis),
                 );
                 let sources_started = crate::perf::enabled().then(iced::time::Instant::now);
-                let boundary_sources = self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
+                let mut boundary_sources =
+                    self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
+                self.tabs[i]
+                    .scene
+                    .retain_sources_on_screen(&mut boundary_sources, plane);
                 let sources_ms = crate::perf::elapsed_ms(sources_started);
                 let (source_count, segment_count, curve_count) = if perf_hatch {
                     (
@@ -855,9 +859,12 @@ impl OpenCADStudio {
 
             "GRADIENT" => {
                 use crate::modules::draw::draw::hatch::GradientCommand;
-                let boundary_sources = self.tabs[i]
+                let plane = crate::command::WorkingPlane::default();
+                let mut boundary_sources =
+                    self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
+                self.tabs[i]
                     .scene
-                    .boundary_sources_on_plane(crate::command::WorkingPlane::default(), 1.0e-6);
+                    .retain_sources_on_screen(&mut boundary_sources, plane);
                 let new_cmd = GradientCommand::new(boundary_sources)
                     .with_gap_tolerance(self.hatch_gap_tolerance);
                 self.command_line.push_info(&new_cmd.prompt());
@@ -871,7 +878,8 @@ impl OpenCADStudio {
                 } else {
                     crate::command::WorkingPlane::default()
                 };
-                let sources = self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
+                let mut sources = self.tabs[i].scene.boundary_sources_on_plane(plane, 1.0e-6);
+                self.tabs[i].scene.retain_sources_on_screen(&mut sources, plane);
                 let selected = self.tabs[i]
                     .scene
                     .selected_entities()
@@ -1049,6 +1057,45 @@ impl OpenCADStudio {
                 }
             }
 
+            "DCDISPLAY" => {
+                use crate::command::ValuePromptCommand;
+                use crate::modules::draw::select::SelectObjectsCommand;
+                if self.tabs[i].scene.selected_handles_in_order().is_empty() {
+                    let sel = SelectObjectsCommand::new(cmd);
+                    self.command_line.push_info(&sel.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(sel));
+                } else {
+                    let c = ValuePromptCommand::new(
+                        "DCDISPLAY",
+                        "DCDISPLAY  Enter an option [Show/Hide] <Show>:",
+                    );
+                    self.command_line.push_info(&c.prompt());
+                    self.tabs[i].active_cmd = Some(Box::new(c));
+                }
+            }
+
+            cmd if cmd.starts_with("DCDISPLAY ") => {
+                let visible = match cmd["DCDISPLAY ".len()..].trim().to_ascii_uppercase().as_str() {
+                    "" | "S" | "SHOW" => true,
+                    "H" | "HIDE" => false,
+                    _ => {
+                        self.command_line
+                            .push_error(crate::t!("Usage: DCDISPLAY [Show|Hide]").as_ref());
+                        return Some(self.finish_dispatch(cmd));
+                    }
+                };
+                let handles = self.tabs[i].scene.selected_handles_in_order();
+                let scope = self.tabs[i].current_parametric_scope();
+                let count = self.tabs[i].scene.set_parametric_constraint_visibility(
+                    scope,
+                    Some(&handles),
+                    true,
+                    visible,
+                );
+                self.command_line
+                    .push_output(crate::tf!("{} constraint indicator(s) updated.", count).as_ref());
+            }
+
             "GCRESET" => {
                 let scope = self.tabs[i].current_parametric_scope();
                 let count = self.tabs[i]
@@ -1086,7 +1133,7 @@ impl OpenCADStudio {
                     visible,
                 );
                 self.command_line
-                    .push_output(format!("{} constraint indicator(s) updated.", count).as_str());
+                    .push_output(crate::tf!("{} constraint indicator(s) updated.", count).as_ref());
             }
 
             "DELCONSTRAINT" => {
@@ -2744,7 +2791,11 @@ impl OpenCADStudio {
                 } else {
                     height
                 };
-                let new_cmd = MTextCommand::with_defaults(height, style);
+                let annotative = crate::scene::annotative::text_style_is_annotative(
+                    &self.tabs[i].scene.document,
+                    &style,
+                );
+                let new_cmd = MTextCommand::with_defaults(height, style).with_annotative(annotative);
                 self.command_line.push_info(&new_cmd.prompt());
                 self.tabs[i].active_cmd = Some(Box::new(new_cmd));
             }

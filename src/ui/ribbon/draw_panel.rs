@@ -181,6 +181,55 @@ const IMPORT_TOOLS: &[Tool] = &[icon_tool(
 )];
 const IMPORT_PANEL_ID: &str = "import_extension";
 
+/// Annotate > Text slide-out: Scale, then the text layer list (drawn by
+/// `text_overlay`).
+const TEXT_TOOLS: &[Tool] = &[icon_tool(
+    "SCALETEXT",
+    "Scale",
+    include_bytes!("../../../assets/icons/scale.svg"),
+)];
+pub(super) const TEXT_PANEL_ID: &str = "text_extension";
+
+/// Annotate > Dimensions slide-out, its tools named beside their icons.
+const DIMENSION_TOOLS: &[Tool] = &[
+    icon_tool(
+        "TOLERANCE",
+        "Tolerance",
+        include_bytes!("../../../assets/icons/tolerance.svg"),
+    ),
+    icon_tool(
+        "DIMEDIT;O",
+        "Oblique",
+        include_bytes!("../../../assets/icons/dim_edit.svg"),
+    ),
+    icon_tool(
+        "DIMTEDIT_ANGLE",
+        "Text Angle",
+        include_bytes!("../../../assets/icons/dim_tedit.svg"),
+    ),
+    icon_tool(
+        "DIMTEDIT_LEFT",
+        "Left Justify",
+        include_bytes!("../../../assets/icons/align_left.svg"),
+    ),
+    icon_tool(
+        "DIMTEDIT_CENTER",
+        "Center Justify",
+        include_bytes!("../../../assets/icons/align_hcenter.svg"),
+    ),
+    icon_tool(
+        "DIMTEDIT_RIGHT",
+        "Right Justify",
+        include_bytes!("../../../assets/icons/align_right.svg"),
+    ),
+    icon_tool(
+        "DIMOVERRIDE",
+        "Override",
+        include_bytes!("../../../assets/icons/dim_style.svg"),
+    ),
+];
+pub(super) const DIMENSIONS_PANEL_ID: &str = "dimensions_extension";
+
 const PANELS: &[Panel] = &[
     Panel {
         id: PANEL_ID,
@@ -223,6 +272,20 @@ const PANELS: &[Panel] = &[
         title_id: "import_extension_title",
         title: "Import",
         tools: IMPORT_TOOLS,
+    },
+    Panel {
+        id: TEXT_PANEL_ID,
+        anchor: Some("ANNOTATE_TEXT"),
+        title_id: "text_extension_title",
+        title: "Text",
+        tools: TEXT_TOOLS,
+    },
+    Panel {
+        id: DIMENSIONS_PANEL_ID,
+        anchor: Some("DIM"),
+        title_id: "dimensions_extension_title",
+        title: "Dimensions",
+        tools: DIMENSION_TOOLS,
     },
 ];
 
@@ -327,7 +390,17 @@ pub(super) fn group_title<'a>(
             || format!("title:{title}"),
             text(t!(title)).size(9).style(muted_text_style),
         );
-        return container(label).padding([1, 4]).into();
+        let label: Element<'a, Message> = container(label).padding([1, 4]).into();
+        // Leaders has no slide-out, only the corner arrow to its style.
+        if title == "Leaders" && group_ids.contains(&"MLEADER") {
+            let launcher = corner_launcher(
+                Message::Command("MLEADERSTYLE".to_string()),
+                format!("{}\n{} MLEADERSTYLE", t!("Multileader Style"), t!("Command:")),
+                keytips::LEADER_LAUNCHER,
+            );
+            return row![label, launcher].spacing(6).align_y(iced::Center).into();
+        }
+        return label;
     };
     let expanded = open.as_deref().and_then(parent_panel) == Some(panel.id);
     // A command running from the closed slide-out lights its title, the way a
@@ -360,11 +433,39 @@ pub(super) fn group_title<'a>(
         .padding([1, 4]),
     )
     .into();
-    if panel.id != REFERENCE_PANEL_ID {
-        return title_button;
-    }
-    // The corner arrow opens the External References palette, or closes it
-    // when it is open.
+    // The corner arrow opens the External References palette (or closes
+    // it when it is open), or the Text Style window.
+    let (on_press, tip, anchor) = match panel.id {
+        REFERENCE_PANEL_ID => (
+            Message::ToggleXrefManager,
+            format!("{}\n{} EXTERNALREFERENCES", t!("External References"), t!("Command:")),
+            keytips::XREF_LAUNCHER,
+        ),
+        TEXT_PANEL_ID => (
+            Message::Command("STYLE".to_string()),
+            format!("{}\n{} STYLE", t!("Text Style"), t!("Command:")),
+            keytips::TEXT_LAUNCHER,
+        ),
+        DIMENSIONS_PANEL_ID => (
+            Message::Command("DIMSTYLE".to_string()),
+            format!("{}\n{} DIMSTYLE", t!("Dimension Style"), t!("Command:")),
+            keytips::DIMENSION_LAUNCHER,
+        ),
+        _ => return title_button,
+    };
+    let launcher = corner_launcher(on_press, tip, anchor);
+    row![title_button, launcher]
+        .spacing(6)
+        .align_y(iced::Center)
+        .into()
+}
+
+/// A panel's corner arrow running `on_press`.
+fn corner_launcher<'a>(
+    on_press: Message,
+    tip: String,
+    anchor: &'static str,
+) -> Element<'a, Message> {
     let launcher = tooltip(
         // A right arrow turned to point into the corner.
         button(
@@ -376,24 +477,16 @@ pub(super) fn group_title<'a>(
                     color: Some(theme.palette().background.base.text),
                 }),
         )
-        .on_press(Message::ToggleXrefManager)
+        .on_press(on_press)
         .style(move |theme: &Theme, status| tool_btn_style(theme, false, status))
         .padding([0, 3]),
-        make_tip(format!(
-            "{}\n{} EXTERNALREFERENCES",
-            t!("External References"),
-            t!("Command:")
-        )),
+        make_tip(tip),
         tooltip::Position::Bottom,
     )
     .delay(Duration::from_millis(400))
     .style(tip_style);
     // Shrink-sized: a Fill here would make the panel claim the whole row.
-    let launcher = keytips::anchor(keytips::XREF_LAUNCHER, launcher);
-    row![title_button, launcher]
-        .spacing(6)
-        .align_y(iced::Center)
-        .into()
+    keytips::anchor(anchor, launcher)
 }
 
 fn tool_button(tool: &Tool, active: bool, panel_id: &'static str) -> Element<'static, Message> {
@@ -512,6 +605,80 @@ fn reference_overlay<'a>(ribbon: &Ribbon, panel: Panel, win: (f32, f32)) -> Elem
     dropdown_backdrop(position_ribbon_dropdown(body.into(), false, left, top))
 }
 
+/// The Text slide-out: Scale, and the layer new text goes on (TEXTLAYER:
+/// Use Current, or a layer of the drawing).
+fn text_overlay<'a>(ribbon: &Ribbon, panel: Panel, win: (f32, f32)) -> Element<'a, Message> {
+    let width: f32 = 240.0_f32.min((win.0 - 8.0).max(120.0));
+    let (_, x, anchor_top) = ribbon.dd_anchor(panel.id, width, win.0);
+    let left = x.clamp(0.0, (win.0 - width).max(0.0));
+    let top = anchor_top.min((win.1 - 80.0).max(0.0));
+    let scale = labeled_row(panel.id, &panel.tools[0]);
+    let current = ribbon.text_layer.clone();
+    let entry = |value: String, label: String, color: Option<iced::Color>| {
+        let on = value.eq_ignore_ascii_case(&current);
+        let swatch: Element<'a, Message> = match color {
+            Some(color) => container(text(""))
+                .width(10)
+                .height(10)
+                .style(move |_: &Theme| container::Style {
+                    background: Some(color.into()),
+                    border: iced::Border {
+                        color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                        width: 1.0,
+                        radius: 2.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into(),
+            None => iced::widget::Space::new().width(10).height(10).into(),
+        };
+        let item: Element<'a, Message> =
+            button(row![swatch, text(label).size(11)].spacing(6).align_y(iced::Center))
+                .on_press(Message::RibbonTextLayer(value))
+                .style(move |theme: &Theme, status| {
+                    if on {
+                        tool_btn_style(theme, true, status)
+                    } else {
+                        popup_row_style(theme, status)
+                    }
+                })
+                .width(Fill)
+                .padding([3, 6])
+                .into();
+        item
+    };
+    let mut layers: Vec<Element<'a, Message>> =
+        vec![entry(String::new(), t!("Use Current").into_owned(), None)];
+    layers.extend(
+        ribbon
+            .layer_infos
+            .iter()
+            .map(|info| entry(info.name.clone(), info.name.clone(), Some(info.color))),
+    );
+    let list_height = ((ribbon.layer_infos.len() + 1) as f32 * 24.0).min(220.0);
+    let list = container(
+        scrollable(column(layers).spacing(1)).height(iced::Length::Fixed(list_height)),
+    )
+    .padding(2);
+    let layer_title = row![
+        make_icon(
+            IconKind::Svg(include_bytes!("../../../assets/icons/underlay_layers.svg")),
+            16.0
+        ),
+        text(t!("Text Layer")).size(11).style(muted_text_style),
+    ]
+    .spacing(6)
+    .align_y(iced::Center);
+    let body = container(column![scale, layer_title, list].spacing(4).padding(6))
+        .width(width)
+        .style(|theme: &Theme| {
+            let mut style = popup_panel_style(theme);
+            style.border.color = theme.palette().primary.base.color;
+            style
+        });
+    dropdown_backdrop(position_ribbon_dropdown(body.into(), false, left, top))
+}
+
 /// A slide-out listing each tool as icon and label, one per row.
 fn labeled_overlay<'a>(ribbon: &Ribbon, panel: Panel, win: (f32, f32)) -> Element<'a, Message> {
     let width: f32 = 200.0_f32.min((win.0 - 8.0).max(120.0));
@@ -561,8 +728,14 @@ pub(super) fn overlay<'a>(ribbon: &Ribbon, id: &str, win: (f32, f32)) -> Element
     if panel.id == REFERENCE_PANEL_ID {
         return reference_overlay(ribbon, panel, win);
     }
-    if panel.id == BLOCK_DEFINITION_PANEL_ID || panel.id == IMPORT_PANEL_ID {
+    if panel.id == BLOCK_DEFINITION_PANEL_ID
+        || panel.id == IMPORT_PANEL_ID
+        || panel.id == DIMENSIONS_PANEL_ID
+    {
         return labeled_overlay(ribbon, panel, win);
+    }
+    if panel.id == TEXT_PANEL_ID {
+        return text_overlay(ribbon, panel, win);
     }
     let tools = panel.tools;
     let width = (7.0 * (CELL + GAP) - GAP + 12.0).min((win.0 - 8.0).max(CELL + 12.0));

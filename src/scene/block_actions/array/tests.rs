@@ -6,7 +6,7 @@ fn setup(
     kind: distance::Kind,
     targets_per_action: usize,
     action_count: usize,
-) -> (CadDocument, Handle, Parameter, BlockArrayAction) {
+) -> (Document, Handle, Parameter, BlockArrayAction) {
     let (mut doc, definition, targets) = super::super::tests::fixture();
     let handle = distance::create(
         &mut doc,

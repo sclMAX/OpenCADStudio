@@ -22,6 +22,8 @@ pub enum FieldTarget {
     AttdefDefault,
     /// The Default of the Edit Attribute Definition dialog.
     AttdefEdit,
+    /// The field a text already shows, edited in place.
+    EditText(codec::Handle),
 }
 
 /// The categories the dialog offers, with their fields (only the ones the
@@ -463,6 +465,46 @@ pub const FORMULA_PRECISIONS: &[&str] = &[
     "0.00000000",
 ];
 
+/// Decimal separators of a number: list label and `%ds` character (the
+/// period is the default and writes none).
+pub const DECIMAL_SEPARATORS: &[(&str, char)] = &[("Period", '.'), ("Comma", ','), ("Space", ' ')];
+
+/// Thousands separators of a number: list label and `%th` character.
+pub const THOUSANDS_SEPARATORS: &[(&str, Option<char>)] = &[
+    ("None", None),
+    ("Comma", Some(',')),
+    ("Period", Some('.')),
+    ("Space", Some(' ')),
+];
+
+/// The coordinates a point property shows: list label and `%pt` bits (all
+/// three is the default and writes none).
+pub const COORDINATES: &[(&str, u8)] = &[("X, Y, Z", 7), ("X, Y", 3), ("X", 1), ("Y", 2), ("Z", 4)];
+
+/// Object properties that are points. A new field reads them the way the
+/// Properties palette does (`AcObjProp.16.2`), in the current UCS, as level
+/// marks do; a field opened from the drawing keeps the evaluator it has.
+pub const POINT_PROPERTIES: &[&str] = &[
+    "Center",
+    "EndPoint",
+    "InsertionPoint",
+    "Position",
+    "StartPoint",
+];
+
+/// Object properties whose value is text: they take a text case rather than
+/// a number format.
+pub const TEXT_PROPERTIES: &[&str] = &["Color", "EffectiveName", "Layer", "Linetype", "TextString"];
+
+/// The text between the brackets that follow `key` and its digits in a
+/// format picture (`%ct8[100]` → `100`).
+fn bracketed<'a>(picture: &'a str, key: &str) -> Option<&'a str> {
+    let after = &picture[picture.find(key)? + key.len()..];
+    let after = after.trim_start_matches(|c: char| c.is_ascii_digit());
+    let inner = after.strip_prefix('[')?;
+    Some(&inner[..inner.find(']')?])
+}
+
 pub fn kind_of(name: &str) -> FieldKind {
     match name {
         "CreateDate" | "Date" | "PlotDate" | "SaveDate" => FieldKind::Date,
@@ -506,10 +548,23 @@ pub struct FieldDialogState {
     pub object: Option<(codec::Handle, String)>,
     pub object_props: Vec<&'static str>,
     pub object_prop: Option<&'static str>,
+    /// Whether the object field opened from the drawing used the versioned
+    /// evaluator (`AcObjProp.16.2`); `None` for a new field.
+    pub object_versioned: Option<bool>,
     pub formula: String,
     /// Indexes into codec FORMULA_FORMATS and FORMULA_PRECISIONS.
     pub formula_format: usize,
     pub formula_precision: usize,
+    /// Additional format of a formula or object property: the conversion
+    /// factor (`%ct8[…]`, empty for none), the text around the value
+    /// (`%ps[prefix,suffix]`), indexes into DECIMAL_SEPARATORS and
+    /// THOUSANDS_SEPARATORS, and for a point the index into COORDINATES.
+    pub conversion: String,
+    pub prefix: String,
+    pub suffix: String,
+    pub decimal_separator: usize,
+    pub thousands_separator: usize,
+    pub coordinates: usize,
     pub hyperlink_text: String,
     pub hyperlink_url: String,
     /// Index into codec PLOT_SCALE_FORMATS.
@@ -562,9 +617,16 @@ impl FieldDialogState {
             object: None,
             object_props: Vec::new(),
             object_prop: None,
+            object_versioned: None,
             formula: String::new(),
             formula_format: 0,
             formula_precision: 0,
+            conversion: String::new(),
+            prefix: String::new(),
+            suffix: String::new(),
+            decimal_separator: 0,
+            thousands_separator: 0,
+            coordinates: 0,
             hyperlink_text: String::new(),
             hyperlink_url: String::new(),
             plot_scale: 0,
@@ -622,16 +684,9 @@ impl FieldDialogState {
                 vec![],
             ),
             FieldKind::Formula => {
-                let format = codec::fields::FORMULA_FORMATS
-                    .get(self.formula_format)
-                    .map_or("", |f| f.1);
-                let precision = match self.formula_precision {
-                    0 => String::new(),
-                    n => format!("%pr{}", n - 1),
-                };
                 let (formula, objects) = indexed_object_ids(self.formula.trim());
                 let body = format!("\\AcExpr ({formula})");
-                match format!("{format}{precision}") {
+                match self.number_picture() {
                     f if f.is_empty() => (body, objects),
                     f => (format!("{body} \\f \"{f}\""), objects),
                 }
@@ -719,13 +774,170 @@ impl FieldDialogState {
                 None => ("\\AcObjProp".into(), vec![]),
             },
             FieldKind::Object => match (&self.object, self.object_prop) {
-                (Some((handle, _)), Some(prop)) => (
-                    format!("\\AcObjProp Object(%<\\_ObjIdx 0>%).{prop}"),
-                    vec![*handle],
-                ),
+                (Some((handle, _)), Some(prop)) => {
+                    let versioned = self
+                        .object_versioned
+                        .unwrap_or_else(|| POINT_PROPERTIES.contains(&prop));
+                    let evaluator = if versioned {
+                        "AcObjProp.16.2"
+                    } else {
+                        "AcObjProp"
+                    };
+                    let body = format!("\\{evaluator} Object(%<\\_ObjIdx 0>%).{prop}");
+                    if TEXT_PROPERTIES.contains(&prop) {
+                        (case(body), vec![*handle])
+                    } else {
+                        match self.number_picture() {
+                            f if f.is_empty() => (body, vec![*handle]),
+                            f => (format!("{body} \\f \"{f}\""), vec![*handle]),
+                        }
+                    }
+                }
                 _ => ("\\AcObjProp".into(), vec![]),
             },
         }
+    }
+
+    /// Open on the field `code` a text already shows: its name and the
+    /// settings its code spells. An Object field returns the property it
+    /// reads, for the caller to match against the object's own list.
+    pub fn seed_from_code(&mut self, code: &str, objects: &[codec::Handle]) -> Option<String> {
+        let code = code.trim();
+        let (body, picture) = match code.find(" \\f \"") {
+            Some(at) => (code[..at].trim(), code[at + 4..].trim().trim_matches('"')),
+            None => (code, ""),
+        };
+        self.category = 0;
+        self.formula_format = codec::fields::FORMULA_FORMATS
+            .iter()
+            .position(|(_, format)| !format.is_empty() && picture.contains(format))
+            .unwrap_or(0);
+        let digits = |after: &str| -> Option<usize> {
+            let tail = picture.split(after).nth(1)?;
+            let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        };
+        self.formula_precision =
+            digits("%pr").map_or(0, |n| (n + 1).min(FORMULA_PRECISIONS.len() - 1));
+        if let Some(case) = digits("%tc") {
+            self.text_case = case;
+        }
+        let character = |key: &str| digits(key).and_then(|n| char::from_u32(n as u32));
+        if let Some(separator) = character("%ds") {
+            self.decimal_separator = DECIMAL_SEPARATORS
+                .iter()
+                .position(|(_, c)| *c == separator)
+                .unwrap_or(0);
+        }
+        if let Some(separator) = character("%th") {
+            self.thousands_separator = THOUSANDS_SEPARATORS
+                .iter()
+                .position(|(_, c)| *c == Some(separator))
+                .unwrap_or(0);
+        }
+        if let Some(bits) = digits("%pt") {
+            self.coordinates = COORDINATES
+                .iter()
+                .position(|(_, b)| usize::from(*b) == bits)
+                .unwrap_or(0);
+        }
+        if let Some(factor) = bracketed(picture, "%ct8") {
+            self.conversion = factor.trim().to_string();
+        }
+        if let Some(pair) = bracketed(picture, "%ps") {
+            let (prefix, suffix) = pair.split_once(',').unwrap_or((pair, ""));
+            self.prefix = prefix.to_string();
+            self.suffix = suffix.to_string();
+        }
+        let (evaluator, rest) = body.split_once(' ').unwrap_or((body, ""));
+        let rest = rest.trim();
+        if evaluator.starts_with("\\AcExpr") {
+            self.name = "Formula";
+            let inner = rest
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(rest);
+            self.formula = typed_object_ids(inner, objects);
+        } else if evaluator.starts_with("\\AcObjProp") {
+            let property = rest.rsplit_once(").").map(|(_, property)| property.trim())?;
+            if property == "Name" {
+                self.name = "NamedObject";
+                return None;
+            }
+            self.name = "Object";
+            self.object_versioned = Some(evaluator.starts_with("\\AcObjProp."));
+            return Some(property.to_string());
+        } else if evaluator == "\\AcDiesel" {
+            self.name = "DieselExpression";
+            self.diesel = rest.to_string();
+        } else if evaluator.starts_with("\\AcVar") {
+            let variable = rest.split_whitespace().next().unwrap_or("");
+            if let Some(name) = fields_of(0)
+                .into_iter()
+                .find(|name| name.eq_ignore_ascii_case(variable))
+            {
+                self.name = name;
+                if kind_of(name) == FieldKind::Date && !picture.is_empty() {
+                    self.date_format = picture.to_string();
+                }
+            } else if !variable.is_empty() {
+                self.name = "SystemVariable";
+                self.sysvar = variable.to_string();
+            }
+        }
+        None
+    }
+
+    /// The number format, precision and additional format picked for a
+    /// formula or an object property (`%lu2%pr3%ds44%ct8[0.0001]%ps[,m²]`),
+    /// empty for the drawing's own units.
+    fn number_picture(&self) -> String {
+        let mut picture = codec::fields::FORMULA_FORMATS
+            .get(self.formula_format)
+            .map_or("", |f| f.1)
+            .to_string();
+        let point = kind_of(self.name) == FieldKind::Object
+            && self
+                .object_prop
+                .is_some_and(|p| POINT_PROPERTIES.contains(&p));
+        if let Some((_, bits)) = COORDINATES
+            .get(self.coordinates)
+            .filter(|_| point && self.coordinates > 0)
+        {
+            picture.push_str(&format!("%pt{bits}"));
+        }
+        if self.formula_precision > 0 {
+            picture.push_str(&format!("%pr{}", self.formula_precision - 1));
+        }
+        if let Some((_, separator)) = DECIMAL_SEPARATORS
+            .get(self.decimal_separator)
+            .filter(|_| self.decimal_separator > 0)
+        {
+            picture.push_str(&format!("%ds{}", u32::from(*separator)));
+        }
+        if let Some((_, Some(separator))) = THOUSANDS_SEPARATORS.get(self.thousands_separator) {
+            picture.push_str(&format!("%th{}", u32::from(*separator)));
+        }
+        let factor = self.conversion.trim();
+        if factor.parse::<f64>().is_ok_and(|f| f != 1.0) {
+            picture.push_str(&format!("%ct8[{factor}]"));
+        }
+        // A comma ends the prefix and a bracket the pair; a quote would end
+        // the picture.
+        let prefix: String = self
+            .prefix
+            .chars()
+            .filter(|c| !",]\"".contains(*c))
+            .collect();
+        let suffix: String = self
+            .suffix
+            .chars()
+            .filter(|c| !"]\"".contains(*c))
+            .collect();
+        if !prefix.is_empty() || !suffix.is_empty() {
+            picture.push_str(&format!("%ps[{prefix},{suffix}]"));
+        }
+        picture
     }
 
     /// The field can be inserted (an object field needs its object and
@@ -745,6 +957,30 @@ impl FieldDialogState {
 
 /// Table references in a formula are typed as `%<\_ObjId HANDLE>%`; the stored
 /// code numbers them (`%<\_ObjIdx n>%`) and lists the objects.
+/// The stored, numbered object references of a formula (`%<\_ObjIdx 0>%`)
+/// back as the typed ones the dialog edits (`%<\_ObjId 2A>%`).
+fn typed_object_ids(formula: &str, objects: &[codec::Handle]) -> String {
+    let mut out = String::new();
+    let mut rest = formula;
+    while let Some(start) = rest.find("%<\\_ObjIdx ") {
+        let after = &rest[start + "%<\\_ObjIdx ".len()..];
+        let Some(end) = after.find(">%") else { break };
+        let Some(handle) = after[..end]
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| objects.get(index))
+        else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(&format!("%<\\_ObjId {:X}>%", handle.value()));
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn indexed_object_ids(formula: &str) -> (String, Vec<codec::Handle>) {
     let mut out = String::new();
     let mut objects: Vec<codec::Handle> = Vec::new();
@@ -772,17 +1008,28 @@ fn indexed_object_ids(formula: &str) -> (String, Vec<codec::Handle>) {
 }
 
 /// The geometric properties a field can show for an object of this type.
+/// Its own properties first, then the ones every object has.
 pub fn object_properties(entity: &codec::EntityType) -> Vec<&'static str> {
     use codec::EntityType as E;
-    match entity {
-        E::Line(_) => vec!["Center", "EndPoint", "Length", "StartPoint"],
-        E::Circle(_) => vec!["Area", "Center", "Circumference", "Diameter", "Radius"],
-        E::Arc(_) => vec!["Center", "Length", "Radius"],
-        E::Ellipse(_) => vec!["Area", "Center"],
-        E::LwPolyline(_) | E::Polyline2D(_) | E::Spline(_) => vec!["Area", "Length"],
-        E::Hatch(_) => vec!["Area"],
-        _ => vec![],
-    }
+    let own: &[&'static str] = match entity {
+        E::Line(_) => &["Center", "EndPoint", "Length", "StartPoint"],
+        E::Circle(_) => &["Area", "Center", "Circumference", "Diameter", "Radius"],
+        E::Arc(_) => &["Center", "Length", "Radius"],
+        E::Ellipse(_) => &["Area", "Center"],
+        E::LwPolyline(_) | E::Polyline2D(_) | E::Spline(_) => &["Area", "Length"],
+        E::Hatch(_) => &["Area"],
+        E::Insert(_) => &[
+            "EffectiveName",
+            "InsertionPoint",
+            "XScaleFactor",
+            "YScaleFactor",
+            "ZScaleFactor",
+        ],
+        E::Text(_) | E::MText(_) => &["InsertionPoint", "TextString"],
+        _ => &[],
+    };
+    let general: [&'static str; 4] = ["Color", "Layer", "Linetype", "LinetypeScale"];
+    own.iter().chain(general.iter()).copied().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -804,6 +1051,12 @@ pub enum FieldDialogMsg {
     Formula(String),
     FormulaFormat(usize),
     FormulaPrecision(usize),
+    Conversion(String),
+    Prefix(String),
+    Suffix(String),
+    DecimalSeparator(usize),
+    ThousandsSeparator(usize),
+    Coordinates(usize),
     Evaluate,
     /// Sum / Average / Count of a cell range, or one Cell, picked in a table.
     TableFunction(&'static str),
@@ -1057,50 +1310,7 @@ fn format_panel<'a>(state: &'a FieldDialogState) -> Element<'a, Message> {
         ]
         .spacing(8)
         .into(),
-        FieldKind::Formula => {
-            let formats: Vec<Pick> = codec::fields::FORMULA_FORMATS
-                .iter()
-                .enumerate()
-                .map(|(i, (n, _))| Pick(i, t!(*n).into_owned()))
-                .collect();
-            let precisions: Vec<Pick> = FORMULA_PRECISIONS
-                .iter()
-                .enumerate()
-                .map(|(i, n)| Pick(i, t!(*n).into_owned()))
-                .collect();
-            column![
-                row![
-                    text(t!("Format")).size(12).width(Length::Fixed(80.0)),
-                    pick_list(
-                        Some(formats[state.formula_format].clone()),
-                        formats.clone(),
-                        |p: &Pick| p.1.clone()
-                    )
-                    .on_select(|p| msg(FieldDialogMsg::FormulaFormat(p.0)))
-                    .text_size(12)
-                    .padding([5, 8])
-                    .width(Fill),
-                ]
-                .spacing(8)
-                .align_y(iced::Center),
-                row![
-                    text(t!("Precision")).size(12).width(Length::Fixed(80.0)),
-                    pick_list(
-                        Some(precisions[state.formula_precision].clone()),
-                        precisions.clone(),
-                        |p: &Pick| p.1.clone(),
-                    )
-                    .on_select(|p| msg(FieldDialogMsg::FormulaPrecision(p.0)))
-                    .text_size(12)
-                    .padding([5, 8])
-                    .width(Fill),
-                ]
-                .spacing(8)
-                .align_y(iced::Center),
-            ]
-            .spacing(8)
-            .into()
-        }
+        FieldKind::Formula => number_format_rows(state),
         FieldKind::Hyperlink => column![
             row![
                 text(t!("Text to display"))
@@ -1402,10 +1612,137 @@ fn format_panel<'a>(state: &'a FieldDialogState) -> Element<'a, Message> {
                     .collect(),
                 180.0,
             ),
+            if state
+                .object_prop
+                .is_some_and(|p| TEXT_PROPERTIES.contains(&p))
+            {
+                column![text(t!("Format")).size(12), case_list(state)]
+                    .spacing(8)
+                    .into()
+            } else {
+                number_format_rows(state)
+            },
         ]
         .spacing(8)
         .into(),
     }
+}
+
+/// Format and Precision of a number, for a formula or an object property,
+/// with its additional format and, for a point, the coordinates it shows.
+fn number_format_rows(state: &FieldDialogState) -> Element<'_, Message> {
+    const LABEL: f32 = 120.0;
+    let formats: Vec<Pick> = codec::fields::FORMULA_FORMATS
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| Pick(i, t!(*n).into_owned()))
+        .collect();
+    let precisions: Vec<Pick> = FORMULA_PRECISIONS
+        .iter()
+        .enumerate()
+        .map(|(i, n)| Pick(i, t!(*n).into_owned()))
+        .collect();
+    // "Comma (,)": the name and the character it writes.
+    let separator = |name: &str, c: char| match c {
+        ' ' => t!(name).into_owned(),
+        c => format!("{} ({c})", t!(name)),
+    };
+    let decimals: Vec<Pick> = DECIMAL_SEPARATORS
+        .iter()
+        .enumerate()
+        .map(|(i, (n, c))| Pick(i, separator(n, *c)))
+        .collect();
+    let thousands: Vec<Pick> = THOUSANDS_SEPARATORS
+        .iter()
+        .enumerate()
+        .map(|(i, (n, c))| {
+            Pick(
+                i,
+                c.map_or_else(|| t!(*n).into_owned(), |c| separator(n, c)),
+            )
+        })
+        .collect();
+    let choice = |label: &str, picks: Vec<Pick>, at: usize, on: fn(usize) -> FieldDialogMsg| {
+        row![
+            text(t!(label)).size(12).width(Length::Fixed(LABEL)),
+            pick_list(picks.get(at).cloned(), picks, |p: &Pick| p.1.clone())
+                .on_select(move |p| msg(on(p.0)))
+                .text_size(12)
+                .padding([5, 8])
+                .width(Fill),
+        ]
+        .spacing(8)
+        .align_y(iced::Center)
+    };
+    let entry = |label: &str, value: &str, on: fn(String) -> FieldDialogMsg| {
+        row![
+            text(t!(label)).size(12).width(Length::Fixed(LABEL)),
+            text_input("", value)
+                .size(12)
+                .padding([5, 8])
+                .style(field_style)
+                .on_input(move |v| msg(on(v))),
+        ]
+        .spacing(8)
+        .align_y(iced::Center)
+    };
+    let mut rows = column![
+        choice(
+            "Format",
+            formats,
+            state.formula_format,
+            FieldDialogMsg::FormulaFormat
+        ),
+        choice(
+            "Precision",
+            precisions,
+            state.formula_precision,
+            FieldDialogMsg::FormulaPrecision
+        ),
+    ]
+    .spacing(8);
+    let point = kind_of(state.name) == FieldKind::Object
+        && state
+            .object_prop
+            .is_some_and(|p| POINT_PROPERTIES.contains(&p));
+    if point {
+        let coordinates: Vec<Pick> = COORDINATES
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| Pick(i, (*n).to_string()))
+            .collect();
+        rows = rows.push(choice(
+            "Coordinates",
+            coordinates,
+            state.coordinates,
+            FieldDialogMsg::Coordinates,
+        ));
+    }
+    rows.push(
+        text(t!("Additional format").to_uppercase())
+            .size(10)
+            .style(accent_text),
+    )
+    .push(entry(
+        "Conversion factor",
+        &state.conversion,
+        FieldDialogMsg::Conversion,
+    ))
+    .push(entry("Prefix", &state.prefix, FieldDialogMsg::Prefix))
+    .push(entry("Suffix", &state.suffix, FieldDialogMsg::Suffix))
+    .push(choice(
+        "Decimal separator",
+        decimals,
+        state.decimal_separator,
+        FieldDialogMsg::DecimalSeparator,
+    ))
+    .push(choice(
+        "Thousands separator",
+        thousands,
+        state.thousands_separator,
+        FieldDialogMsg::ThousandsSeparator,
+    ))
+    .into()
 }
 
 pub fn view<'a>(
@@ -1577,4 +1914,115 @@ pub fn view<'a>(
     .padding([10, 12])
     .width(sizing.width)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FieldDialogState, FieldTarget};
+
+    /// Open `code` in the dialog as the edit of an existing field would, and
+    /// give back the code the dialog writes when nothing is changed.
+    fn reopened(code: &str, objects: &[codec::Handle], props: &[&'static str]) -> String {
+        let mut state = FieldDialogState::new(FieldTarget::NewText);
+        if let Some(property) = state.seed_from_code(code, objects) {
+            state.object = Some((objects[0], "Line".into()));
+            state.object_props = props.to_vec();
+            state.object_prop = props.iter().copied().find(|p| *p == property);
+        }
+        let (written, written_objects) = state.code();
+        assert_eq!(written_objects, objects);
+        written
+    }
+
+    #[test]
+    fn a_level_mark_keeps_its_ucs_coordinate_and_prefix() {
+        // A level mark: the end point's Y in the current UCS, after "+".
+        let code = "\\AcObjProp.16.2 Object(%<\\_ObjIdx 0>%).EndPoint \\f \"%lu6%pt2%ps[+,]\"";
+        let line = codec::Handle::new(0x2A);
+        let props = ["Center", "EndPoint", "Length", "StartPoint"];
+        assert_eq!(reopened(code, &[line], &props), code);
+    }
+
+    #[test]
+    fn a_formula_keeps_its_conversion_factor_and_separators() {
+        for code in [
+            // A door width in metres shown in centimetres.
+            "\\AcExpr (0.9*1) \\f \"%lu2%pr0%ct8[100]\"",
+            "\\AcExpr (1234.5) \\f \"%lu2%pr2%ds44%th46\"",
+            "\\AcExpr (74.08) \\f \"%lu2%pr1%ps[,m²]\"",
+        ] {
+            assert_eq!(reopened(code, &[], &[]), code);
+        }
+    }
+
+    #[test]
+    fn the_additional_format_goes_into_the_picture() {
+        let mut state = FieldDialogState::new(FieldTarget::NewText);
+        state.name = "Object";
+        state.object = Some((codec::Handle::new(0x2A), "Polyline".into()));
+        state.object_props = vec!["Area", "Length"];
+        state.object_prop = Some("Area");
+        state.formula_format = 2;
+        state.formula_precision = 3;
+        state.conversion = "0.0001".into();
+        // A comma would end the prefix; a bracket would end the pair.
+        state.prefix = "A,]".into();
+        state.suffix = " m²".into();
+        state.decimal_separator = 1;
+        state.thousands_separator = 2;
+        // Coordinates belong to points only.
+        state.coordinates = 3;
+        assert_eq!(
+            state.code().0,
+            "\\AcObjProp Object(%<\\_ObjIdx 0>%).Area \\f \"%lu2%pr2%ds44%th46%ct8[0.0001]%ps[A, m²]\""
+        );
+
+        // A text property takes a case instead of a number format.
+        state.object_prop = Some("Layer");
+        state.text_case = 1;
+        assert_eq!(
+            state.code().0,
+            "\\AcObjProp Object(%<\\_ObjIdx 0>%).Layer \\f \"%tc1\""
+        );
+        state.object_prop = Some("Area");
+        state.text_case = 0;
+
+        // A factor of one, or one that is not a number, converts nothing.
+        for factor in ["1", "abc", ""] {
+            state.conversion = factor.into();
+            assert!(!state.code().0.contains("%ct"), "{factor}");
+        }
+    }
+
+    #[test]
+    fn a_new_point_field_reads_the_current_ucs() {
+        let mut state = FieldDialogState::new(FieldTarget::NewText);
+        state.name = "Object";
+        state.object = Some((codec::Handle::new(0x2A), "Block reference".into()));
+        state.object_prop = Some("InsertionPoint");
+        assert!(state.code().0.starts_with("\\AcObjProp.16.2 "));
+        state.object_prop = Some("XScaleFactor");
+        assert!(state.code().0.starts_with("\\AcObjProp "));
+    }
+
+    #[test]
+    fn a_block_reference_offers_its_own_and_the_general_properties() {
+        use codec::entities::Insert;
+        use codec::types::Vector3;
+        let door = codec::EntityType::Insert(Insert::new("DOOR", Vector3::ZERO));
+        assert_eq!(
+            super::object_properties(&door),
+            [
+                "EffectiveName",
+                "InsertionPoint",
+                "XScaleFactor",
+                "YScaleFactor",
+                "ZScaleFactor",
+                "Color",
+                "Layer",
+                "Linetype",
+                "LinetypeScale",
+            ]
+        );
+    }
 }

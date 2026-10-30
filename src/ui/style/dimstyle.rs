@@ -104,6 +104,10 @@ pub struct DimStyleValues<'a> {
     pub dimltex2_name: String,
     // Dropdown option lists shared by the arrowhead / linetype fields.
     pub block_opts: Vec<String>,
+    /// The drawing's blocks a User Arrow can name.
+    pub user_arrow_blocks: Vec<String>,
+    /// The arrowhead field whose User Arrow block list is open.
+    pub user_arrow_field: Option<&'static str>,
     pub lt_opts: Vec<String>,
     pub text_style_opts: Vec<String>,
     pub text_style_fixed_height: Option<f64>,
@@ -703,6 +707,8 @@ pub fn view_window<'a>(
 
     // Block / linetype Handle dropdown: pick a block-record (arrowheads) or a
     // linetype by name from the available records.
+    let user_arrow_blocks = &vals.user_arrow_blocks;
+    let user_arrow_field = vals.user_arrow_field;
     let hrow = move |label: Cow<'static, str>,
                      options: Vec<String>,
                      selected: String,
@@ -710,6 +716,8 @@ pub fn view_window<'a>(
           -> Element<'a, Message> {
         let list: Element<'a, Message> = if vals.read_only {
             crate::ui::read_only::field(&selected, 11.0, Length::Fixed(150.0))
+        } else if user_arrow_field == Some(field) {
+            user_arrow_list(user_arrow_blocks.clone(), field)
         } else {
             iced::widget::pick_list(Some(selected), options, |value| value.to_string())
                 .on_select(move |value| Message::DsSetHandle { field, value })
@@ -733,7 +741,12 @@ pub fn view_window<'a>(
             iced::widget::pick_list(Some(selected.clone()), options, |value| value.to_string())
                 .text_size(11)
                 .width(150);
-        let list: Element<'a, Message> = if enabled && !vals.read_only {
+        let list: Element<'a, Message> = if enabled
+            && !vals.read_only
+            && user_arrow_field == Some(field)
+        {
+            user_arrow_list(user_arrow_blocks.clone(), field)
+        } else if enabled && !vals.read_only {
             list.on_select(move |value| Message::DsSetHandle { field, value })
                 .into()
         } else {
@@ -1434,6 +1447,7 @@ pub fn view_window<'a>(
         on_new: Message::DimStyleDialogNew,
         on_copy: Message::DimStyleDialogCopy,
         on_delete: Message::DimStyleDialogDelete,
+        on_import: Some(Message::StyleImportPick(crate::app::StyleKind::Dim)),
         on_select: Message::DimStyleDialogSelect,
         on_set_current: Message::DimStyleDialogSetCurrent,
         on_apply: Message::DimStyleDialogApply,
@@ -1462,4 +1476,14 @@ mod preview_arrow_tests {
         assert!(matches!(first, ArrowKind::Dot { .. }));
         assert!(matches!(second, ArrowKind::None));
     }
+}
+
+/// The drawing's blocks, offered once User Arrow… is picked for `field`.
+fn user_arrow_list<'a>(blocks: Vec<String>, field: &'static str) -> Element<'a, Message> {
+    iced::widget::pick_list(None::<String>, blocks, |value| value.to_string())
+        .placeholder(t!("Select Block").into_owned())
+        .on_select(move |value| Message::DsSetHandle { field, value })
+        .text_size(11)
+        .width(150)
+        .into()
 }

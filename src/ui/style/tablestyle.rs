@@ -737,6 +737,7 @@ pub fn view_window<'a>(
         on_new: Message::TableStyleDialogNew,
         on_copy: Message::TableStyleDialogCopy,
         on_delete: Message::TableStyleDialogDelete,
+        on_import: None,
         on_select: Message::TableStyleDialogSelect,
         on_set_current: Message::TableStyleDialogSetCurrent,
         on_apply: Message::TableStyleApply,

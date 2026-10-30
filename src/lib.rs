@@ -25,6 +25,8 @@ pub mod io;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod mcp_intent;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod mcp_ops;
 pub mod modules;
 #[cfg(not(target_arch = "wasm32"))]

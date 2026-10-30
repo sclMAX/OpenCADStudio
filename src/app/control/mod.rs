@@ -206,6 +206,7 @@ fn background_mutation(op: &str) -> bool {
             | "group_create"
             | "undo"
             | "redo"
+            | "save"
     )
 }
 
@@ -398,6 +399,9 @@ fn command_selection_policy(name: &str) -> &'static str {
         "COPY",
         "COPYCLIP",
         "CUTCLIP",
+        "DCDISPLAY",
+        "DIMDISASSOCIATE",
+        "DIMREASSOCIATE",
         "ERASE",
         "EXPLODE",
         "TXTEXP",
@@ -1251,6 +1255,7 @@ impl OpenCADStudio {
             "entities_create" => self.control_entities_create(req)?,
             "entities_delete" => self.control_entities_delete(req)?,
             "entities_transform" => self.control_entities_transform(req)?,
+            "node_graph" => self.control_node_graph(req)?,
             "entities_copy_to" => self.control_entities_copy_to(req)?,
             "text_replace" => self.control_text_replace(req)?,
             "xdata_set" => self.control_xdata_set(req)?,
@@ -1306,7 +1311,8 @@ impl OpenCADStudio {
                     ));
                 }
                 self.set_control_result(json!({
-                    "saved":path,"target_format":if is_dxf { "dxf" } else { "dwg" },
+                    "saved":path,
+                    "target_format":super::automation::source_format(Some(&path), is_dxf),
                     "target_version":format!("{version:?}"),"dropped_on_save":dropped,
                 }));
                 if self.main_window.is_none() {
@@ -1615,6 +1621,7 @@ impl OpenCADStudio {
         if previous < self.tabs.len() {
             self.active_tab = previous;
         }
+        crate::ui::ribbon::keytip_note_command_finished();
     }
     pub(super) fn control_measure(&self, req: &Value) -> Value {
         let tab = &self.tabs[self.active_tab];
@@ -1944,6 +1951,7 @@ mod entities;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod http_bridge;
 mod interactive;
+mod node_graph;
 mod sheets;
 pub(crate) use sheets::new_guid_v4;
 pub(crate) mod block_ops;
@@ -1954,6 +1962,13 @@ pub(crate) mod text_ops;
 mod p1_tests;
 pub(super) fn action_names() -> &'static [&'static str] {
     actions::NAMES
+}
+
+pub(super) fn controlled_open_pending(app: &OpenCADStudio) -> bool {
+    app.control
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.request["op"] == "open")
 }
 
 #[cfg(test)]
@@ -2195,6 +2210,88 @@ mod tests {
         assert_eq!(app.automation_op(r#"{"op":"entities"}"#)["total"], 0);
     }
     #[test]
+    fn control_property_sets_dynamic_visibility_with_tooltip() {
+        use crate::scene::block_visibility;
+        use codec::entities::{Insert, Line};
+        use codec::types::Vector3;
+        use codec::EntityType;
+
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let i = app.active_tab;
+        let scene = &mut app.tabs[i].scene;
+        scene.define_block_raw(
+            "VISIBILITY_TEST",
+            Vector3::ZERO,
+            vec![
+                EntityType::Line(Line::from_coords(0.0, 0.0, 0.0, 5.0, 0.0, 0.0)),
+                EntityType::Line(Line::from_coords(0.0, 3.0, 0.0, 5.0, 3.0, 0.0)),
+            ],
+        );
+        let definition = scene.document.block_records.get("VISIBILITY_TEST").unwrap();
+        let owner = definition.handle;
+        let first = definition.entity_handles[0];
+        let second = definition.entity_handles[1];
+        let parameter =
+            block_visibility::create(&mut scene.document, owner, Vector3::ZERO).unwrap();
+        let other =
+            block_visibility::add_state(&mut scene.document, parameter, "Other", 0).unwrap();
+        assert_eq!(other, 1);
+        block_visibility::set_visible(&mut scene.document, parameter, 0, &[second], false);
+        block_visibility::set_visible(&mut scene.document, parameter, other, &[first], false);
+        block_visibility::finish_editing(&mut scene.document, owner);
+        let reference = scene.add_entity(EntityType::Insert(Insert::new(
+            "VISIBILITY_TEST",
+            Vector3::ZERO,
+        )));
+        let selected = request(&mut app, json!({"op":"select","type":"INSERT"}));
+        assert_eq!(selected["ok"], true, "{selected}");
+        assert_eq!(app.tabs[i].selected_handle, Some(reference));
+        let depth = app.tabs[i].history.undo_stack.len();
+
+        let changed = request(
+            &mut app,
+            json!({"op":"property","field":"dyn_visibility","value":"Other"}),
+        );
+        assert_eq!(changed["ok"], true, "{changed}");
+        let doc = &app.tabs[i].scene.document;
+        let EntityType::Insert(insert) = doc.get_entity(reference).unwrap() else {
+            panic!("expected the block reference");
+        };
+        assert_ne!(insert.block_name, "VISIBILITY_TEST");
+        let visible: Vec<_> = doc
+            .entities_in_block(&insert.block_name)
+            .filter(|entity| !entity.common().invisible)
+            .collect();
+        assert_eq!(visible.len(), 1);
+        let EntityType::Line(line) = visible[0] else {
+            panic!("expected the alternative line");
+        };
+        assert_eq!(line.start.y, 3.0);
+        assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
+        let row = OpenCADStudio::visibility_property(doc, reference).unwrap();
+        let row = property_json(&row);
+        assert_eq!(row["kind"], "choice");
+        assert_eq!(row["value"], "Other");
+        assert_eq!(row["options"], json!(["VisibilityState0", "Other"]));
+
+        let invalid = request(
+            &mut app,
+            json!({"op":"property","field":"dyn_visibility","value":"Missing"}),
+        );
+        assert_eq!(invalid["code"], "invalid_choice", "{invalid}");
+        assert_eq!(app.tabs[i].history.undo_stack.len(), depth + 1);
+        assert_eq!(request(&mut app, json!({"op":"undo"}))["ok"], true);
+        let EntityType::Insert(insert) = app.tabs[i].scene.document.get_entity(reference).unwrap()
+        else {
+            panic!("expected the restored block reference");
+        };
+        assert_eq!(insert.block_name, "VISIBILITY_TEST");
+        let row =
+            OpenCADStudio::visibility_property(&app.tabs[i].scene.document, reference).unwrap();
+        assert_eq!(property_json(&row)["value"], "VisibilityState0");
+    }
+    #[test]
     fn selection_changes_are_published_to_the_event_stream() {
         let mut app = OpenCADStudio::new_for_test();
         request(&mut app, json!({"op":"new"}));
@@ -2428,6 +2525,87 @@ mod tests {
         assert_eq!(reply["status"], "completed", "{reply}");
     }
 
+    fn recoverable_open_failure(app: &mut OpenCADStudio) {
+        app.opening = Some(crate::app::OpenProgress {
+            id: 7,
+            name: "damaged.dwg".to_string(),
+            source_path: None,
+            size_bytes: 0,
+            state: std::sync::Arc::new(crate::io::OpenProgressState::new(
+                crate::app::OPEN_PHASE_READING,
+            )),
+            started: std::time::Instant::now(),
+            recovery_error: None,
+            recovery_read_stats: None,
+            fingerprint: None,
+        });
+        let _ = app.update(Message::FileOpened(
+            7,
+            Err(crate::io::OpenLoadError {
+                message: "Invalid record at handle 0x5B87, type_code=37".to_string(),
+                source_sha256: None,
+                read_stats: None,
+                recovery_available: true,
+            }),
+        ));
+    }
+
+    #[test]
+    fn controlled_open_fails_instead_of_waiting_on_the_recovery_prompt() {
+        let mut app = OpenCADStudio::new_for_test();
+        let errors = app.command_line.error_revision;
+        app.control.pending = Some(Operation {
+            id: "open-damaged".to_string(),
+            request: json!({"op":"open","path":"damaged.dwg"}),
+            pending: 0,
+            error_revision: errors,
+            document_id: None,
+            origin_document: app.tabs[app.active_tab].id,
+            geometry_revision: 0,
+            result: json!({}),
+            cancelled: false,
+        });
+        recoverable_open_failure(&mut app);
+        assert!(app.opening.is_none());
+        assert_ne!(
+            app.active_modal,
+            Some(crate::app::ModalKind::RecoveryPrompt)
+        );
+        app.control_settle();
+        let reply = app
+            .control_request(json!({"op":"operation","request_id":"open-damaged"}))
+            .0;
+        assert_eq!(reply["status"], "failed", "{reply}");
+        assert!(app.control.pending.is_none());
+    }
+
+    #[test]
+    fn recovery_prompt_is_answerable_through_actions() {
+        let mut app = OpenCADStudio::new_for_test();
+        assert!(crate::app::automation_action_names().contains(&"recovery_accept"));
+        let reply = request(
+            &mut app,
+            json!({"op":"action","request_id":"accept-none","name":"recovery_accept"}),
+        );
+        assert_eq!(reply["status"], "completed", "{reply}");
+
+        recoverable_open_failure(&mut app);
+        assert_eq!(
+            app.active_modal,
+            Some(crate::app::ModalKind::RecoveryPrompt)
+        );
+        let reply = request(
+            &mut app,
+            json!({"op":"action","request_id":"decline","name":"close_modal"}),
+        );
+        assert_eq!(reply["status"], "completed", "{reply}");
+        assert!(app.opening.is_none());
+        assert_ne!(
+            app.active_modal,
+            Some(crate::app::ModalKind::RecoveryPrompt)
+        );
+    }
+
     #[test]
     fn pending_request_id_reuse_rejects_changed_payload() {
         let mut app = OpenCADStudio::new_for_test();
@@ -2532,7 +2710,7 @@ mod tests {
 
     #[test]
     fn open_with_missing_xrefs_succeeds_and_lists_every_reference() {
-        let mut doc = codec::CadDocument::new();
+        let mut doc = codec::Document::new();
         for name in ["Grid Plan", "Wall Base"] {
             let mut record = codec::tables::BlockRecord::new(name);
             record.flags.is_xref = true;

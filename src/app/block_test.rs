@@ -7,7 +7,7 @@ pub(super) struct BlockTestSession {
     pub source_id: u64,
     pub definition: codec::Handle,
     pub insert: codec::Handle,
-    pub baseline: std::sync::Arc<codec::CadDocument>,
+    pub baseline: std::sync::Arc<codec::Document>,
 }
 
 impl OpenCADStudio {

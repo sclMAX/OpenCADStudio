@@ -437,7 +437,7 @@ impl OpenCADStudio {
     /// drawing; with `redefine` an existing definition takes the source's.
     fn import_block_definition(
         &mut self,
-        source: &codec::CadDocument,
+        source: &codec::Document,
         name: &str,
         redefine: bool,
     ) -> Result<(), String> {
@@ -935,7 +935,7 @@ impl OpenCADStudio {
 /// The block records of `doc` the palette lists (as `custom_block_names`):
 /// not model space, paper space or a layout's, whose contents are the
 /// drawing itself and can be large.
-fn palette_records(doc: &codec::CadDocument) -> impl Iterator<Item = &codec::tables::BlockRecord> {
+fn palette_records(doc: &codec::Document) -> impl Iterator<Item = &codec::tables::BlockRecord> {
     use codec::TableEntry;
     doc.block_records
         .iter()
@@ -945,7 +945,7 @@ fn palette_records(doc: &codec::CadDocument) -> impl Iterator<Item = &codec::tab
 /// `changed` (upper-cased block names) plus every block of `doc` holding one
 /// of them, directly or through other blocks.
 fn with_holding_blocks(
-    doc: &codec::CadDocument,
+    doc: &codec::Document,
     mut changed: std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
     let uses: Vec<(String, Vec<String>)> = palette_records(doc)
@@ -978,8 +978,8 @@ fn with_holding_blocks(
 /// The blocks of `after` the palette lists whose record or contents differ
 /// from `before`'s (new ones included).
 pub(crate) fn changed_block_names(
-    before: &codec::CadDocument,
-    after: &codec::CadDocument,
+    before: &codec::Document,
+    after: &codec::Document,
 ) -> Vec<String> {
     palette_records(after)
         .filter(|br| {

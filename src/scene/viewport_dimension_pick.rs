@@ -206,7 +206,13 @@ impl Scene {
             let frozen = viewport.and_then(|h| self.document.get_entity(h)).is_some_and(|entity| {
                 matches!(entity, EntityType::Viewport(vp) if layer.is_some_and(|l| vp.frozen_layers.contains(&l.handle)))
             });
-            if common.invisible || layer.is_some_and(|l| l.flags.off || l.flags.frozen) || frozen {
+            if common.invisible
+                || layer.is_some_and(|l| l.flags.off || l.flags.frozen)
+                || frozen
+                // LAYWALK: block-internal measurement targets obey the walk
+                // of the space being picked, exactly like the rendered wires.
+                || self.layer_walk_hidden(layer)
+            {
                 continue;
             }
             if let EntityType::Insert(child_insert) = child_entity {

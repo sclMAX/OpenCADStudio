@@ -23,12 +23,13 @@ use crate::ribbon::CadModule;
 // so out-of-tree plugins can use them without adding their own opencadcodec
 // dependency (which would risk an ABI-mismatching version).
 pub use codec;
+pub use codec as acadrust;
 pub use codec::objects::{
     DictionaryCloningFlags, KnownXRecordKind, ProxyObjectReference, ProxyReferenceKind, XRecord,
     XRecordEntry, XRecordSection, XRecordValue, XRecordValueType,
 };
 pub use codec::xdata::{ExtendedDataRecord, XDataValue};
-pub use codec::{CadDocument, EntityType, Handle};
+pub use codec::{Document, EntityType, Handle};
 
 use crate::ipc::protocol::{PluginRequest, PluginResponse};
 
@@ -36,6 +37,16 @@ use crate::ipc::protocol::{PluginRequest, PluginResponse};
 /// Out-of-process V4 plugins implement this; in-process hosts may return `None`.
 pub trait PluginRequestSender: Send + Sync {
     fn request(&self, req: PluginRequest) -> Result<PluginResponse, PluginRequestError>;
+}
+
+/// One page of [`HostApi::query_entities`] (API v14).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityPage {
+    pub entities: Vec<EntityType>,
+    /// Matches in the whole drawing, across all pages.
+    pub count: u64,
+    /// The `offset` of the next page; `None` on the last one.
+    pub next_offset: Option<u64>,
 }
 
 /// Error returned when a plugin worker thread cannot issue a host request.
@@ -457,6 +468,13 @@ pub enum HostNotification {
         entities: Vec<Handle>,
         records: Vec<(Handle, String)>,
     },
+    /// V7 panel control event (button click, value change). Discriminant 12.
+    PanelAction {
+        panel_id: String,
+        control_id: String,
+        action: String,
+        value: Option<crate::dialog::DialogValue>,
+    },
     /// Fallback for notification variants added in future minor revisions.
     /// Carries the raw bincode payload so an older peer can ignore it without
     /// failing deserialization.
@@ -524,6 +542,22 @@ impl Serialize for HostNotification {
                 bincode::serialize_into(&mut bytes, entities).map_err(serde::ser::Error::custom)?;
                 bincode::serialize_into(&mut bytes, records).map_err(serde::ser::Error::custom)?;
             }
+            HostNotification::PanelAction {
+                panel_id,
+                control_id,
+                action,
+                value,
+            } => {
+                bytes.push(12);
+                bincode::serialize_into(&mut bytes, panel_id)
+                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, control_id)
+                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, action)
+                    .map_err(serde::ser::Error::custom)?;
+                bincode::serialize_into(&mut bytes, value)
+                    .map_err(serde::ser::Error::custom)?;
+            }
             HostNotification::Unknown(raw) => bytes.extend_from_slice(raw),
         }
         bytes.serialize(serializer)
@@ -582,6 +616,23 @@ impl<'de> Deserialize<'de> for HostNotification {
                     version,
                     entities,
                     records,
+                })
+            }
+            12 => {
+                let mut cursor = std::io::Cursor::new(rest);
+                let panel_id: String = bincode::deserialize_from(&mut cursor)
+                    .map_err(serde::de::Error::custom)?;
+                let control_id: String = bincode::deserialize_from(&mut cursor)
+                    .map_err(serde::de::Error::custom)?;
+                let action: String = bincode::deserialize_from(&mut cursor)
+                    .map_err(serde::de::Error::custom)?;
+                let value: Option<crate::dialog::DialogValue> = bincode::deserialize_from(&mut cursor)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(HostNotification::PanelAction {
+                    panel_id,
+                    control_id,
+                    action,
+                    value,
                 })
             }
             _ => Ok(HostNotification::Unknown(bytes)),
@@ -849,6 +900,21 @@ pub trait InteractiveCommand: Send {
     /// Returns `true` when selection should reject entities on locked layers (e.g. ssget ":L").
     fn selection_rejects_locked_layers(&self) -> bool {
         false
+    }
+
+    /// An optional declarative modal dialog to display while this interactive command is active.
+    fn modal_dialog(&self) -> Option<crate::dialog::DialogDef> {
+        None
+    }
+
+    /// User submitted or cancelled the modal dialog.
+    fn on_dialog_response(&mut self, _response: crate::dialog::DialogResponse) -> CommandStep {
+        CommandStep::Done
+    }
+
+    /// Pending panel updates buffered during interactive command execution (API v7, additive).
+    fn take_pending_panel_updates(&mut self) -> Vec<(String, std::collections::HashMap<String, crate::dialog::DialogValue>)> {
+        Vec::new()
     }
 }
 
@@ -1118,6 +1184,32 @@ macro_rules! export_plugin {
             $crate::API_VERSION
         }
 
+        /// The whole runner, run by this plugin's own build so no Rust type
+        /// crosses the library boundary (API v14 and later). `socket` is the
+        /// host's socket name; returns the process exit code.
+        #[no_mangle]
+        pub extern "C" fn ocs_plugin_run(socket: *const ::std::os::raw::c_char) -> i32 {
+            if socket.is_null() {
+                return 2;
+            }
+            let socket = unsafe { ::std::ffi::CStr::from_ptr(socket) }
+                .to_string_lossy()
+                .into_owned();
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let plugin: ::std::boxed::Box<dyn $crate::host::BuiltinPlugin> =
+                    ::std::boxed::Box::new($ctor);
+                $crate::runner::run_with_plugin(&socket, $crate::API_VERSION, plugin)
+                    .map_err(|e| e.to_string())
+            })) {
+                ::std::result::Result::Ok(::std::result::Result::Ok(())) => 0,
+                ::std::result::Result::Ok(::std::result::Result::Err(e)) => {
+                    eprintln!("[plugin] {e}");
+                    1
+                }
+                ::std::result::Result::Err(_) => 2,
+            }
+        }
+
         #[no_mangle]
         pub extern "C" fn ocs_plugin_register(
         ) -> *mut ::std::boxed::Box<dyn $crate::host::BuiltinPlugin> {
@@ -1143,7 +1235,7 @@ pub trait HostApi {
     fn tab_index(&self) -> usize;
 
     // ── Document ────────────────────────────────────────────────────────────
-    fn document(&self) -> &CadDocument;
+    fn document(&self) -> &Document;
     /// Mutable access to the active document.
     ///
     /// For an **out-of-process** plugin this borrows a *local snapshot*: edits
@@ -1152,7 +1244,7 @@ pub trait HostApi {
     /// use [`add_entity`](Self::add_entity), [`update_entity`](Self::update_entity)
     /// and [`remove_entity`](Self::remove_entity), which are committed to the
     /// host document over IPC.
-    fn document_mut(&mut self) -> &mut CadDocument;
+    fn document_mut(&mut self) -> &mut Document;
 
     /// Add an entity to the active document, returning its handle.
     fn add_entity(&mut self, entity: EntityType) -> Handle;
@@ -1192,6 +1284,28 @@ pub trait HostApi {
 
     // ── Undo / dirty ────────────────────────────────────────────────────────
     fn push_undo(&mut self, label: &str);
+    /// Open one undo step that spans several messages (API v14): every edit
+    /// until [`HostApi::end_undo_group`] joins it, including writes a worker
+    /// thread sends through [`HostApi::plugin_request_sender`], and
+    /// `push_undo` inside it opens nothing new. The step also closes when the
+    /// user runs a command of their own. The default is [`HostApi::push_undo`].
+    fn begin_undo_group(&mut self, label: &str) {
+        self.push_undo(label);
+    }
+    /// Close the step [`HostApi::begin_undo_group`] opened.
+    fn end_undo_group(&mut self) {}
+
+    /// The entities matching `query`, one page at a time (API v14). `query`
+    /// is the JSON of the control API's `query` operation, e.g.
+    /// `{"layer":"*-OPENBARE_RUIMTE_*","type":"Mesh","xdata_app":"OPENINFRA",
+    /// "bounds":[x0,y0,x1,y1],"offset":0,"limit":500}`: `layer` takes `*` and
+    /// `?`, `where` filters properties by JSON Pointer, and `limit` is at
+    /// most 10000. One message carries at most 64 MiB either way, so batch
+    /// writes and size pages to stay under it.
+    fn query_entities(&mut self, query: &str) -> Result<EntityPage, String> {
+        let _ = query;
+        Err("query_entities is not supported by this host".to_owned())
+    }
     fn set_dirty(&mut self);
 
     // ── Command line ────────────────────────────────────────────────────────
@@ -1294,6 +1408,12 @@ pub trait HostApi {
 
     /// Read a named host setting without invoking the command dispatcher.
     /// Names are case-insensitive. Hosts may support only a subset.
+    ///
+    /// The desktop host reads `CLAYER`, `CTAB`, `CTEXTSTYLE`, `CELTYPE` and
+    /// `SNAPANG`, and the drawing's numeric and point variables (`INSUNITS`,
+    /// `MEASUREMENT`, `LUNITS`, `LUPREC`, `LTSCALE`, `PDMODE`, `PDSIZE`,
+    /// `EXTMIN`, `EXTMAX`, `LIMMIN`, `LIMMAX`, `INSBASE`, ...). A point comes
+    /// back as text, `"x,y,z"`.
     fn system_variable(&self, _name: &str) -> Option<HostSettingValue> {
         None
     }
@@ -1626,7 +1746,32 @@ pub trait HostApi {
     ) -> Result<Vec<(String, Vec<XRecordEntry>)>, String> {
         Err("XRecord listing with entries is not supported by this host".to_owned())
     }
+
+    /// Display a declarative modal form dialog and wait for user submission or cancellation (API v7, additive).
+    fn show_dialog(&mut self, _dialog: crate::dialog::DialogDef) -> crate::dialog::DialogResponse {
+        crate::dialog::DialogResponse::Cancelled
+    }
+
+    /// Register a persistent dockable side panel / palette (API v7, additive).
+    fn register_panel(&mut self, _panel: crate::dialog::PanelDef) -> bool {
+        false
+    }
+
+    /// Update control values in a persistent dockable side panel (API v7, additive).
+    fn update_panel(
+        &mut self,
+        _panel_id: &str,
+        _values: std::collections::HashMap<String, crate::dialog::DialogValue>,
+    ) -> bool {
+        false
+    }
+
+    /// Toggle visibility or show/hide a persistent dockable side panel (API v7, additive).
+    fn toggle_panel(&mut self, _panel_id: &str, _show: Option<bool>) -> bool {
+        false
+    }
 }
+
 
 /// One XRecord addressed by dictionary path + name (API v13, additive).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1699,7 +1844,7 @@ pub trait DocumentReader {
     /// Total number of entities in the document.
     fn entity_count(&self) -> usize;
 
-    /// Iterate over all entities without allocating a full `CadDocument`.
+    /// Iterate over all entities without allocating a full `Document`.
     fn for_each_entity(&self, f: &mut dyn FnMut(ReaderEntity<'_>));
 
     /// Look up a layer name by handle.
@@ -1727,8 +1872,8 @@ impl ReaderEntityKind {
     }
 }
 
-/// In-process `DocumentReader` implementation that wraps a borrowed `CadDocument`.
-pub struct CadDocumentReader<'a>(pub &'a CadDocument);
+/// In-process `DocumentReader` implementation that wraps a borrowed `Document`.
+pub struct CadDocumentReader<'a>(pub &'a Document);
 
 impl<'a> DocumentReader for CadDocumentReader<'a> {
     fn entity_count(&self) -> usize {

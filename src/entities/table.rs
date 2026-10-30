@@ -142,7 +142,7 @@ fn cell_text_height(
 /// A cell's text style: the content's own, else the cell, row, column or
 /// table style that sets it (by handle, or by name for a cell override).
 fn cell_text_style(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     table: &Table,
     row: &codec::entities::table::TableRow,
     column: usize,
@@ -161,6 +161,21 @@ fn cell_text_style(
                 .map(|s| s.handle)
         })
     })
+}
+
+/// The face each text style draws with, resolved the way text of that style
+/// resolves anywhere else (a .shx file on disk before the built-in stroke
+/// font of its name), so a table's cells match the text of its picture.
+fn table_style_fonts(document: &codec::Document) -> rustc_hash::FxHashMap<codec::Handle, String> {
+    document
+        .text_styles
+        .iter()
+        .map(|style| {
+            let font = crate::entities::text_support::resolve_text_style(&style.name, document)
+                .font_name;
+            (style.handle, font)
+        })
+        .collect()
 }
 
 fn style_for_border<'a>(
@@ -676,7 +691,7 @@ fn fallback_content_centers(
 }
 
 fn content_display_value(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     table: &Table,
     content: &codec::entities::table::CellContent,
 ) -> String {
@@ -701,7 +716,7 @@ fn content_display_value(
 }
 
 fn resolved_content_geometry(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     table: &Table,
     row: usize,
     column: usize,
@@ -753,7 +768,7 @@ fn resolved_content_geometry(
 
 pub(crate) fn block_cell_inserts(
     table: &Table,
-    document: &codec::CadDocument,
+    document: &codec::Document,
     anno_scale: f32,
 ) -> Vec<codec::entities::Insert> {
     use codec::entities::table::ContentLayoutFlags;
@@ -1054,7 +1069,7 @@ pub(crate) fn block_cell_inserts(
 }
 
 impl RenderConvertible for Table {
-    fn to_render(&self, document: &codec::CadDocument) -> Option<RenderEntity> {
+    fn to_render(&self, document: &codec::Document) -> Option<RenderEntity> {
         if self.rows.is_empty() || self.columns.is_empty() {
             return None;
         }
@@ -1190,33 +1205,9 @@ impl RenderConvertible for Table {
         let title_suppressed = resolved_title_suppressed(self, table_style);
         let header_suppressed = resolved_header_suppressed(self, table_style);
 
+        let style_fonts = table_style_fonts(document);
         let font_for_handle = |handle: Option<codec::Handle>| -> Option<String> {
-            handle.and_then(|h| lookup_style(h)).and_then(|s| {
-                let mut font_name = if !s.true_type_font.trim().is_empty() {
-                    s.true_type_font.trim().to_string()
-                } else {
-                    let file = s.font_file.trim();
-                    if !file.is_empty() {
-                        let basename = file.rsplit(['/', '\\']).next().unwrap_or(file);
-                        let stem = basename.split('.').next().unwrap_or(basename).trim();
-                        if !stem.is_empty() {
-                            stem.to_string()
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                };
-                if !crate::scene::text::lff::is_builtin(&font_name) {
-                    if let Some(canonical) =
-                        crate::scene::text::sysfont::canonical_family_name(&font_name)
-                    {
-                        font_name = canonical;
-                    }
-                }
-                Some(font_name)
-            })
+            handle.and_then(|h| style_fonts.get(&h).cloned())
         };
         // Build a ResolvedTextStyle for the cell — needed by the shared MText
         // pipeline so inline `\W`, `\Q`, etc. compose with the style baseline.
@@ -1398,7 +1389,7 @@ impl RenderConvertible for Table {
 /// Builds colored geometry for tables without a stored display block.
 pub fn tessellate_table(
     tab: &Table,
-    document: &codec::CadDocument,
+    document: &codec::Document,
     selected: bool,
     entity_color: [f32; 4],
     line_weight_px: f32,
@@ -1469,29 +1460,9 @@ pub fn tessellate_table(
     let lookup_style = |hh: codec::Handle| -> Option<&codec::tables::TextStyle> {
         document.text_styles.iter().find(|s| s.handle == hh)
     };
+    let style_fonts = table_style_fonts(document);
     let font_for_handle = |handle: Option<codec::Handle>| -> Option<String> {
-        handle.and_then(lookup_style).and_then(|s| {
-            let mut font_name = if !s.true_type_font.trim().is_empty() {
-                s.true_type_font.trim().to_string()
-            } else {
-                let file = s.font_file.trim();
-                let basename = file.rsplit(['/', '\\']).next().unwrap_or(file);
-                let stem = basename.split('.').next().unwrap_or(basename).trim();
-                if !stem.is_empty() {
-                    stem.to_string()
-                } else {
-                    return None;
-                }
-            };
-            if !crate::scene::text::lff::is_builtin(&font_name) {
-                if let Some(canonical) =
-                    crate::scene::text::sysfont::canonical_family_name(&font_name)
-                {
-                    font_name = canonical;
-                }
-            }
-            Some(font_name)
-        })
+        handle.and_then(|h| style_fonts.get(&h).cloned())
     };
     let resolved_style_for_handle =
         |handle: Option<codec::Handle>, font_name: String| -> ResolvedTextStyle {

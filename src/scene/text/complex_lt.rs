@@ -36,7 +36,7 @@ fn atype_segments(scaled: &[LtSeg], align_end: f32, total: f32) -> Option<Vec<Lt
     if pat_len < 1e-10 || scaled.len() < 2 {
         return None;
     }
-    let ae = align_end.clamp(1e-4, total * 0.5);
+    let ae = align_end.max(1e-4).min(total * 0.5);
     let interior = total - 2.0 * ae;
     if interior / pat_len > 50_000.0 {
         return None; // too many repeats to materialise — keep cycling walk

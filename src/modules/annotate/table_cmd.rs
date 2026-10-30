@@ -137,7 +137,7 @@ fn cell_style_from_row(style: &codec::objects::RowCellStyle) -> CellStyle {
     result
 }
 
-fn selected_row_style(table_style: &codec::objects::TableStyle, name: &str) -> CellStyle {
+pub(crate) fn selected_row_style(table_style: &codec::objects::TableStyle, name: &str) -> CellStyle {
     let style = if name.eq_ignore_ascii_case("Title") {
         &table_style.title_row_style
     } else if name.eq_ignore_ascii_case("Header") {

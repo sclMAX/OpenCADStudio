@@ -4,11 +4,11 @@ use crate::scene::block_authoring::{edit, metadata};
 use crate::scene::block_grips::runtime;
 use codec::{
     objects::{DynamicBlockData, ObjectType},
-    CadDocument,
+    Document,
 };
 
 fn description(
-    doc: &CadDocument,
+    doc: &Document,
     definition: Handle,
     parameter: Handle,
     component: Option<usize>,

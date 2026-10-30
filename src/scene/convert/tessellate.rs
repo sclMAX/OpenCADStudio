@@ -15,7 +15,7 @@
 
 use crate::entities::leader::LeaderTess;
 use codec::types::Color as AcadColor;
-use codec::{CadDocument, EntityType, Handle};
+use codec::{Document, EntityType, Handle};
 use glam::Vec3;
 
 use crate::scene::convert::acad_to_render::{convert, RenderObject};
@@ -91,7 +91,7 @@ use crate::entities::field::{BOX_ABOVE as FIELD_BOX_ABOVE, BOX_BELOW as FIELD_BO
 /// FIELD_BOX_ABOVE across it. `None` when the host's fields cannot be
 /// located in its text (the whole text is boxed then).
 fn field_run_corner_groups(
-    document: &codec::CadDocument,
+    document: &codec::Document,
     entity: &EntityType,
     stroke_groups: &[crate::scene::convert::acad_to_render::TextStroke],
     anno: f64,
@@ -724,11 +724,118 @@ fn split_mixed_polyline(
         }
     }
 
+    // A dashed band leaves its joints open as the dashes fall.
+    if pattern_length <= 0.0 {
+        let bevels = arc_joint_bevels(tangent_geoms, key_vertices, seg_widths, global_world_width);
+        if !bevels.is_empty() {
+            let (fill_tris, fill_tris_low) = points_to_ds(bevels);
+            out.push(WireModel {
+                name: name.to_string(),
+                color,
+                selected,
+                line_weight_px,
+                fill_tris,
+                fill_tris_low,
+                aabb: WireModel::UNBOUNDED_AABB,
+                plinegen: true,
+                display_visible: true,
+                plot_visible: true,
+                ..Default::default()
+            });
+        }
+    }
+
     out
 }
 
+/// The bands of a line and an arc, or of two arcs, are separate wires that
+/// end square at their joint, so a turn there opens a notch on its outer side.
+/// A bevel triangle on each side of such a joint closes it (#2200).
+fn arc_joint_bevels(
+    tangent_geoms: &[TangentGeom],
+    key_vertices: &[[f64; 3]],
+    seg_widths: &[(f32, f32)],
+    global_world_width: f32,
+) -> Vec<[f64; 3]> {
+    use glam::DVec3;
+    let (n, m) = (tangent_geoms.len(), key_vertices.len());
+    if n < 2 || m < 2 {
+        return Vec::new();
+    }
+    let vertex = |k: usize| DVec3::from(key_vertices[k % m]);
+    let half = |i: usize| {
+        let (start, end) = seg_widths
+            .get(i)
+            .copied()
+            .unwrap_or((global_world_width, global_world_width));
+        (f64::from(start) * 0.5, f64::from(end) * 0.5)
+    };
+    // Segment `i`'s direction of travel at its start or end, and its plane
+    // normal when it is an arc.
+    let direction = |i: usize, at_end: bool| -> Option<(DVec3, Option<DVec3>)> {
+        let (a, b) = (vertex(i), vertex(i + 1));
+        match tangent_geoms[i] {
+            TangentGeom::Line { .. } => Some(((b - a).try_normalize()?, None)),
+            TangentGeom::Arc {
+                center,
+                axis_x,
+                axis_y,
+                radius,
+                start_angle,
+                ..
+            } => {
+                let (c, x, y) = (DVec3::from(center), DVec3::from(axis_x), DVec3::from(axis_y));
+                let normal = x.cross(y).try_normalize()?;
+                let (sin, cos) = start_angle.sin_cos();
+                let first = c + radius * (cos * x + sin * y);
+                // The polyline runs the arc clockwise when the arc's own
+                // start sits at the segment's end.
+                let reversed = first.distance_squared(b) < first.distance_squared(a);
+                let at = if at_end { b } else { a };
+                let ccw = normal.cross(at - c).try_normalize()?;
+                Some((if reversed { -ccw } else { ccw }, Some(normal)))
+            }
+            _ => None,
+        }
+    };
+    // Joints between consecutive segments, and the last segment to the first
+    // where the polyline comes back to its start.
+    // ponytail: an open polyline whose ends merely touch is joined there too;
+    // pass the closed flag in if that bevel ever shows.
+    let closed = m == n || vertex(n).distance_squared(vertex(0)) < 1e-18;
+    let joints = (1..n).chain(closed.then_some(n));
+    let mut tris = Vec::new();
+    for k in joints {
+        let (before, after) = (k - 1, k % n);
+        let either_arc = [before, after]
+            .iter()
+            .any(|&i| matches!(tangent_geoms[i], TangentGeom::Arc { .. }));
+        if !either_arc {
+            continue;
+        }
+        let (Some((d0, n0)), Some((d1, n1))) = (direction(before, true), direction(after, false))
+        else {
+            continue;
+        };
+        // A tangent joint has no notch to close.
+        let Some(normal) = n0.or(n1).filter(|_| d0.dot(d1) < 1.0 - 1e-9) else {
+            continue;
+        };
+        let (h0, h1) = (half(before).1, half(after).0);
+        if h0 <= 0.0 && h1 <= 0.0 {
+            continue;
+        }
+        let p = vertex(k);
+        let (left0, left1) = (normal.cross(d0), normal.cross(d1));
+        for side in [1.0, -1.0] {
+            tris.extend([p, p + left0 * h0 * side, p + left1 * h1 * side].map(|v| v.to_array()));
+        }
+    }
+    tris
+}
+
 fn point_cloud_wires(
-    document: &CadDocument,
+    document: &Document,
     handle: Handle,
     entity: &EntityType,
     selected: bool,
@@ -870,7 +977,7 @@ pub(crate) fn shift_wire_to_world(w: &mut WireModel, origin: [f64; 3]) {
 /// For Solid3D entities this returns an empty wire; mesh tessellation lives
 /// in `solid3d_tess` and is uploaded via the mesh pipeline instead.
 pub fn tessellate(
-    document: &CadDocument,
+    document: &Document,
     handle: Handle,
     entity: &EntityType,
     selected: bool,
@@ -2794,7 +2901,7 @@ pub(crate) enum ArrowKind {
 }
 
 pub(crate) fn arrow_from_block(
-    doc: &CadDocument,
+    doc: &Document,
     handle: codec::types::Handle,
     dimasz: f32,
 ) -> ArrowKind {
@@ -2802,7 +2909,7 @@ pub(crate) fn arrow_from_block(
 }
 
 pub(crate) fn arrow_from_block_with_deferred_hatch(
-    doc: &CadDocument,
+    doc: &Document,
     handle: codec::types::Handle,
     dimasz: f32,
     defer_hatch: bool,
@@ -2814,6 +2921,11 @@ pub(crate) fn arrow_from_block_with_deferred_hatch(
         return arrow_from_block_name(None, dimasz);
     };
     if let Some(arrow) = builtin_arrow_from_block_name(&record.name, dimasz) {
+        // AutoCAD writes "_None" empty, but it draws whatever the block
+        // holds: some drawings define "_NONE" as a small circle.
+        if matches!(arrow, ArrowKind::None) && !record.entity_handles.is_empty() {
+            return custom_arrow_from_block(doc, record, dimasz, defer_hatch).unwrap_or(arrow);
+        }
         return arrow;
     }
     custom_arrow_from_block(doc, record, dimasz, defer_hatch)
@@ -2926,7 +3038,7 @@ fn builtin_arrow_from_block_name(name: &str, dimasz: f32) -> Option<ArrowKind> {
 }
 
 fn custom_arrow_from_block(
-    doc: &CadDocument,
+    doc: &Document,
     record: &codec::tables::BlockRecord,
     dimasz: f32,
     defer_hatch: bool,
@@ -2978,7 +3090,7 @@ fn custom_arrow_from_block(
 }
 
 fn append_custom_arrow_leaf(
-    doc: &CadDocument,
+    doc: &Document,
     entity: &EntityType,
     lines: &mut Vec<[f32; 3]>,
     fill: &mut Vec<[f32; 3]>,
@@ -3216,6 +3328,13 @@ pub(crate) struct DimGeom {
     /// dimension line's dashes.
     pub(crate) arrow_lines: Vec<[f32; 3]>,
     pub(crate) arrow_fill: Vec<[f32; 3]>,
+    /// World-space point that `ext_lines` / `dim_lines` / `arrow_lines` /
+    /// `arrow_fill` were built relative to. Dimension tessellation shifts the
+    /// definition data to a nearby origin so its f32 geometry keeps
+    /// sub-millimetre precision at UTM scale; consumers that need world-space
+    /// points (explode) add this back. Zero for leader and multileader
+    /// arrowheads, whose points are already world-space f32.
+    pub(crate) origin: codec::types::Vector3,
 }
 
 impl DimGeom {
@@ -3225,6 +3344,7 @@ impl DimGeom {
             dim_lines: Vec::new(),
             arrow_lines: Vec::new(),
             arrow_fill: Vec::new(),
+            origin: codec::types::Vector3::ZERO,
         }
     }
 }
@@ -3505,6 +3625,38 @@ pub(crate) fn normalized_or(v: Vec3, fallback: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn none_arrow_draws_what_its_block_holds() {
+        // A drawing's "_NONE" holding a 0.25 circle, which AutoCAD 2025 draws.
+        let mut doc = Document::new();
+        let circle = codec::entities::Circle::from_center_radius(codec::types::Vector3::ZERO, 0.25);
+        crate::app::define_block_raw_doc(
+            &mut doc,
+            "_NONE",
+            codec::types::Vector3::ZERO,
+            &[EntityType::Circle(circle)],
+        );
+        let handle = doc.block_records.get("_NONE").unwrap().handle;
+        let ArrowKind::Custom { size, lines, .. } = arrow_from_block(&doc, handle, 50.0) else {
+            panic!("a non-empty \"_NONE\" draws its contents");
+        };
+        assert_eq!(size, 50.0);
+        let reach = lines
+            .iter()
+            .map(|p| Vec3::from_array(*p).length())
+            .fold(0.0_f32, f32::max);
+        assert!((reach - 0.25).abs() < 1e-3, "circle radius {reach}");
+
+        // AutoCAD's own "_None" is empty: no arrow.
+        let mut doc = Document::new();
+        crate::app::define_block_raw_doc(&mut doc, "_None", codec::types::Vector3::ZERO, &[]);
+        let handle = doc.block_records.get("_None").unwrap().handle;
+        assert!(matches!(
+            arrow_from_block(&doc, handle, 50.0),
+            ArrowKind::None
+        ));
+    }
 
     #[test]
     fn arrow_name_mapping_covers_preview_kinds() {

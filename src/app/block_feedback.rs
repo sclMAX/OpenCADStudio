@@ -224,7 +224,7 @@ impl OpenCADStudio {
                 .and_then(|(insert, parameter)| {
                     let handle =
                         insert.or_else(|| tab.block_test.as_ref().map(|test| test.insert))?;
-                    let (source, definition): (&codec::CadDocument, _) =
+                    let (source, definition): (&codec::Document, _) =
                         if let Some(test) = tab.block_test.as_ref() {
                             (&test.baseline, test.definition)
                         } else {
