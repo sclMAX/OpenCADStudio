@@ -13,6 +13,7 @@ mod block_actions;
 mod block_parameter_properties;
 mod block_alignment;
 mod block_feedback;
+mod block_flip;
 mod block_cycle_order;
 mod block_grip_set;
 mod block_construction;
@@ -1094,6 +1095,8 @@ pub(super) struct OpenCADStudio {
     /// Open dynamic-block visibility-state dropdown.
     visibility_popup: Option<visibility::VisibilityPopup>,
     table_popup: Option<visibility::TablePopup>,
+    /// Open dynamic-block flip-state list on a model-space reference.
+    flip_popup: Option<block_flip::FlipPopup>,
     /// A leader line just added via the "Add Leader" grip menu whose arrow is
     /// being placed (follows the cursor). `(entity handle, new-arrow grip id)`.
     /// Esc before the placement click removes it again.
@@ -1781,6 +1784,10 @@ pub(super) struct OpenCADStudio {
     table_insert: crate::ui::window::annotation_data::TableInsertState,
     data_link_manager: crate::ui::window::annotation_data::DataLinkManagerState,
     data_link_parent_table: bool,
+    /// The Table Style dialog was opened from Insert Table and returns there.
+    tablestyle_parent_table: bool,
+    /// The Table Style list shows only the styles in use.
+    tablestyle_in_use_only: bool,
     data_extraction: crate::ui::window::annotation_data::DataExtractionState,
 
     // ── Plot Style Panel ──────────────────────────────────────────────────
@@ -3992,6 +3999,8 @@ pub enum Message {
     /// visibility dropdown's items.
     VisibilityPick(usize),
     TableRowPick(usize),
+    /// User picked a dynamic-block flip state — `0` base, `1` flipped.
+    FlipPick(usize),
     /// Timer pulse while the cursor is dwelling on a grip; drives the
     /// dwell-to-popup transition without requiring further mouse motion.
     GripDwellTick,
@@ -5011,6 +5020,7 @@ pub enum Message {
     #[allow(dead_code)]
     TableStyleDialogClose,
     TableStyleDialogSelect(String),
+    TableStyleListInUse(bool),
     TableStyleDialogTab(u8),
     TableStyleDialogCompare(String),
     TableStyleDialogNew,
@@ -5269,6 +5279,8 @@ pub enum Message {
     WblockWriteFinished(String, std::path::PathBuf, Result<(), String>),
     // ── DATAEXTRACTION ────────────────────────────────────────────────────
     TableInsertStyle(String),
+    /// Insert Table's button to the Table Style dialog.
+    TableInsertManageStyles,
     TableInsertField(crate::ui::window::annotation_data::TableInsertField),
     TableInsertApply,
     DataLinkManagerOpen,
@@ -5628,6 +5640,7 @@ impl OpenCADStudio {
             grip_pending: None,
             visibility_popup: None,
             table_popup: None,
+            flip_popup: None,
             grip_add_provisional: None,
             grip_preview_handles: Vec::new(),
             hover_dwell: None,
@@ -5917,6 +5930,8 @@ impl OpenCADStudio {
             table_insert: Default::default(),
             data_link_manager: Default::default(),
             data_link_parent_table: false,
+            tablestyle_parent_table: false,
+            tablestyle_in_use_only: false,
             data_extraction: Default::default(),
             layout_manager_rename_buf: String::new(),
             plotstyle_panel_aci: 1,

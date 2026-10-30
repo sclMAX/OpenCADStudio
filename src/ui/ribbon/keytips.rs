@@ -113,6 +113,8 @@ pub(super) const TEXT_HEIGHT: &str = "TEXT_HEIGHT";
 pub(super) const DIMENSION_LAUNCHER: &str = "DIMENSION_LAUNCHER";
 /// The Leaders panel's corner arrow (Multileader Style).
 pub(super) const LEADER_LAUNCHER: &str = "LEADER_LAUNCHER";
+/// Annotate > Tables: the corner arrow to the table styles.
+pub(super) const TABLE_LAUNCHER: &str = "TABLE_LAUNCHER";
 const COLLAPSED_PREFIX: &str = "panel:";
 
 pub fn active() -> bool {
@@ -526,6 +528,9 @@ const CODES: &[(&str, &str, &str)] = &[
     ("annotate", "TABLE", "TB"),
     ("annotate", "TABLE_STYLE_COMBO", "TL"),
     ("annotate", "DATALINK", "DL"),
+    ("annotate", "DATALINKUPDATE", "UD"),
+    ("annotate", "DATALINKUPDATE_WRITE", "WD"),
+    ("annotate", TABLE_LAUNCHER, "TT"),
     ("annotate", "WIPEOUT", "WI"),
     ("annotate", "REVCLOUD", "AC"),
     // The reference shows AC here too; typing it runs Revision Cloud.
@@ -851,6 +856,14 @@ impl Ribbon {
                         target: LEADER_LAUNCHER,
                         code: code(scope, LEADER_LAUNCHER).map(str::to_string),
                         action: Action::Run(Message::Command("MLEADERSTYLE".to_string())),
+                    });
+                }
+                if group.title == "Tables" && ids.contains(&"TABLE") {
+                    tips.push(Tip {
+                        anchor: TABLE_LAUNCHER.to_string(),
+                        target: TABLE_LAUNCHER,
+                        code: code(scope, TABLE_LAUNCHER).map(str::to_string),
+                        action: Action::Run(Message::Command("TABLESTYLE".to_string())),
                     });
                 }
                 continue;

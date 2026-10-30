@@ -798,6 +798,8 @@ pub struct UserSettings {
     pub image_frame: i16,
     /// The Attribute Definition dialog's "Specify on-screen" choice.
     pub attdef_on_screen: bool,
+    /// Insert Table / -TABLE column and row settings and insertion behaviour.
+    pub table_insert: crate::modules::annotate::table_cmd::TableDefaults,
     /// Block Definition dialog: base point "Specify On-screen".
     pub block_base_on_screen: bool,
     /// Block Definition dialog: objects "Specify On-screen".
@@ -1336,6 +1338,7 @@ impl Default for UserSettings {
             grip_object_limit: DEFAULT_GRIP_OBJECT_LIMIT,
             image_frame: 1,
             attdef_on_screen: true,
+            table_insert: Default::default(),
             block_base_on_screen: false,
             block_objects_on_screen: false,
             block_object_mode: 1,

@@ -84,8 +84,8 @@ const WEB_ALIAS_KEY: &str = "opencadstudio.aliases";
 /// version 10 the block command-line forms and block editor shortcuts;
 /// version 11 IO (INSERTOBJ); version 12 DLU (DATALINKUPDATE); version 13 SP
 /// (SPELL); version 14 the multileader set (MLE, LEAD; LE and MLA retargeted,
-/// MLR / MLAL / QL dropped).
-const DEFAULT_ALIASES_VERSION: u32 = 14;
+/// MLR / MLAL / QL dropped); version 15 TS (TABLESTYLE) and CT (CTABLESTYLE).
+const DEFAULT_ALIASES_VERSION: u32 = 15;
 
 #[cfg(target_arch = "wasm32")]
 const WEB_ALIAS_VERSION_KEY: &str = "opencadstudio.aliases.version";
@@ -122,6 +122,7 @@ fn introduced_at(version: u32) -> &'static [(&'static str, &'static str)] {
         12 => &[("DLU", "DATALINKUPDATE")],
         13 => &[("SP", "SPELL")],
         14 => &[("MLE", "MLEADEREDIT"), ("LEAD", "LEADER")],
+        15 => &[("TS", "TABLESTYLE"), ("CT", "CTABLESTYLE")],
         _ => &[],
     }
 }

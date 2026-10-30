@@ -966,7 +966,9 @@ impl Scene {
             } else {
                 entity.common().linetype.clone()
             }),
-            "linetype_scale" => Some(format!("{:.4}", entity.common().linetype_scale)),
+            "linetype_scale" => Some(crate::entities::common::format_decimal(
+                entity.common().linetype_scale,
+            )),
             "plot_style" => Some(
                 match entity.common().plotstyle_flags {
                     0 => "ByLayer",

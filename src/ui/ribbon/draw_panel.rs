@@ -400,6 +400,16 @@ pub(super) fn group_title<'a>(
             );
             return row![label, launcher].spacing(6).align_y(iced::Center).into();
         }
+        // Tables: the corner arrow opens the table styles.
+        if title == "Tables" && group_ids.contains(&"TABLE") {
+            let launcher = corner_launcher(
+                Message::Command("TABLESTYLE".to_string()),
+                format!("{}
+{} TABLESTYLE", t!("Table Style"), t!("Command:")),
+                keytips::TABLE_LAUNCHER,
+            );
+            return row![label, launcher].spacing(6).align_y(iced::Center).into();
+        }
         return label;
     };
     let expanded = open.as_deref().and_then(parent_panel) == Some(panel.id);

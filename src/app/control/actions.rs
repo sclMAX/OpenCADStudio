@@ -47,6 +47,16 @@ fn color_value(color: codec::types::Color) -> Value {
         json!(color.index())
     }
 }
+/// The id a row answers to: its parameter and component for a dynamic row,
+/// the palette's static field name otherwise.
+pub(crate) fn row_id(p: &crate::scene::model::object::Property) -> String {
+    match &p.value {
+        PropValue::BlockNumber { key, .. } | PropValue::BlockChoice { key, .. } => {
+            crate::scene::block_parameter_properties::field_id(key)
+        }
+        _ => p.field.to_owned(),
+    }
+}
 /// One Properties-panel row as the control protocol's JSON (`id`, `label`,
 /// `kind`, `value`, `options`). The node graph moves values in this form too,
 /// so a port's value round-trips through [`OpenCADStudio::set_property_value`].
@@ -91,9 +101,29 @@ pub(crate) fn property_json(p: &crate::scene::model::object::Property) -> Value 
         PropValue::AttrText { tag, value } => {
             ("attribute", json!({"tag":tag,"value":value}), Value::Null)
         }
+        PropValue::BlockNumber { value, .. } => ("number", json!(value), Value::Null),
+        PropValue::BlockChoice {
+            selected, options, ..
+        } => (
+            "choice",
+            options
+                .get(*selected)
+                .map(|label| json!(label))
+                .unwrap_or(Value::Null),
+            json!(options),
+        ),
         other => ("specialized", json!(format!("{other:?}")), Value::Null),
     };
-    json!({"id":p.field,"label":p.label,"kind":kind,"value":value,"options":options})
+    let mut row = json!({"id":row_id(p),"label":p.label,"kind":kind,"value":value,"options":options});
+    if let PropValue::BlockNumber { key, description, .. }
+    | PropValue::BlockChoice { key, description, .. } = &p.value
+    {
+        row["description"] = json!(description);
+        row["component"] =
+            json!(crate::scene::block_parameter_properties::component_id(&key.component));
+        row["parameter"] = json!(format!("{:X}", key.parameter.value()));
+    }
+    row
 }
 pub(super) const NAMES: &[&str] = &[
     "close_modal",
@@ -143,7 +173,10 @@ pub(super) const NAMES: &[&str] = &[
     "ribbon_dropdown",
     "keytips",
     "dialog_ok",
+    "dialog_discard",
+    "dialog_cancel",
     "block_def_dialog",
+    "table_insert_dialog",
     "attdef_dialog",
     "field_dialog",
     "attman_dialog",
@@ -1209,7 +1242,7 @@ impl OpenCADStudio {
             .sections
             .iter()
             .flat_map(|s| &s.props)
-            .find(|p| p.field == field)
+            .find(|p| row_id(p) == field)
             .cloned()
             .ok_or_else(|| {
                 failure(
@@ -1314,6 +1347,24 @@ impl OpenCADStudio {
                     field,
                     value: control_lineweight(raw)?,
                 }),
+            PropValue::BlockNumber { key, .. } => {
+                let input = self.update(Message::PropBlockInput { key, value });
+                let commit = self.update(Message::PropBlockCommit(key));
+                Task::batch([input, commit])
+            }
+            PropValue::BlockChoice { key, options, .. } => {
+                let index = options
+                    .iter()
+                    .position(|option| option == &value)
+                    .or_else(|| {
+                        let index = value.trim().parse::<usize>().ok()?;
+                        (index < options.len()).then_some(index)
+                    })
+                    .ok_or_else(|| {
+                        failure("invalid_choice", "Value is not an available option")
+                    })?;
+                self.update(Message::PropBlockChoice { key, index })
+            }
             PropValue::ReadOnly(_) | PropValue::ReadOnlyWithTooltip { .. } => {
                 return Err(failure("readonly_property", "Property cannot be edited"))
             }
@@ -1670,6 +1721,37 @@ impl OpenCADStudio {
                     return Err(failure("no_tab", "No such ribbon tab"));
                 }
                 return Ok(Task::none());
+            }
+            // The open Insert Table dialog: `style=…`, `columns=…`, `rows=…`,
+            // `width=…`, `lines=…`, `window=0|1`, `columns_fixed=0|1`,
+            // `rows_fixed=0|1`, `preview=0|1`, `styles` (the Table Style
+            // button), `ok`.
+            "table_insert_dialog" => {
+                use crate::ui::window::annotation_data::{TableInsertField as F, TableInsertion};
+                if self.active_modal != Some(crate::app::ModalKind::InsertTable) {
+                    return Err(failure("no_dialog", "The Insert Table dialog is not open"));
+                }
+                let value = string(req, "value")?;
+                let (key, v) = value.split_once('=').unwrap_or((value, ""));
+                let on = v == "1";
+                match key {
+                    "style" => Message::TableInsertStyle(v.to_string()),
+                    "columns" => Message::TableInsertField(F::Columns(v.to_string())),
+                    "rows" => Message::TableInsertField(F::DataRows(v.to_string())),
+                    "width" => Message::TableInsertField(F::ColumnWidth(v.to_string())),
+                    "lines" => Message::TableInsertField(F::RowHeight(v.to_string())),
+                    "window" => Message::TableInsertField(F::Insertion(if on {
+                        TableInsertion::Window
+                    } else {
+                        TableInsertion::Point
+                    })),
+                    "columns_fixed" => Message::TableInsertField(F::ColumnsFixed(on)),
+                    "rows_fixed" => Message::TableInsertField(F::RowsFixed(on)),
+                    "preview" => Message::TableInsertField(F::Preview(on)),
+                    "styles" => Message::TableInsertManageStyles,
+                    "ok" => Message::TableInsertApply,
+                    _ => return Err(failure("invalid_value", "Unknown Insert Table field")),
+                }
             }
             // The open Block Definition dialog: `name=…`, `open_in_editor=0|1`,
             // `base_on_screen=0|1`, `objects_on_screen=0|1`, `create_empty`,
@@ -3022,6 +3104,7 @@ impl OpenCADStudio {
             }
             // The open dialog's OK button.
             "dialog_ok" => match self.active_modal {
+                Some(crate::app::ModalKind::Unsaved) => Message::UnsavedDialogSave,
                 Some(crate::app::ModalKind::XrefAttach) => {
                     Message::XrefAttach(crate::ui::window::xref_attach::XrefAttachMsg::Apply)
                 }
@@ -3042,6 +3125,16 @@ impl OpenCADStudio {
                     Message::AttMan(crate::ui::window::attman_dialog::AttManMsg::Ok)
                 }
                 _ => return Err(failure("no_dialog", "No dialog with an OK button is open")),
+            },
+            "dialog_discard" | "dialog_cancel" => match self.active_modal {
+                Some(crate::app::ModalKind::Unsaved) => {
+                    if name == "dialog_discard" {
+                        Message::UnsavedDialogDiscard
+                    } else {
+                        Message::UnsavedDialogCancel
+                    }
+                }
+                _ => return Err(failure("no_dialog", "No dialog with that button is open")),
             },
             "close_document" => Message::TabClose(self.tabs[self.active_tab].id),
             "toggle_properties" => Message::ToggleProperties,

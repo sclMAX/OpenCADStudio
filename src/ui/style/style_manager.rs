@@ -50,6 +50,9 @@ pub struct Scaffold<'a, 'b> {
     /// Referenced styles may be copied but not changed, renamed, deleted, or
     /// made current.
     pub read_only: bool,
+    /// "Styles in use" list filter: whether it is on and the message that
+    /// sets it. `None` for managers without one.
+    pub in_use_filter: Option<(bool, fn(bool) -> Message)>,
     pub editor: Element<'a, Message>,
 }
 
@@ -101,9 +104,19 @@ pub fn view<'a, 'b>(s: Scaffold<'a, 'b>) -> Element<'a, Message> {
         })
         .collect();
 
+    let filter: Element<'_, Message> = match s.in_use_filter {
+        Some((on, message)) => checkbox(on)
+            .label(t!("Styles in use"))
+            .on_toggle(message)
+            .size(12)
+            .text_size(11)
+            .into(),
+        None => Space::new().height(0).into(),
+    };
     let list_panel = container(
         column![
             text(t!("Styles")).size(10).style(muted_text_style),
+            filter,
             container(scrollable(column(rows).spacing(1)).height(height))
                 .style(|theme: &Theme| {
                     let palette = theme.palette();

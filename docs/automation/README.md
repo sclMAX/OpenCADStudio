@@ -38,7 +38,7 @@ key.
 
 `ocs_render` is the low-friction drawing view. It delegates to the capture
 implementation and frames to extents by default. Use `ocs_capture` for tiles,
-diffs, window capture, and resource delivery. `ocs_read` and `ocs_execute`
+window capture, and resource delivery. `ocs_read` and `ocs_execute`
 remain the full-control surface for advanced operations and explicit envelopes.
 
 A complete drawing and verification flow needs no session or request IDs:
@@ -275,13 +275,11 @@ unconsumed, and the command closed rather than left armed for a second line. Geo
 
 `ocs_capture` defaults to the drawing viewport and a longest edge of 1600 pixels. Set `scope` to `window` for the full interface or change `max_dimension` between 256 and 4096.
 
-With `diff: true`, an unchanged comparison returns metadata only, including
-`diff.changed: false`, the hash and resource URI; it does not resend image or
-resource content blocks, regardless of `delivery`. The initial baseline (also
-after `reset_diff_baseline: true`) still uses the requested image delivery.
-Changed captures retain the requested diff mode, including cropped patches.
-Use `diff: false` or read the returned resource URI to retrieve the full image
-when an unchanged comparison omitted it.
+Every capture delivers its image under the requested `delivery`. The retired
+`diff`, `diff_mode` and `reset_diff_baseline` parameters are refused by name: the
+comparison's baseline moved with the camera and the on-screen command line
+counted as changed pixels, so it was removed rather than repaired. Capture twice
+and compare the two images if you need a visual delta.
 
 Clients using MCP 2026-07-28 can advertise `io.modelcontextprotocol/tasks`. OCS then returns a standard task handle when an operation is still running and accepts `tasks/get`, `tasks/update`, and `tasks/cancel`. Other clients continue to receive the existing operation status and can read it with `ocs_read`.
 

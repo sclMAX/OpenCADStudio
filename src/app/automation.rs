@@ -716,8 +716,6 @@ impl OpenCADStudio {
         })
     }
 
-    /// Handle one JSON request line and return the JSON response.
-    #[cfg(any(test, not(target_arch = "wasm32")))]
     /// Serve what plugins posted from their worker threads since the last
     /// request; the window's timer does this in the GUI.
     pub(crate) fn pump_plugin_requests(&mut self) {
@@ -727,6 +725,8 @@ impl OpenCADStudio {
         }
     }
 
+    /// Handle one JSON request line and return the JSON response.
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub(crate) fn automation_op(&mut self, line: &str) -> Value {
         self.pump_plugin_requests();
         if let Ok(req) = serde_json::from_str::<Value>(line) {
@@ -995,90 +995,86 @@ impl OpenCADStudio {
                             .collect()
                     })
                     .unwrap_or_default();
-                if req["clear"].as_bool() != Some(true) {
-                    let inside = definition_members(&self.tabs[i].scene.document);
-                    let refused: Vec<String> = explicit
-                        .iter()
-                        .filter(|h| inside.contains(h))
-                        .map(|h| format!("{:X}", h.value()))
-                        .collect();
-                    if !refused.is_empty() {
-                        return err(format!(
-                            "select: inside a block definition, not selectable: {}",
-                            refused.join(", ")
-                        ));
-                    }
+                let inside = definition_members(&self.tabs[i].scene.document);
+                let refused: Vec<String> = explicit
+                    .iter()
+                    .filter(|h| inside.contains(h))
+                    .map(|h| format!("{:X}", h.value()))
+                    .collect();
+                if !refused.is_empty() {
+                    return err(format!(
+                        "select: inside a block definition, not selectable: {}",
+                        refused.join(", ")
+                    ));
                 }
                 self.tabs[i].scene.deselect_all();
-                if req["clear"].as_bool() != Some(true) {
-                    for h in explicit {
+                for h in explicit {
+                    self.tabs[i].scene.select_entity(h, false);
+                }
+                // Or by a window / crossing box in world XY, through the
+                // viewport's own box test.
+                if let Some(window) = req["window"].as_array() {
+                    let corner = |index: usize| window.get(index).and_then(Value::as_f64);
+                    let (Some(x1), Some(y1), Some(x2), Some(y2)) =
+                        (corner(0), corner(1), corner(2), corner(3))
+                    else {
+                        return err("select: window needs [x1, y1, x2, y2]");
+                    };
+                    let crossing = req["crossing"].as_bool().unwrap_or(false);
+                    let (vw, vh) = self.tabs[i].scene.selection.borrow().view.vp_size;
+                    let tile = self.tabs[i].scene.active_model_tile_bounds(vw, vh);
+                    let bounds = iced::Rectangle {
+                        width: tile.width,
+                        height: tile.height,
+                        ..iced::Rectangle::default()
+                    };
+                    let screen = |x: f64, y: f64| {
+                        let camera = self.tabs[i].scene.camera.borrow();
+                        camera.project(glam::DVec3::new(x, y, 0.0), bounds)
+                    };
+                    let (Some(a), Some(p)) = (screen(x1, y1), screen(x2, y2)) else {
+                        return err("select: the window is not in view");
+                    };
+                    let (mut handles, _) = self.box_selection_handles(
+                        i,
+                        &None,
+                        bounds,
+                        iced::Point::new(a.x, a.y),
+                        iced::Point::new(p.x, p.y),
+                        crossing,
+                    );
+                    handles.retain(|&h| self.tabs[i].scene.passes_selection_filter(h));
+                    self.tabs[i].scene.select_entities(&handles);
+                    self.tabs[i].scene.expand_selection_for_groups(&handles);
+                }
+                // Or by type / layer.
+                let type_filter = req["type"].as_str();
+                let layer_filter = req["layer"].as_str();
+                if type_filter.is_some() || layer_filter.is_some() {
+                    // Only what the current space draws: an entity inside a
+                    // block definition is not selectable on its own.
+                    let scene = &self.tabs[i].scene;
+                    let space = scene.current_layout_block_handle_pub();
+                    let listed: std::collections::HashSet<codec::Handle> = scene
+                        .document
+                        .block_records
+                        .iter()
+                        .find(|record| record.handle == space)
+                        .map(|record| record.entity_handles.iter().copied().collect())
+                        .unwrap_or_default();
+                    let handles: Vec<codec::Handle> = scene
+                        .document
+                        .entities()
+                        .filter(|e| {
+                            e.common().owner_handle == space
+                                || listed.contains(&e.common().handle)
+                        })
+                        .filter(|e| type_filter.is_none_or(|t| entity_type_matches(e, t)))
+                        .filter(|e| layer_filter.is_none_or(|l| e.common().layer == l))
+                        .map(|e| e.common().handle)
+                        .collect();
+                    for h in handles {
                         self.tabs[i].scene.select_entity(h, false);
-                    }
-                    // Or by a window / crossing box in world XY, through the
-                    // viewport's own box test.
-                    if let Some(window) = req["window"].as_array() {
-                        let corner = |index: usize| window.get(index).and_then(Value::as_f64);
-                        let (Some(x1), Some(y1), Some(x2), Some(y2)) =
-                            (corner(0), corner(1), corner(2), corner(3))
-                        else {
-                            return err("select: window needs [x1, y1, x2, y2]");
-                        };
-                        let crossing = req["crossing"].as_bool().unwrap_or(false);
-                        let (vw, vh) = self.tabs[i].scene.selection.borrow().view.vp_size;
-                        let tile = self.tabs[i].scene.active_model_tile_bounds(vw, vh);
-                        let bounds = iced::Rectangle {
-                            width: tile.width,
-                            height: tile.height,
-                            ..iced::Rectangle::default()
-                        };
-                        let screen = |x: f64, y: f64| {
-                            let camera = self.tabs[i].scene.camera.borrow();
-                            camera.project(glam::DVec3::new(x, y, 0.0), bounds)
-                        };
-                        let (Some(a), Some(p)) = (screen(x1, y1), screen(x2, y2)) else {
-                            return err("select: the window is not in view");
-                        };
-                        let (mut handles, _) = self.box_selection_handles(
-                            i,
-                            &None,
-                            bounds,
-                            iced::Point::new(a.x, a.y),
-                            iced::Point::new(p.x, p.y),
-                            crossing,
-                        );
-                        handles.retain(|&h| self.tabs[i].scene.passes_selection_filter(h));
-                        self.tabs[i].scene.select_entities(&handles);
-                        self.tabs[i].scene.expand_selection_for_groups(&handles);
-                    }
-                    // Or by type / layer.
-                    let type_filter = req["type"].as_str();
-                    let layer_filter = req["layer"].as_str();
-                    if type_filter.is_some() || layer_filter.is_some() {
-                        // Only what the current space draws: an entity inside a
-                        // block definition is not selectable on its own.
-                        let scene = &self.tabs[i].scene;
-                        let space = scene.current_layout_block_handle_pub();
-                        let listed: std::collections::HashSet<codec::Handle> = scene
-                            .document
-                            .block_records
-                            .iter()
-                            .find(|record| record.handle == space)
-                            .map(|record| record.entity_handles.iter().copied().collect())
-                            .unwrap_or_default();
-                        let handles: Vec<codec::Handle> = scene
-                            .document
-                            .entities()
-                            .filter(|e| {
-                                e.common().owner_handle == space
-                                    || listed.contains(&e.common().handle)
-                            })
-                            .filter(|e| type_filter.is_none_or(|t| entity_type_matches(e, t)))
-                            .filter(|e| layer_filter.is_none_or(|l| e.common().layer == l))
-                            .map(|e| e.common().handle)
-                            .collect();
-                        for h in handles {
-                            self.tabs[i].scene.select_entity(h, false);
-                        }
                     }
                 }
                 json!({ "ok": true, "selected": self.tabs[i].scene.selected_entities().len() })
@@ -1164,11 +1160,13 @@ impl OpenCADStudio {
     }
 
     /// Run a command line headlessly. Thin wrapper over the shared
-    /// [`OpenCADStudio::run_command_line`] (see `cmd_result.rs`), which the GUI
-    /// command line uses too so both process `UCS Z 90` / `LINE 0,0 10,10` /
-    /// `PDMODE 3` identically.
+    /// [`OpenCADStudio::run_one_command_line`] (see `cmd_result.rs`), which the
+    /// GUI command line shares so both process `UCS Z 90` / `LINE 0,0 10,10` /
+    /// `PDMODE 3` identically. A caller sends one command per call, so words
+    /// the command did not ask for stay unconsumed rather than starting the
+    /// next command.
     fn run_headless(&mut self, cmd: &str) -> Result<(), String> {
-        let task = self.run_command_line(cmd);
+        let task = self.run_one_command_line(cmd);
         self.drive_headless_task(task)
     }
 
@@ -1448,6 +1446,27 @@ impl OpenCADStudio {
         }
         let count = matched.len();
         let fields = req["fields"].as_array();
+        // A field the matched entities do not carry used to be dropped without a
+        // word: the record came back as its handle alone, which reads as "this
+        // entity has no such value" rather than "the parameter was not applied".
+        if let Some(requested) = fields {
+            let carried: std::collections::HashSet<&str> = matched
+                .iter()
+                .filter_map(|(_, entity)| entity.as_object())
+                .flat_map(|object| object.keys().map(String::as_str))
+                .collect();
+            let unknown: Vec<&str> = requested
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|name| *name != "handle" && !carried.contains(name))
+                .collect();
+            if !unknown.is_empty() {
+                return err(format!(
+                    "query: no matched entity has the field(s): {}",
+                    unknown.join(", ")
+                ));
+            }
+        }
         let entities: Vec<Value> = matched
             .into_iter()
             .skip(offset)
@@ -2520,6 +2539,45 @@ mod tests {
     }
 
     #[test]
+    fn run_keeps_a_commands_argument_out_of_the_command_table() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        // `BEDIT` takes no inline argument — it opens the picker. The word after
+        // it is an unused argument of this line, not a command of its own: it
+        // must neither be dispatched nor turn the call into a failure.
+        let r = app.automation_op(r#"{"op":"run","cmd":"BEDIT CIRCLE"}"#);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["status"], "waiting_input", "{r}");
+        assert_eq!(r["blocked_by"], "modal:BlockEditPicker", "{r}");
+        assert_eq!(r["unconsumed"][0], "CIRCLE", "{r}");
+        assert_eq!(r["added"], 0, "the argument was run as a command: {r}");
+
+        let counts = app.automation_op(r#"{"op":"entities"}"#);
+        assert!(counts["by_type"].get("Circle").is_none(), "{counts}");
+        assert!(
+            app.command_line.last_error.is_none(),
+            "{:?}",
+            app.command_line.last_error
+        );
+    }
+
+    #[test]
+    fn a_standalone_option_letter_is_consumed_by_the_menu_command() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+
+        // `F` is the Form option of the menu: it has to reach that command on
+        // the same line, and the trailing Enter continues from there rather
+        // than leaving the letter behind as unconsumed input.
+        let r = app.automation_op(r#"{"op":"run","cmd":"DIMCONSTRAINT F"}"#);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["unconsumed"].as_array().map(|v| v.len()), Some(0), "{r}");
+        let state = app.control_state();
+        assert_eq!(state["command"]["name"], "DIMCONSTRAINT", "{state}");
+    }
+
+    #[test]
     fn run_reports_leftover_tokens_instead_of_dropping_them() {
         let mut app = OpenCADStudio::new_for_test();
         let _ = app.automation_op(r#"{"op":"new"}"#);
@@ -2635,6 +2693,58 @@ mod tests {
         assert_eq!(app.automation_op(r#"{"op":"bogus"}"#)["ok"], false);
         assert_eq!(app.automation_op("not json")["ok"], false);
         assert_eq!(app.automation_op(r#"{"op":"run"}"#)["ok"], false);
+    }
+
+    #[test]
+    fn select_clear_starts_empty_and_still_applies_the_filter() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        let _ = app.automation_op(r#"{"op":"run","cmd":"LINE 0,5 10,5"}"#);
+        let _ = app.automation_op(r#"{"op":"run","cmd":"CIRCLE 5,5 3"}"#);
+
+        // `clear` means "start from an empty selection", not "select nothing":
+        // the filter that follows must still reach the drawing.
+        let r = app.automation_op(r#"{"op":"select","clear":true,"type":"Line"}"#);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["selected"], 2, "{r}");
+
+        let q = app.automation_op(r#"{"op":"query","type":"Circle"}"#);
+        let circle = q["entities"][0]["handle"].as_str().unwrap().to_string();
+        let r = app.automation_op(&format!(
+            r#"{{"op":"select","clear":true,"handles":["{circle}"]}}"#
+        ));
+        assert_eq!(r["selected"], 1, "{r}");
+
+        // With nothing to apply, `clear` alone still empties the selection.
+        let r = app.automation_op(r#"{"op":"select","clear":true}"#);
+        assert_eq!(r["selected"], 0, "{r}");
+    }
+
+    /// A window selects what it wholly contains; `crossing` is the mirror box
+    /// that also takes what it only touches. Both came back empty for every
+    /// box, the containing one included.
+    #[test]
+    fn select_window_takes_what_it_contains_and_crossing_what_it_touches() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.automation_op(r#"{"op":"run","cmd":"CIRCLE 0,0 5"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+
+        let r = app.automation_op(r#"{"op":"select","clear":true,"window":[-10,-10,10,10]}"#);
+        assert_eq!(r["selected"], 1, "window around the whole circle: {r}");
+
+        let r = app.automation_op(r#"{"op":"select","clear":true,"window":[3,3,12,12]}"#);
+        assert_eq!(r["selected"], 0, "window only grazing the circle: {r}");
+
+        let r = app.automation_op(
+            r#"{"op":"select","clear":true,"window":[3,3,12,12],"crossing":true}"#,
+        );
+        assert_eq!(
+            r["selected"], 1,
+            "crossing box over the circle's edge: {r}"
+        );
     }
 
     #[test]
@@ -2877,6 +2987,35 @@ mod tests {
         ));
         assert_eq!(r["ok"], false);
         assert_eq!(r["code"], "window_required");
+    }
+
+    #[test]
+    fn query_rejects_a_field_no_matched_entity_carries() {
+        let mut app = OpenCADStudio::new_for_test();
+        let _ = app.automation_op(r#"{"op":"new"}"#);
+        let _ = app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+
+        // A requested field has to come back. Answering with the handle alone
+        // reads as "this entity has no such value", which is a different claim
+        // and the caller cannot tell the two apart.
+        let r = app.automation_op(
+            r#"{"op":"query","type":"Line","detail":"full","fields":["actual_measurement"]}"#,
+        );
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("actual_measurement"),
+            "{r}"
+        );
+
+        // A field the entity does carry still comes through on its own.
+        let r =
+            app.automation_op(r#"{"op":"query","type":"Line","detail":"full","fields":["layer"]}"#);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r["entities"][0].get("layer").is_some(), "{r}");
+        assert!(r["entities"][0].get("bounds").is_none(), "{r}");
     }
 
     #[test]

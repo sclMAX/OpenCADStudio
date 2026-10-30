@@ -530,6 +530,14 @@ impl OpenCADStudio {
                 self.open_table_insert();
             }
 
+            "-TABLE" => {
+                self.start_command_line_table();
+            }
+
+            cmd if cmd.starts_with("-TABLE _LINK ") => {
+                self.place_command_line_link_table(&cmd["-TABLE _LINK ".len()..]);
+            }
+
             "TABLEDIT" => {
                 use crate::modules::annotate::table_cmd::TableditCommand;
                 let cmd = TableditCommand::new();

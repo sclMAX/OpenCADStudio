@@ -4,6 +4,7 @@
 //! Finish.  That keeps Cancel lossless and lets the wizard validate one page
 //! before advancing to the next.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -84,7 +85,12 @@ pub struct TableInsertState {
     pub columns: String,
     pub data_rows: String,
     pub column_width: String,
+    /// Row height, in lines of the row's text.
     pub row_height: String,
+    /// Window insertion keeps the column count (else the column width).
+    pub columns_fixed: bool,
+    /// Window insertion keeps the data row count (else the row height).
+    pub rows_fixed: bool,
     pub preview: bool,
     pub first_row_style: String,
     pub second_row_style: String,
@@ -101,10 +107,12 @@ impl Default for TableInsertState {
             links: Vec::new(),
             link: None,
             insertion: TableInsertion::Point,
-            columns: "3".into(),
-            data_rows: "4".into(),
-            column_width: "2.0".into(),
-            row_height: "0.5".into(),
+            columns: "5".into(),
+            data_rows: "1".into(),
+            column_width: "63.5".into(),
+            row_height: "1".into(),
+            columns_fixed: true,
+            rows_fixed: true,
             preview: true,
             first_row_style: "Title".into(),
             second_row_style: "Header".into(),
@@ -124,6 +132,8 @@ pub enum TableInsertField {
     DataRows(String),
     ColumnWidth(String),
     RowHeight(String),
+    ColumnsFixed(bool),
+    RowsFixed(bool),
     Preview(bool),
     FirstRowStyle(String),
     SecondRowStyle(String),
@@ -528,10 +538,78 @@ fn preview_grid<'a>(rows: &'a [Vec<String>]) -> Element<'a, Message> {
         .into()
 }
 
-pub fn table_insert_view(
-    state: &TableInsertState,
+/// The Insert Table dialog's sample: a title, a header and data rows.
+struct InsertTablePreview;
+
+impl iced::widget::canvas::Program<Message> for InsertTablePreview {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        theme: &Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Path, Stroke, Text};
+        use iced::Point;
+        let mut frame = Frame::new(renderer, bounds.size());
+        let ink = theme.palette().background.base.text;
+        frame.fill(
+            &Path::rectangle(Point::ORIGIN, bounds.size()),
+            theme.palette().background.weak.color,
+        );
+        let (left, top) = (12.0, 8.0);
+        let (width, height) = (bounds.width - 24.0, bounds.height - 16.0);
+        let rows = 6usize;
+        let row_h = height / rows as f32;
+        let col_w = width / 3.0;
+        let stroke = Stroke::default()
+            .with_color(ink.scale_alpha(0.8))
+            .with_width(1.0);
+        for k in 0..=rows {
+            let y = top + k as f32 * row_h;
+            frame.stroke(&Path::line(Point::new(left, y), Point::new(left + width, y)), stroke);
+        }
+        for k in 0..=3 {
+            let x = left + k as f32 * col_w;
+            // The title row spans the table.
+            let y0 = if k == 0 || k == 3 { top } else { top + row_h };
+            frame.stroke(&Path::line(Point::new(x, y0), Point::new(x, top + height)), stroke);
+        }
+        let label = |frame: &mut Frame, content: String, x: f32, y: f32, size: f32| {
+            frame.fill_text(Text {
+                content,
+                position: Point::new(x, y),
+                color: ink,
+                size: iced::Pixels(size),
+                align_x: iced::advanced::text::Alignment::Center,
+                align_y: iced::alignment::Vertical::Center,
+                ..Default::default()
+            });
+        };
+        label(&mut frame, t!("Title").into_owned(), left + width / 2.0, top + row_h / 2.0, 13.0);
+        for row in 1..rows {
+            let content = if row == 1 { t!("Header") } else { t!("Data") }.into_owned();
+            for column in 0..3 {
+                label(
+                    &mut frame,
+                    content.clone(),
+                    left + (column as f32 + 0.5) * col_w,
+                    top + (row as f32 + 0.5) * row_h,
+                    11.0,
+                );
+            }
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+pub fn table_insert_view<'a>(
+    state: &'a TableInsertState,
     sizing: crate::ui::modal::ModalSizing,
-) -> Element<'_, Message> {
+) -> Element<'a, Message> {
     let style = pick_list(Some(state.style.clone()), state.styles.clone(), |value| {
         value.clone()
     })
@@ -588,21 +666,73 @@ pub fn table_insert_view(
             Message::TableInsertField(TableInsertField::Insertion(TableInsertion::Window))
         ),
     ];
+    // In window mode one value of each pair comes from the window ("Auto");
+    // the dot marks the one kept.
+    let window = state.insertion == TableInsertion::Window;
+    let setting = |label: Cow<'static, str>,
+                   value: &'a str,
+                   kept: bool,
+                   keep: Message,
+                   suffix: Option<Cow<'static, str>>,
+                   msg: fn(String) -> Message|
+     -> Element<'a, Message> {
+        let input: Element<'a, Message> = if window && !kept {
+            text_input("", &t!("Auto"))
+                .padding([4, 7])
+                .size(12)
+                .width(Fill)
+                .into()
+        } else {
+            text_input("", value)
+                .on_input(msg)
+                .padding([4, 7])
+                .size(12)
+                .width(Fill)
+                .into()
+        };
+        let mut line = row![].spacing(6).align_y(iced::Center);
+        if window {
+            line = line.push(form_radio("", true, kept.then_some(true), move |_| keep.clone()));
+        }
+        line = line.push(text(label).size(11).style(muted).width(92)).push(input);
+        if let Some(suffix) = suffix {
+            line = line.push(text(suffix).size(11).style(muted));
+        }
+        line.into()
+    };
     let settings = column![
-        labeled_input(
+        setting(
             t!("Columns"),
             &state.columns,
+            state.columns_fixed,
+            Message::TableInsertField(TableInsertField::ColumnsFixed(true)),
+            None,
             |v| Message::TableInsertField(TableInsertField::Columns(v))
         ),
-        labeled_input(t!("Column width"), &state.column_width, |v| {
-            Message::TableInsertField(TableInsertField::ColumnWidth(v))
-        }),
-        labeled_input(t!("Data rows"), &state.data_rows, |v| {
-            Message::TableInsertField(TableInsertField::DataRows(v))
-        }),
-        labeled_input(t!("Row height"), &state.row_height, |v| {
-            Message::TableInsertField(TableInsertField::RowHeight(v))
-        }),
+        setting(
+            t!("Column width"),
+            &state.column_width,
+            !state.columns_fixed,
+            Message::TableInsertField(TableInsertField::ColumnsFixed(false)),
+            None,
+            |v| Message::TableInsertField(TableInsertField::ColumnWidth(v))
+        ),
+        setting(
+            t!("Data rows"),
+            &state.data_rows,
+            state.rows_fixed,
+            Message::TableInsertField(TableInsertField::RowsFixed(true)),
+            None,
+            |v| Message::TableInsertField(TableInsertField::DataRows(v))
+        ),
+        setting(
+            t!("Row height"),
+            &state.row_height,
+            !state.rows_fixed,
+            Message::TableInsertField(TableInsertField::RowsFixed(false)),
+            Some(t!("Line(s)")),
+            |v| Message::TableInsertField(TableInsertField::RowHeight(v))
+        ),
     ]
     .spacing(5);
     let cell_styles = column![
@@ -617,22 +747,50 @@ pub fn table_insert_view(
         }),
     ]
     .spacing(5);
-    column![
-        group(t!("Table style"), row![style].into()),
+    // Left: what the table starts from and its sample; right: how it is
+    // placed and sized, and the row styles.
+    let preview: Element<'a, Message> = if state.preview {
+        iced::widget::canvas(InsertTablePreview)
+            .width(Fill)
+            .height(Fill)
+            .into()
+    } else {
+        Space::new().height(Fill).into()
+    };
+    let left = column![
+        group(
+            t!("Table style"),
+            row![
+                style,
+                button(text(t!("Table Style…")).size(11))
+                    .on_press(Message::TableInsertManageStyles)
+                    .padding([4, 8]),
+            ]
+            .spacing(8)
+            .align_y(iced::Center)
+            .into()
+        ),
         group(
             t!("Insert options"),
             column![source, link_picker].spacing(4).into()
         ),
-        row![
-            group(t!("Insertion behavior"), insertion.into()),
-            group(t!("Column & row settings"), settings.into())
-        ]
-        .spacing(8),
-        group(t!("Set cell styles"), cell_styles.into()),
         checkbox(state.preview)
             .label(t!("Preview"))
             .on_toggle(|v| Message::TableInsertField(TableInsertField::Preview(v)))
             .size(14),
+        preview,
+    ]
+    .spacing(8)
+    .width(Fill);
+    let right = column![
+        group(t!("Insertion behavior"), insertion.into()),
+        group(t!("Column & row settings"), settings.into()),
+        group(t!("Set cell styles"), cell_styles.into()),
+    ]
+    .spacing(8)
+    .width(Fill);
+    column![
+        row![left, right].spacing(10).height(Fill),
         text(&state.error).size(11),
         row![
             Space::new().width(Fill),

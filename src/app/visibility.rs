@@ -227,25 +227,25 @@ impl OpenCADStudio {
         state_idx: usize,
         param: &BlockVisibilityParameter,
     ) -> Option<StateMapping> {
-        let def_handles: Vec<Handle> = doc
-            .block_records
-            .iter()
-            .find(|b| b.handle == def_block)?
-            .entity_handles
-            .clone();
+        let def_handles = crate::scene::block_authoring::members(doc, def_block);
         let anon_handles: Vec<Handle> = doc
             .block_records
             .iter()
             .find(|b| b.name == anon_name)?
             .entity_handles
             .clone();
-        let state = param.states.get(state_idx)?;
-        let visible: HashSet<u64> = state.visible_blocks.iter().map(|h| h.value()).collect();
-        let visible_idx: HashSet<usize> = def_handles
+        if def_handles.len() != anon_handles.len() {
+            return None;
+        }
+        let shown = crate::scene::block_visibility::state_visibility(doc, param.handle, state_idx);
+        if shown.len() != def_handles.len() {
+            return None;
+        }
+        let visible_idx: HashSet<usize> = shown
             .iter()
             .enumerate()
-            .filter(|(_, h)| visible.contains(&h.value()))
-            .map(|(i, _)| i)
+            .filter(|(_, visible)| **visible)
+            .map(|(index, _)| index)
             .collect();
         Some(StateMapping {
             anon_handles,

@@ -370,6 +370,27 @@ pub fn path_entity(document: &Document, array: &AssocArray) -> Option<(Handle, E
         })
 }
 
+/// World to array-block coordinates: the inverse of the array reference's
+/// transform (identity when the reference is missing).
+fn array_block_from_world(document: &Document, insert: Handle) -> DMat4 {
+    let Some(EntityType::Insert(reference)) = document.get_entity(insert) else {
+        return DMat4::IDENTITY;
+    };
+    let transform = crate::scene::render_graph::insert_transform(document, reference);
+    let at = |x: f64, y: f64, z: f64| {
+        let p = transform.apply(codec::types::Vector3::new(x, y, z));
+        DVec3::new(p.x, p.y, p.z)
+    };
+    let origin = at(0.0, 0.0, 0.0);
+    DMat4::from_cols(
+        (at(1.0, 0.0, 0.0) - origin).extend(0.0),
+        (at(0.0, 1.0, 0.0) - origin).extend(0.0),
+        (at(0.0, 0.0, 1.0) - origin).extend(0.0),
+        origin.extend(1.0),
+    )
+    .inverse()
+}
+
 /// The items of a path array along `path`: `Items` of them `ItemSpacing`
 /// apart from the path's start (its end when `PathDirection` is 0), spread
 /// over the whole path when `Method` is 0 (Divide), turned to the travel
@@ -610,7 +631,13 @@ pub fn update(
                     set_param_value(&mut params, "ItemSpacing", curve.length() / gaps.max(1.0));
                 }
             }
+            // The path gives world placements; the items live in the array
+            // block, so undo where the array reference puts that block.
+            let to_block = array_block_from_world(document, array.insert);
             path_items(&params, path)
+                .into_iter()
+                .map(|(location, placement)| (location, to_block * placement))
+                .collect()
         }
     };
     if placements.is_empty() {
@@ -1622,6 +1649,60 @@ mod tests {
             };
             let insert = create_from_spec(&mut scene, &[source], DVec3::ZERO, &spec).unwrap();
             assert_block_dependency_reactors(&scene.document, insert);
+        }
+    }
+
+    #[test]
+    fn path_array_moved_with_its_path_stays_on_the_path() {
+        let mut scene = crate::scene::Scene::new();
+        let source = scene.add_entity(codec::EntityType::Circle(
+            codec::entities::Circle::from_coords(0.0, 0.0, 0.0, 2.0),
+        ));
+        let path = scene.add_entity(codec::EntityType::Line(codec::entities::Line::from_coords(
+            0.0, 0.0, 0.0, 100.0, 0.0, 0.0,
+        )));
+        let spec = AssocArraySpec::Path {
+            path,
+            items: 5,
+            spacing: 25.0,
+            divide: false,
+            reversed: false,
+        };
+        let insert = create_from_spec(&mut scene, &[source], DVec3::ZERO, &spec).unwrap();
+        scene.transform_entities(
+            &[path, insert],
+            &crate::command::EntityTransform::Translate(DVec3::new(0.0, 20.0, 0.0)),
+        );
+
+        let document = &scene.document;
+        let array = array_of_insert(document, insert).unwrap();
+        let Some(EntityType::Insert(reference)) = document.get_entity(insert) else {
+            panic!("array reference");
+        };
+        let to_world = crate::scene::render_graph::insert_transform(document, reference);
+        let mut world: Vec<(f64, f64)> = document
+            .block_records
+            .iter()
+            .find(|record| record.handle == array.array_block)
+            .unwrap()
+            .entity_handles
+            .iter()
+            .filter_map(|handle| match document.get_entity(*handle) {
+                Some(EntityType::Insert(item)) => {
+                    let p = to_world.apply(item.insert_point);
+                    Some((p.x, p.y))
+                }
+                _ => None,
+            })
+            .collect();
+        world.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(world.len(), 5);
+        for (index, (x, y)) in world.into_iter().enumerate() {
+            assert!((x - 25.0 * index as f64).abs() < 1e-9, "item {index} x {x}");
+            assert!(
+                (y - 20.0).abs() < 1e-9,
+                "item {index} y {y} off the moved path"
+            );
         }
     }
 }

@@ -725,7 +725,8 @@ impl OpenCADStudio {
         {
             match prop.value {
                 PropValue::BlockNumber { value, .. } => {
-                    if let Ok(num) = value.parse::<f64>() {
+                    if let Some(num) = crate::app::block_parameter_properties::parse_value(&value)
+                    {
                         dyn_props.insert(prop.label, json!(clean_float(num)));
                     } else {
                         dyn_props.insert(prop.label, json!(value));

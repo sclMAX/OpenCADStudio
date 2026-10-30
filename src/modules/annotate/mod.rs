@@ -289,7 +289,24 @@ impl CadModule for AnnotateModule {
                             style_key: StyleKey::TableStyle,
                             combo_id: "TABLE_STYLE_COMBO",
                             manager_cmd: Some("TABLESTYLE"),
-                            rows: vec![vec![data_extract::tool(), data_link::tool()]],
+                            // Each row leads with an icon-only update button,
+                            // then the tool named beside its icon.
+                            rows: vec![
+                                vec![
+                                    data_link::download_tool(),
+                                    crate::modules::ToolDef {
+                                        label: "Extract Data",
+                                        ..data_extract::tool()
+                                    },
+                                ],
+                                vec![
+                                    data_link::upload_tool(),
+                                    crate::modules::ToolDef {
+                                        label: "Link Data",
+                                        ..data_link::tool()
+                                    },
+                                ],
+                            ],
                         },
                     ],
                 },

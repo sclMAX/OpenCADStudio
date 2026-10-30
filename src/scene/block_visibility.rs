@@ -434,6 +434,29 @@ pub fn apply_state(document: &mut Document, parameter: Handle, index: usize) {
     }
 }
 
+/// Per-member visibility of state `index`, in definition member order. A
+/// member the parameter does not control stays visible in every state: a
+/// state only hides objects the parameter governs and it does not name.
+pub fn state_visibility(document: &Document, parameter: Handle, index: usize) -> Vec<bool> {
+    let Some(ObjectType::BlockVisibilityParameter(parameter)) = document.objects.get(&parameter)
+    else {
+        return Vec::new();
+    };
+    let Some(state) = parameter.states.get(index) else {
+        return Vec::new();
+    };
+    let Some(definition) = owner_definition(document, parameter.handle) else {
+        return Vec::new();
+    };
+    members(document, definition)
+        .into_iter()
+        .map(|handle| {
+            !parameter.all_blocks.contains(&handle)
+                || state.visible_blocks.contains(&handle)
+        })
+        .collect()
+}
+
 /// The state whose objects are the ones the definition shows now.
 pub fn shown_state(document: &Document, parameter: Handle) -> usize {
     let Some(ObjectType::BlockVisibilityParameter(parameter)) = document.objects.get(&parameter)
@@ -684,6 +707,49 @@ mod tests {
         scene.set_block_visibility_reveal(false);
         assert_eq!(scene.document, before);
         assert!(!scene.visibility_revealed(controlled));
+    }
+
+    /// A member the parameter does not control stays visible in every state;
+    /// only the objects a state names are hidden when it does not list them.
+    #[test]
+    fn a_state_hides_only_the_members_the_parameter_controls() {
+        let mut scene = Scene::new();
+        scene.define_block_raw(
+            "opening",
+            Vector3::ZERO,
+            vec![
+                EntityType::Line(Line::from_coords(0.0, 0.0, 0.0, 1.0, 0.0, 0.0)),
+                EntityType::Line(Line::from_coords(0.0, 1.0, 0.0, 1.0, 1.0, 0.0)),
+                EntityType::Line(Line::from_coords(0.0, 2.0, 0.0, 1.0, 2.0, 0.0)),
+            ],
+        );
+        let definition = scene.document.block_records.get("opening").unwrap().handle;
+        let parameter = create(&mut scene.document, definition, Vector3::ZERO).unwrap();
+        let hidden = add_state(&mut scene.document, parameter, "WindowHidden", 0).unwrap();
+        let frame = members(&scene.document, definition)[1];
+        set_visible(&mut scene.document, parameter, hidden, &[frame], false);
+
+        let handles = members(&scene.document, definition);
+        let shown = state_visibility(&scene.document, parameter, hidden);
+        assert_eq!(
+            shown,
+            vec![true, false, true],
+            "the door and cat are not controlled, so the state leaves them visible"
+        );
+        assert_eq!(state_visibility(&scene.document, parameter, 0), vec![true; 3]);
+
+        apply_state(&mut scene.document, parameter, hidden);
+        let visible = |handle: Handle| {
+            !scene
+                .document
+                .get_entity(handle)
+                .expect("member")
+                .common()
+                .invisible
+        };
+        assert!(visible(handles[0]), "the door stays visible");
+        assert!(!visible(handles[1]), "the window frame is hidden");
+        assert!(visible(handles[2]), "the cat stays visible");
     }
 
     /// A block given visibility states round-trips them, and a reference

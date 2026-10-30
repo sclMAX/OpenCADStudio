@@ -48,6 +48,7 @@ pub(crate) mod sheet_set;
 mod spell;
 mod styleprops;
 mod text_edit;
+mod table_style_var;
 mod text_layer;
 mod ucsfollow;
 mod view;
@@ -563,6 +564,9 @@ impl OpenCADStudio {
             return Some(t);
         }
         if let Some(t) = self.dispatch_dim_layer(cmd, i) {
+            return Some(t);
+        }
+        if let Some(t) = self.dispatch_table_style_var(cmd, i) {
             return Some(t);
         }
         if let Some(t) = self.dispatch_layer_variable(cmd, i) {

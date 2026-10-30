@@ -4185,6 +4185,32 @@ impl Scene {
             &[],
             true,
             false,
+            None,
+        );
+    }
+
+    /// Apply a newly-created relation. A constraint handler names every
+    /// referenced entity `Modified` before the solve runs, so the delta is
+    /// filtered against the pre-solve copies: only geometry that actually
+    /// moved is published. `pre_move` carries the copies a handler took
+    /// before it nudged geometry onto the relation itself; an empty slice
+    /// makes the copies here, which is right for a handler that wrote none.
+    pub fn bump_entities_after_constraint_added(
+        &mut self,
+        changes: &[(Handle, ChangeKind)],
+        driven_refs: &[parametric_constraints::ParametricRef],
+        retain_size: bool,
+        pre_move: &[(Handle, EntityType)],
+    ) {
+        self.bump_entities_with_solve_policy(
+            changes,
+            driven_refs,
+            retain_size,
+            &[],
+            &[],
+            true,
+            false,
+            Some(pre_move),
         );
     }
 
@@ -4193,13 +4219,13 @@ impl Scene {
         &mut self,
         changes: &[(Handle, ChangeKind)],
     ) {
-        self.bump_entities_with_solve_policy(changes, &[], false, &[], &[], false, false);
+        self.bump_entities_with_solve_policy(changes, &[], false, &[], &[], false, false, None);
     }
 
     /// Refresh display after a restyle that moved no geometry: nothing
     /// associated to these entities is re-resolved or re-solved.
     pub(crate) fn bump_entities_restyled(&mut self, changes: &[(Handle, ChangeKind)]) {
-        self.bump_entities_with_solve_policy(changes, &[], false, &[], &[], false, true);
+        self.bump_entities_with_solve_policy(changes, &[], false, &[], &[], false, true, None);
     }
 
     /// Apply a newly-created ordered relation while temporarily anchoring
@@ -4219,6 +4245,7 @@ impl Scene {
             fixed_refs,
             true,
             false,
+            Some(&[]),
         );
     }
 
@@ -4237,6 +4264,7 @@ impl Scene {
             transformed_refs,
             true,
             false,
+            None,
         );
     }
 
@@ -4249,7 +4277,30 @@ impl Scene {
         fixed_refs: &[parametric_constraints::ParametricRef],
         solve_parametric: bool,
         appearance_only: bool,
+        report_before: Option<&[(Handle, EntityType)]>,
     ) {
+        // A solve can name an entity it then leaves untouched — a neighbour
+        // that already satisfied the relation, or the datum the solver
+        // anchors. When the caller says its list is speculative, keep the
+        // pre-solve copies so the published delta names only geometry that
+        // actually moved; every refresh below still sees the full list,
+        // because they have to run whether or not the entity ends up
+        // modified.
+        let reported_before: Vec<(Handle, EntityType)> = match report_before {
+            Some(pre_move) => changes
+                .iter()
+                .filter(|(_, kind)| matches!(kind, ChangeKind::Modified))
+                .filter_map(|(handle, _)| {
+                    let snapshot = pre_move
+                        .iter()
+                        .find(|(h, _)| h == handle)
+                        .map(|(_, entity)| entity.clone())
+                        .or_else(|| self.document.get_entity(*handle).cloned())?;
+                    Some((*handle, snapshot))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         if changes.iter().any(|(handle, kind)| {
             matches!(kind, ChangeKind::Removed)
                 || self
@@ -4458,7 +4509,34 @@ impl Scene {
                 }
             }
         }
-        self.push_geometry_delta(epoch, changes, false);
+        self.push_geometry_delta(epoch, Self::reported_changes(changes, &reported_before, &self.document), false);
+    }
+
+    /// The delta names what moved. A `Modified` handle whose entity is
+    /// byte-identical to the pre-solve copy is dropped — the solver
+    /// considered it and left it alone — while added and removed handles,
+    /// and anything the refresh pass appended after the snapshot, are
+    /// always named.
+    fn reported_changes(
+        changes: Vec<(Handle, ChangeKind)>,
+        before: &[(Handle, EntityType)],
+        document: &Document,
+    ) -> Vec<(Handle, ChangeKind)> {
+        if before.is_empty() {
+            return changes;
+        }
+        changes
+            .into_iter()
+            .filter(|(handle, kind)| {
+                if !matches!(kind, ChangeKind::Modified) {
+                    return true;
+                }
+                match before.iter().find(|(h, _)| h == handle) {
+                    Some((_, snapshot)) => document.get_entity(*handle) != Some(snapshot),
+                    None => true,
+                }
+            })
+            .collect()
     }
 
     /// Append the handles an associative refresh re-solved, skipping the ones

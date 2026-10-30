@@ -19,6 +19,26 @@ pub fn tool() -> ToolDef {
     }
 }
 
+/// Download from Source: refresh linked tables from their files.
+pub fn download_tool() -> ToolDef {
+    ToolDef {
+        id: "DATALINKUPDATE",
+        label: "Download from Source",
+        icon: IconKind::Svg(include_bytes!("../../../assets/icons/sync.svg")),
+        event: ModuleEvent::Command("DATALINKUPDATE;_U".to_string()),
+    }
+}
+
+/// Upload to Source: write linked tables back to their files.
+pub fn upload_tool() -> ToolDef {
+    ToolDef {
+        id: "DATALINKUPDATE_WRITE",
+        label: "Upload to Source",
+        icon: IconKind::Svg(include_bytes!("../../../assets/icons/ui/file_export.svg")),
+        event: ModuleEvent::Command("DATALINKUPDATE;_W".to_string()),
+    }
+}
+
 /// Marks a table waiting to be linked to the extraction settings named after
 /// the marker.
 pub const EXTRACTION_PENDING: &str = "__OPENCAD_EXTRACTION_PENDING__";
@@ -48,6 +68,14 @@ impl DataLinkPlaceCommand {
             table,
             plane: WorkingPlane::default(),
             command_name: "DATALINK",
+        }
+    }
+
+    /// The same, placed from -TABLE's data Link option.
+    pub fn existing_from_table(table: Table, link: codec::Handle) -> Self {
+        Self {
+            command_name: "-TABLE",
+            ..Self::existing(table, link)
         }
     }
 
@@ -191,6 +219,8 @@ impl CadCommand for DataLinkPlaceCommand {
     fn prompt(&self) -> String {
         if self.command_name == "DATALINK" {
             t!("DATALINK  Specify insertion point:").into_owned()
+        } else if self.command_name == "-TABLE" {
+            t!("%{n}  Specify insertion point:", n = "-TABLE").into_owned()
         } else {
             t!("DATAEXTRACTION  Specify insertion point:").into_owned()
         }
@@ -206,7 +236,15 @@ impl CadCommand for DataLinkPlaceCommand {
     }
 
     fn on_enter(&mut self) -> CmdResult {
+        if self.command_name == "-TABLE" {
+            return CmdResult::ReportError(t!("Invalid point.").into_owned());
+        }
         CmdResult::Cancel
+    }
+
+    fn on_text_input(&mut self, _text: &str) -> Option<CmdResult> {
+        (self.command_name == "-TABLE")
+            .then(|| CmdResult::ReportError(t!("Invalid point.").into_owned()))
     }
 
     fn on_mouse_move(&mut self, point: DVec3) -> Option<WireModel> {

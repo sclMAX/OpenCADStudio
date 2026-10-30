@@ -1036,6 +1036,7 @@ pub fn view_window<'a>(
         on_set_current: Message::MLeaderStyleDialogSetCurrent,
         on_apply: Message::MLeaderStyleApply,
         read_only: false,
+        in_use_filter: None,
         editor,
     })
 }

@@ -839,6 +839,7 @@ impl OpenCADStudio {
             grip_object_limit: self.grip_object_limit,
             image_frame: crate::scene::frame::profile_image_mode(),
             attdef_on_screen: crate::modules::draw::draw::attdef::session().on_screen,
+            table_insert: *crate::modules::annotate::table_cmd::session(),
             block_base_on_screen: block_defaults.base_on_screen,
             block_objects_on_screen: block_defaults.objects_on_screen,
             block_object_mode: crate::modules::insert::block_cmdline::mode_code(
@@ -1013,6 +1014,7 @@ impl OpenCADStudio {
         self.grip_object_limit = s.grip_object_limit.clamp(0, 32767);
         crate::scene::frame::set_profile_image_mode(s.image_frame);
         crate::modules::draw::draw::attdef::session().on_screen = s.attdef_on_screen;
+        *crate::modules::annotate::table_cmd::session() = s.table_insert;
         {
             use crate::modules::insert::block_cmdline as bc;
             let mut remembered = bc::defaults();

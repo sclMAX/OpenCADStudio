@@ -602,11 +602,11 @@ fn wire_distances(wire: &WireModel) -> (Vec<f32>, f32, f32) {
     };
 
     if has_break {
-        // A run too short for one whole period of a dash-first pattern is
-        // drawn as one solid dash, as a single line is below. Batched block
-        // wires and plinegen=false polylines are many runs in one wire, so
-        // pin each such run at the first dash's start.
-        if wire.pattern[0] > 0.0 && wire.pattern[1] < 0.0 {
+        // A run too short for one whole period of a dash-first (or
+        // dot-first) pattern is drawn as one solid dash, as a single line is
+        // below. Batched block wires and plinegen=false polylines are many
+        // runs in one wire, so pin each such run at the first element's start.
+        if wire.pattern[0] >= 0.0 && wire.pattern[1] < 0.0 {
             let mut start = 0;
             while start < n {
                 if !wire.points[start][0].is_finite() {
@@ -652,13 +652,16 @@ fn wire_distances(wire: &WireModel) -> (Vec<f32>, f32, f32) {
         return (dists, ae.max(1e-4).min(total * 0.5), total);
     }
 
-    // Align only a proper alternating pattern that BEGINS with a dash followed
-    // by a gap — every standard linetype does (DASHED/DASHDOT/CENTER/HIDDEN/…).
-    // Gap-first, dot-first, single-element, or consecutive-dash patterns keep
-    // the legacy centred phase: the A-type interior-resume assumes the element
-    // after the leading dash is a gap, and force-lighting an end dash on a
-    // non-dash-start would paint over a leading blank.
-    if wire.pattern[0] > 0.0 && wire.pattern[1] < 0.0 {
+    // Align an alternating pattern that BEGINS with a dash, or a dot, followed
+    // by a gap — every standard linetype does (DASHED/DASHDOT/CENTER/HIDDEN/…),
+    // and the drawing aligns a dot-first one the same way: the dot stretches
+    // into the end dash `D = (L - kP) / 2` and the last interior dash runs on
+    // into it. Gap-first (the drawing rejects it for this alignment),
+    // single-element, or consecutive-dash patterns keep the legacy centred
+    // phase: the A-type interior-resume assumes the element after the leading
+    // one is a gap, and force-lighting an end dash on a gap start would paint
+    // over a leading blank.
+    if wire.pattern[0] >= 0.0 && wire.pattern[1] < 0.0 {
         let a = wire.pattern[0];
         let p = pat_len;
         if total <= p {

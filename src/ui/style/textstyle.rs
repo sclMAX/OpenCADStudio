@@ -463,6 +463,7 @@ pub fn view_window<'a>(
         on_set_current: Message::TextStyleDialogSetCurrent,
         on_apply: Message::TextStyleApply,
         read_only: v.read_only,
+        in_use_filter: None,
         editor,
     })
 }

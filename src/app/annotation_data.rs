@@ -737,6 +737,26 @@ pub(crate) fn read_tabular_file(
     }
 }
 
+/// The drawing's table styles, as the table commands pick them.
+fn table_style_choices(doc: &Document) -> Vec<crate::modules::annotate::table_cmd::StyleChoice> {
+    let mut styles: Vec<_> = doc
+        .objects
+        .iter()
+        .filter_map(|(handle, object)| match object {
+            ObjectType::TableStyle(style) => {
+                Some(crate::modules::annotate::table_cmd::StyleChoice {
+                    name: style.name.clone(),
+                    handle: *handle,
+                    style: style.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    styles.sort_by_key(|choice| choice.name.to_ascii_lowercase());
+    styles
+}
+
 fn table_style_handle(doc: &Document, name: &str) -> Option<Handle> {
     doc.objects
         .iter()
@@ -1669,8 +1689,79 @@ impl OpenCADStudio {
         self.table_insert.style = current;
         self.table_insert.links = links;
         self.table_insert.link = self.table_insert.links.first().cloned();
+        let saved = *crate::modules::annotate::table_cmd::session();
+        let state = &mut self.table_insert;
+        state.columns = saved.columns.to_string();
+        state.data_rows = saved.data_rows.to_string();
+        state.column_width = crate::entities::common::format_length(
+            saved.cell_width(self.tabs[i].scene.document.header.measurement == 1),
+        );
+        state.row_height = saved.row_lines.to_string();
+        state.insertion = if saved.window {
+            TableInsertion::Window
+        } else {
+            TableInsertion::Point
+        };
+        state.columns_fixed = saved.columns_fixed;
+        state.rows_fixed = saved.rows_fixed;
         self.table_insert.error.clear();
         self.reset_annotation_modal(ModalKind::InsertTable);
+    }
+
+    /// -TABLE: the table settings on the command line.
+    pub(super) fn start_command_line_table(&mut self) {
+        let i = self.active_tab;
+        let doc = &self.tabs[i].scene.document;
+        let styles = table_style_choices(doc);
+        let current = styles
+            .iter()
+            .find(|choice| choice.name.eq_ignore_ascii_case(&doc.header.current_table_style_name))
+            .or(styles.first())
+            .cloned();
+        let links = data_link_choices(doc)
+            .into_iter()
+            .map(|choice| (choice.name, choice.handle))
+            .collect();
+        let command = crate::modules::annotate::table_cmd::TableCommand::command_line(
+            current,
+            styles,
+            links,
+            doc.header.measurement == 1,
+        );
+        self.command_line.push_output(&command.status_line());
+        self.command_line
+            .push_info(&crate::command::CadCommand::prompt(&command));
+        self.tabs[i].active_cmd = Some(Box::new(command));
+    }
+
+    /// -TABLE's data Link option: `<link handle> <table style>`.
+    pub(super) fn place_command_line_link_table(&mut self, args: &str) {
+        let i = self.active_tab;
+        let (handle, style) = args.split_once(' ').unwrap_or((args, ""));
+        let doc = &self.tabs[i].scene.document;
+        let Some((handle, link)) = u64::from_str_radix(handle.trim(), 16)
+            .ok()
+            .map(Handle::new)
+            .and_then(|handle| data_link(doc, handle).map(|link| (handle, link)))
+        else {
+            self.command_line.push_error(crate::t!("Data link not found.").as_ref());
+            return;
+        };
+        let rows = match read_link_rows(doc, link) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.command_line.push_error(&error);
+                return;
+            }
+        };
+        let table = build_table(&rows, table_style_handle(doc, style.trim()), None);
+        let command =
+            crate::modules::annotate::data_link::DataLinkPlaceCommand::existing_from_table(
+                table, handle,
+            );
+        self.command_line
+            .push_info(&crate::command::CadCommand::prompt(&command));
+        self.tabs[i].active_cmd = Some(Box::new(command));
     }
 
     pub(super) fn open_data_link_manager(&mut self, from_table: bool) {
@@ -1841,6 +1932,8 @@ impl OpenCADStudio {
             TableInsertField::ColumnWidth(value) => self.table_insert.column_width = value,
             TableInsertField::RowHeight(value) => self.table_insert.row_height = value,
             TableInsertField::Preview(value) => self.table_insert.preview = value,
+            TableInsertField::ColumnsFixed(value) => self.table_insert.columns_fixed = value,
+            TableInsertField::RowsFixed(value) => self.table_insert.rows_fixed = value,
             TableInsertField::FirstRowStyle(value) => self.table_insert.first_row_style = value,
             TableInsertField::SecondRowStyle(value) => self.table_insert.second_row_style = value,
             TableInsertField::OtherRowStyle(value) => self.table_insert.other_row_style = value,
@@ -1902,42 +1995,44 @@ impl OpenCADStudio {
                 .ok()
                 .filter(|value| value.is_finite() && *value > 0.0)
         };
-        let (Some(columns), Some(data_rows), Some(column_width), Some(row_height)) = (
-            parse_usize(&self.table_insert.columns),
-            parse_usize(&self.table_insert.data_rows),
-            parse_number(&self.table_insert.column_width),
-            parse_number(&self.table_insert.row_height),
+        let state = &self.table_insert;
+        let window = state.insertion == TableInsertion::Window;
+        let (Some(columns), Some(data_rows), Some(column_width), Some(row_lines)) = (
+            parse_usize(&state.columns),
+            parse_usize(&state.data_rows),
+            parse_number(&state.column_width),
+            parse_usize(&state.row_height),
         ) else {
             self.table_insert.error =
                 crate::t!("Columns, rows, width, and height must be positive values.").into_owned();
             return Task::none();
         };
+        {
+            let mut saved = crate::modules::annotate::table_cmd::session();
+            saved.columns = columns;
+            saved.data_rows = data_rows;
+            saved.column_width = column_width;
+            saved.row_lines = row_lines;
+            saved.window = window;
+            saved.columns_fixed = state.columns_fixed;
+            saved.rows_fixed = state.rows_fixed;
+        }
         let doc = &self.tabs[i].scene.document;
-        let style = doc
-            .objects
-            .iter()
-            .find_map(|(handle, object)| match object {
-                ObjectType::TableStyle(style)
-                    if style.name.eq_ignore_ascii_case(&self.table_insert.style) =>
-                {
-                    Some((*handle, style))
-                }
-                _ => None,
-            });
-        let multiplier = self.tabs[i].scene.creation_annotation_multiplier();
+        let style = table_style_choices(doc)
+            .into_iter()
+            .find(|choice| choice.name.eq_ignore_ascii_case(&state.style));
         let command = crate::modules::annotate::table_cmd::TableCommand::configured(
             style,
-            multiplier,
-            columns,
-            data_rows,
+            (!window || state.columns_fixed).then_some(columns),
+            (!window || state.rows_fixed).then_some(data_rows),
             column_width,
-            row_height,
-            self.table_insert.insertion == TableInsertion::Window,
-            self.table_insert.preview,
+            row_lines,
+            window,
+            true,
             [
-                &self.table_insert.first_row_style,
-                &self.table_insert.second_row_style,
-                &self.table_insert.other_row_style,
+                &state.first_row_style,
+                &state.second_row_style,
+                &state.other_row_style,
             ],
         );
         self.active_modal = None;
@@ -2316,6 +2411,15 @@ impl OpenCADStudio {
         self.command_line.push_info(&command.prompt());
         self.tabs[i].active_cmd = Some(Box::new(command));
         Task::none()
+    }
+
+    /// Back from the Table Style dialog: the style lists and the current
+    /// style as that dialog left them.
+    pub(in crate::app) fn return_to_table_insert(&mut self) {
+        let doc = &self.tabs[self.active_tab].scene.document;
+        self.table_insert.styles = table_styles(doc);
+        self.table_insert.style = doc.header.current_table_style_name.clone();
+        self.reset_annotation_modal(ModalKind::InsertTable);
     }
 
     pub(super) fn on_data_link_close(&mut self) -> Task<Message> {

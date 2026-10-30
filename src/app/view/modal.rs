@@ -810,7 +810,7 @@ impl OpenCADStudio {
                     crate::ui::style::anno_object_scale::view_window(&label, &scales, flow)
                 })
             }
-            super::super::ModalKind::InsertTable => sized_flow(ex, 620, 650, |flow| {
+            super::super::ModalKind::InsertTable => sized_flow(ex, 860, 560, |flow| {
                 crate::ui::window::annotation_data::table_insert_view(&self.table_insert, flow)
             }),
             super::super::ModalKind::DataLinkManager => sized_flow(ex, 760, 560, |flow| {
@@ -1029,6 +1029,10 @@ impl OpenCADStudio {
                         ObjectType::TableStyle(s) => Some(s.name.clone()),
                         _ => None,
                     })
+                    .filter(|name| {
+                        !self.tablestyle_in_use_only
+                            || self.style_in_use(crate::app::StyleKind::Table, name)
+                    })
                     .collect();
                 let selected_style = tab.scene.document.objects.values().find_map(|o| match o {
                     ObjectType::TableStyle(s) if s.name == self.tablestyle_selected => Some(s),
@@ -1101,6 +1105,7 @@ impl OpenCADStudio {
                             compare_opts: compare_opts.clone(),
                             comparison_sections: comparison_sections.clone(),
                             in_use,
+                            in_use_only: self.tablestyle_in_use_only,
                             hmargin: &self.ts_hmargin,
                             vmargin: &self.ts_vmargin,
                             description: &self.ts_description,

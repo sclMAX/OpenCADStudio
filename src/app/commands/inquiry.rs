@@ -1128,6 +1128,7 @@ impl OpenCADStudio {
         self.grip_popup = None;
         self.visibility_popup = None;
         self.table_popup = None;
+        self.flip_popup = None;
         // Entering BEDIT changes which block is assembled, not the
         // cached geometry of that block's entities.
         self.tabs[i].scene.bump_geometry_no_blocks();
@@ -1163,6 +1164,7 @@ impl OpenCADStudio {
         self.grip_popup = None;
         self.visibility_popup = None;
         self.table_popup = None;
+        self.flip_popup = None;
 
         let parent_index = return_block.and_then(|parent_name| {
             self.tabs[i]

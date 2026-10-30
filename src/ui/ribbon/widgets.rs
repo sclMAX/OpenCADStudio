@@ -1397,6 +1397,25 @@ pub(super) fn render_large_with<'a>(
                     .into(),
                 );
             }
+            // Tables: each row leads with an icon-only update button, then
+            // the tool named beside its icon.
+            if *style_key == StyleKey::TableStyle {
+                for row_tools in rows {
+                    let items: Vec<Element<Message>> = row_tools
+                        .iter()
+                        .enumerate()
+                        .map(|(k, t)| {
+                            if k == 0 {
+                                tool_row(std::slice::from_ref(t), active_tool)
+                            } else {
+                                labeled_tool(t, active_tool, state, Length::Shrink)
+                            }
+                        })
+                        .collect();
+                    col_items.push(row(items).spacing(2).align_y(iced::Center).into());
+                }
+                return combo_panel_col(STYLE_COMBO_W, col_items);
+            }
             for row_tools in rows {
                 col_items.push(tool_row(row_tools, active_tool));
             }

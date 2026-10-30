@@ -2564,6 +2564,25 @@ fn fix_current_style_names(doc: &mut Document) {
             doc.header.current_mleader_style_name = v;
         }
     }
+    // The variables may carry the name in another case ("STANDARD"); the
+    // current style is the record of that name, spelled as the record is.
+    let record_name = |doc: &Document, table: bool, name: &str| {
+        doc.objects.values().find_map(|o| match o {
+            ObjectType::TableStyle(s) if table && s.name.eq_ignore_ascii_case(name) => {
+                Some(s.name.clone())
+            }
+            ObjectType::MultiLeaderStyle(s) if !table && s.name.eq_ignore_ascii_case(name) => {
+                Some(s.name.clone())
+            }
+            _ => None,
+        })
+    };
+    if let Some(name) = record_name(doc, true, &doc.header.current_table_style_name) {
+        doc.header.current_table_style_name = name;
+    }
+    if let Some(name) = record_name(doc, false, &doc.header.current_mleader_style_name) {
+        doc.header.current_mleader_style_name = name;
+    }
     reflect_sketch_settings(doc);
 }
 

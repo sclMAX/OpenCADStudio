@@ -1868,9 +1868,35 @@ impl OpenCADStudio {
             }
 
             "ECONSTRAINT" | "GCEQUAL" => {
+                use crate::command::CmdResult;
                 use crate::modules::parametric::EqualConstraintCommand;
-                // Both objects are picked inside the command, as in the
-                // reference; a selection made beforehand is not used.
+                // A live selection is the set the constraint is about: the
+                // umbrella dispatches the type while the picks are still in
+                // place, and the reference consumes a pickfirst selection
+                // there too. The first object is the datum, as it is for a
+                // first-then-second pick; with nothing selected the command
+                // picks its own two objects.
+                let handles = self.tabs[i].scene.selected_handles_in_order();
+                if handles.len() >= 2 {
+                    let refs = handles
+                        .iter()
+                        .filter_map(|handle| {
+                            let entity = self.tabs[i].scene.document.get_entity(*handle)?;
+                            EqualConstraintCommand::preselected_reference(entity, *handle)
+                        })
+                        .collect::<Vec<_>>();
+                    if refs.len() == handles.len() {
+                        let (first, others) = refs.split_first().expect("checked len >= 2");
+                        return Some(self.apply_cmd_result(CmdResult::AddEqualConstraint {
+                            first: *first,
+                            others: others.to_vec(),
+                            multiple: false,
+                            label: "Equal constraint",
+                        }));
+                    }
+                    self.command_line
+                        .push_error(EqualConstraintCommand::INVALID_OBJECT);
+                }
                 self.tabs[i].scene.deselect_all();
                 let command = EqualConstraintCommand::new();
                 self.command_line.push_info(&command.prompt());

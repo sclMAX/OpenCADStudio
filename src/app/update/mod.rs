@@ -173,6 +173,10 @@ impl OpenCADStudio {
                 return;
             }
         }
+        if self.active_modal == Some(TableStyle) && std::mem::take(&mut self.tablestyle_parent_table) {
+            self.return_to_table_insert();
+            return;
+        }
         if self.active_modal == Some(Plotstyle) {
             if let Some(baseline) = self.plotstyle_panel_baseline.take() {
                 self.active_plot_style = baseline;
@@ -2233,6 +2237,11 @@ impl OpenCADStudio {
             }
 
             Message::TableInsertStyle(value) => self.on_table_insert_style(value),
+            Message::TableInsertManageStyles => {
+                let task = self.update(Message::TableStyleDialogOpen);
+                self.tablestyle_parent_table = true;
+                task
+            }
             Message::TableInsertField(field) => self.on_table_insert_field(field),
             Message::TableInsertApply => self.on_table_insert_apply(),
             Message::DataLinkManagerOpen => {
@@ -5798,6 +5807,12 @@ impl OpenCADStudio {
             Message::TableRowPick(idx) => {
                 if let Some(popup) = self.table_popup.take() {
                     self.apply_table_row(popup.insert_handle, idx);
+                }
+                Task::none()
+            }
+            Message::FlipPick(idx) => {
+                if let Some(popup) = self.flip_popup.take() {
+                    self.apply_flip_state(popup, idx == 1);
                 }
                 Task::none()
             }
@@ -12782,22 +12797,30 @@ impl OpenCADStudio {
             Message::TableStyleDialogOpen => {
                 use codec::objects::ObjectType;
                 let i = self.active_tab;
-                self.tablestyle_selected = self.tabs[i]
-                    .scene
-                    .document
+                // The dialog opens on the current style.
+                let document = &self.tabs[i].scene.document;
+                let current = &document.header.current_table_style_name;
+                let names: Vec<&String> = document
                     .objects
                     .values()
-                    .find_map(|o| {
-                        if let ObjectType::TableStyle(s) = o {
-                            Some(s.name.clone())
-                        } else {
-                            None
-                        }
+                    .filter_map(|o| match o {
+                        ObjectType::TableStyle(s) => Some(&s.name),
+                        _ => None,
                     })
-                    .unwrap_or_else(|| "Standard".to_string());
+                    .collect();
+                self.tablestyle_selected = names
+                    .iter()
+                    .find(|name| name.eq_ignore_ascii_case(current))
+                    .or(names.first())
+                    .map_or_else(|| "Standard".to_string(), |name| (*name).clone());
+                self.tablestyle_parent_table = false;
                 self.load_tablestyle_bufs(i);
                 self.active_modal = Some(super::ModalKind::TableStyle);
                 self.style_stage_begin();
+                Task::none()
+            }
+            Message::TableStyleListInUse(on) => {
+                self.tablestyle_in_use_only = on;
                 Task::none()
             }
             Message::TableStyleDialogClose => {
