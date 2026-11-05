@@ -32,31 +32,9 @@ impl OpenCADStudio {
         parameters: Vec<String>,
     ) {
         if !dimensions.is_empty() {
-            self.tabs[i].scene.erase_entities(&dimensions);
+            self.tabs[i].scene.erase_constraint_owned(&dimensions);
         }
-        let unused: Vec<String> = parameters
-            .into_iter()
-            .filter(|name| {
-                !self.tabs[i]
-                    .scene
-                    .parametric_constraints
-                    .iter()
-                    .flat_map(|set| set.constraints.iter())
-                    .any(|constraint| {
-                        matches!(
-                            &constraint.driving_param,
-                            Some(crate::scene::named_parameters::DrivingValue::Named(used))
-                                if used == name
-                        )
-                    })
-            })
-            .collect();
-        if !unused.is_empty() {
-            self.tabs[i].scene.record_undo_named_parameters_before();
-            for name in &unused {
-                self.tabs[i].scene.named_parameters_mut().remove(name);
-            }
-        }
+        self.tabs[i].scene.drop_unread_named_parameters(parameters);
     }
 
     /// `Dynamic` or `Annotational`, the DCFORM setting.
@@ -482,6 +460,15 @@ impl OpenCADStudio {
                 )
             })
             .collect();
+        // Editing a corner turns a side and leaves both lengths alone, as
+        // applying it does. Retention covers every entity the scope solves,
+        // so it is only safe when all this parameter drives is a two-side
+        // corner: a radius would be pinned to its current size, and the
+        // three-point form needs the solver free to resize.
+        let retain_sizes = self.constraint_solve_mode
+            && readers
+                .iter()
+                .all(|c| c.kind == crate::scene::parametric_constraints::ConstraintKind::Angle);
         self.tabs[i].dirty = true;
         if touched.is_empty() {
             self.tabs[i].scene.sync_native_parametric_graph();
@@ -493,7 +480,7 @@ impl OpenCADStudio {
             .collect();
         self.tabs[i]
             .scene
-            .bump_entities_with_parametric_policy(&changes, &anchors, false);
+            .bump_entities_with_parametric_policy(&changes, &anchors, retain_sizes);
     }
 
     /// Commits one field of one Parameters-section row (Properties panel) —

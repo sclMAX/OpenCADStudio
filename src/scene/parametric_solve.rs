@@ -2159,10 +2159,14 @@ const MOVE_EPS: f64 = 1e-9;
 /// `kernel_constraints::solvers::dogleg`, the bound `solve_dl` exits on) so
 /// "already converged" means exactly what the solver itself would conclude.
 const FIXPOINT_TOLF: f64 = 1.0e-10;
+/// How far a constraint may be off after a solve and still count as held.
+const SATISFIED_TOL: f64 = 1.0e-7;
 type SolveResult = (
     Vec<(Handle, EntityType)>,
     usize,
     Vec<(ConstraintId, kernel_constraints::diagnosis::RedundancyKind)>,
+    // Whether the scope's own constraints hold after the solve.
+    bool,
 );
 
 fn retained_line_length(entity: &EntityType, segment: Option<usize>) -> Option<f64> {
@@ -2497,10 +2501,11 @@ fn solve_scope(
             tangent_point,
             originals,
         ) {
-            // The row→id map only backs `diagnose`/`classify_redundant` below.
-            if diagnostics {
-                owner.push((constraint.clone(), c.id));
-            }
+            // The row→id map backs the fixpoint gate below and
+            // `diagnose`/`classify_redundant`; the gate decides whether to
+            // solve at all, so it needs every user row even when the
+            // diagnostics themselves are not collected.
+            owner.push((constraint.clone(), c.id));
             sys.add_constraint(constraint);
         }
     }
@@ -2756,6 +2761,28 @@ fn solve_scope(
             }
         }
     }
+    // A driving dimension between an entity's own ends is its size, so a
+    // retained length would contradict a new value — and pinning both ends
+    // of a dragged line would contradict it outright.
+    let driving_self_size: HashSet<Handle> = constraints
+        .iter()
+        .filter(|c| {
+            c.enabled
+                && c.driving_param.is_some()
+                && matches!(
+                    c.kind,
+                    ConstraintKind::Distance
+                        | ConstraintKind::DistanceX
+                        | ConstraintKind::DistanceY
+                        | ConstraintKind::DistanceDirected
+                )
+                && c.refs.len() >= 2
+                && c.refs
+                    .iter()
+                    .all(|r| r.entity == c.refs[0].entity && r.marker.is_some())
+        })
+        .map(|c| c.refs[0].entity)
+        .collect();
     if !retain_lengths {
         let mut axis_lines: Vec<_> = line_axes
             .into_iter()
@@ -2859,7 +2886,11 @@ fn solve_scope(
                 } else {
                     line.p1
                 };
-                if !driven_points.contains(&opposite) {
+                // A driving size between the line's own ends owns that span;
+                // pinning the far end's along-edge coordinate would fight it.
+                if !driven_points.contains(&opposite)
+                    && !driving_self_size.contains(&reference.entity)
+                {
                     let parameter = if *vertical { opposite.y } else { opposite.x };
                     // Only the along-edge coordinate stays fixed. The normal
                     // coordinate follows the grabbed point through the kernel.
@@ -2939,10 +2970,22 @@ fn solve_scope(
                     .iter()
                     .any(|(line_ref, _, _)| line_ref.entity == reference.entity)
             {
-                anchors.push(ParametricRef::point(
-                    reference.entity,
-                    1 - reference.marker.unwrap(),
-                ));
+                let opposite =
+                    ParametricRef::point(reference.entity, 1 - reference.marker.unwrap());
+                let both_ends_grabbed = driven_refs.iter().any(|other| {
+                    other.entity == reference.entity
+                        && matches!(other.marker, Some(marker) if Some(marker) != reference.marker)
+                });
+                // A driving size relation owns the span between the line's
+                // ends, so a single grab gives way: the far end stays put and
+                // the grabbed end is pulled back onto the dimension. A grab
+                // that names both ends keeps them exact.
+                if driving_self_size.contains(&reference.entity) && !both_ends_grabbed {
+                    anchors.retain(|anchor| anchor != reference);
+                }
+                if !anchors.contains(&opposite) {
+                    anchors.push(opposite);
+                }
             }
         }
     }
@@ -2952,27 +2995,6 @@ fn solve_scope(
     if retain_size {
         let follower_entities: HashSet<Handle> =
             equal_followers.iter().map(|follower| follower.entity).collect();
-        // A driving dimension between an entity's own ends is its size;
-        // a retained length would contradict a new value.
-        let self_dimensioned: HashSet<Handle> = constraints
-            .iter()
-            .filter(|c| {
-                c.enabled
-                    && c.driving_param.is_some()
-                    && matches!(
-                        c.kind,
-                        ConstraintKind::Distance
-                            | ConstraintKind::DistanceX
-                            | ConstraintKind::DistanceY
-                            | ConstraintKind::DistanceDirected
-                    )
-                    && c.refs.len() >= 2
-                    && c.refs
-                        .iter()
-                        .all(|r| r.entity == c.refs[0].entity && r.marker.is_some())
-            })
-            .map(|c| c.refs[0].entity)
-            .collect();
         for (handle, geom) in &cache {
             // A Fixed entity's size is whatever its pins say: whole → all
             // pinned anyway, partial → the reference lets it resize (MOVE
@@ -2985,7 +3007,7 @@ fn solve_scope(
                     constraint.refs.get(2).is_some_and(|axis| axis.entity == *handle)
                 })
                 || follower_entities.contains(handle)
-                || self_dimensioned.contains(handle)
+                || driving_self_size.contains(handle)
             {
                 continue;
             }
@@ -3356,6 +3378,9 @@ fn solve_scope(
         (0, Vec::new())
     };
 
+    let satisfied = owner
+        .iter()
+        .all(|(constraint, _)| constraint.error(sys.store()).abs() <= SATISFIED_TOL);
     let store = sys.store();
     let mut results = Vec::new();
     for (&handle, geom) in &cache {
@@ -3741,7 +3766,7 @@ fn solve_scope(
         initial_fixed_refs,
         &mut results,
     );
-    Some((results, dof, conflicts))
+    Some((results, dof, conflicts, satisfied))
 }
 
 impl Scene {
@@ -3859,7 +3884,11 @@ impl Scene {
         &mut self,
         changes: &[(Handle, ChangeKind)],
     ) -> Vec<(Handle, ChangeKind)> {
-        self.refresh_parametric_constraints_with_policy(changes, &[], false)
+        let refreshed = self.refresh_parametric_constraints_with_policy(changes, &[], false);
+        // This entry point reports nothing, so it leaves no moved record for
+        // a later solve to inherit.
+        self.solve_moved.clear();
+        refreshed
     }
 
     #[allow(dead_code)]
@@ -3907,6 +3936,7 @@ impl Scene {
         retained_originals: &[(Handle, EntityType)],
         initial_fixed_refs: &[ParametricRef],
     ) -> Vec<(Handle, ChangeKind)> {
+        self.solve_moved.clear();
         // An erased entity takes its constraints with it instead of leaving
         // dangling references. Done first,
         // and unconditionally over every scope (not just ones a `touched`
@@ -3950,6 +3980,8 @@ impl Scene {
                     }
                 }
             }
+            let mut orphaned_dimensions: Vec<Handle> = Vec::new();
+            let mut orphaned_parameters: Vec<String> = Vec::new();
             for (handle, kind) in changes {
                 if *kind != ChangeKind::Removed {
                     continue;
@@ -3968,6 +4000,33 @@ impl Scene {
                         let before = self.parametric_constraints[index].clone();
                         self.record_undo_parametric_constraints_before(scope, before);
                     }
+                    // What this erase orphans: the dimension each constraint
+                    // drew (not a participant, so nothing else deletes it) and
+                    // the parameter it drives.
+                    {
+                        let set = &self.parametric_constraints[index];
+                        for constraint in &set.constraints {
+                            if !constraint
+                                .refs
+                                .iter()
+                                .any(|reference| reference.entity == *handle)
+                            {
+                                continue;
+                            }
+                            if let Some(dimension) = set.dimensions.get(&constraint.id).copied() {
+                                if !orphaned_dimensions.contains(&dimension) {
+                                    orphaned_dimensions.push(dimension);
+                                }
+                            }
+                            if let Some(crate::scene::named_parameters::DrivingValue::Named(name)) =
+                                &constraint.driving_param
+                            {
+                                if !orphaned_parameters.contains(name) {
+                                    orphaned_parameters.push(name.clone());
+                                }
+                            }
+                        }
+                    }
                     let removed = self.parametric_constraints[index].remove_all_touching(*handle);
                     // Erasing an entity deletes its constraints with it — the
                     // glyph set changed. Bumped exactly when the removal took
@@ -3977,6 +4036,49 @@ impl Scene {
                         self.bump_constraints_epoch();
                     }
                 }
+            }
+            // The constraint's own records go with it: its dimension is erased
+            // and its parameter is dropped only when no surviving constraint
+            // reads it. The erase re-enters this refresh, which finds no
+            // constraint naming a dimension; its `solve_moved` clear is
+            // harmless because this purge runs before the outer solve.
+            self.drop_unread_named_parameters(orphaned_parameters);
+            if !orphaned_dimensions.is_empty() {
+                self.erase_constraint_owned(&orphaned_dimensions);
+            }
+        }
+
+        // A dimension erased on its own leaves its set pointing at a handle
+        // that is gone; a later block save rejects a dimension it cannot find.
+        if !removed_handles.is_empty() {
+            let stale: Vec<usize> = self
+                .parametric_constraints
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| {
+                    set.dimensions
+                        .values()
+                        .any(|dimension| removed_handles.contains(dimension))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in stale {
+                let scope = self.parametric_constraints[index].scope;
+                // First-touch wins: an image recorded earlier in this
+                // transaction still holds the entry this drop removes.
+                let missing_before = self.undo_recording.as_ref().is_some_and(|recording| {
+                    !recording.parametric_constraints_before.contains_key(&scope)
+                });
+                if missing_before {
+                    let before = self.parametric_constraints[index].clone();
+                    self.record_undo_parametric_constraints_before(scope, before);
+                }
+                self.parametric_constraints[index]
+                    .dimensions
+                    .retain(|_, dimension| !removed_handles.contains(dimension));
+                // The glyph set counts constraints without a dimension, so a
+                // dropped entry changes which badges are drawn.
+                self.bump_constraints_epoch();
             }
         }
 
@@ -4033,19 +4135,29 @@ impl Scene {
             }
             let view: Vec<&ParametricConstraint> =
                 self.parametric_constraints[i].constraints.iter().collect();
-            let Some((solved, dof, conflicts)) = solve_scope(
-                &self.document,
-                &self.named_parameters,
-                &self.parametric_constraints[i].local_parameters,
-                &view,
-                driven_refs,
-                retain_size,
-                true,
-                &retained_before,
-                initial_fixed_refs,
-                &originals,
-                true,
-            ) else {
+            let solve = |retain_lengths: bool| {
+                solve_scope(
+                    &self.document,
+                    &self.named_parameters,
+                    &self.parametric_constraints[i].local_parameters,
+                    &view,
+                    driven_refs,
+                    retain_size,
+                    retain_lengths,
+                    &retained_before,
+                    initial_fixed_refs,
+                    &originals,
+                    true,
+                )
+            };
+            // Kept lengths are a preference: when holding every edge length
+            // leaves the constraints unmet (a second perpendicular on a
+            // closed polyline), the edges give way rather than nothing
+            // moving at all.
+            let Some((solved, dof, conflicts, _)) = (match solve(true) {
+                Some(result) if !result.3 => solve(false).filter(|loose| loose.3).or(Some(result)),
+                other => other,
+            }) else {
                 continue;
             };
             if initial_fixed_refs.is_empty() {
@@ -4095,11 +4207,20 @@ impl Scene {
                     }
                     _ => new_entity,
                 };
-                if let Some(before) = self.document.get_entity_arc(handle) {
+                let before = self.document.get_entity_arc(handle);
+                // A handle the solve names but the document no longer holds is
+                // not geometry the solve moved.
+                let moved = before
+                    .as_deref()
+                    .is_some_and(|before| before != &new_entity);
+                if let Some(before) = before {
                     self.record_undo_before(handle, Some(before));
                 }
                 if let Some(slot) = self.document.get_entity_mut(handle) {
                     *slot = new_entity;
+                }
+                if moved {
+                    self.solve_moved.push(handle);
                 }
                 result.push((handle, ChangeKind::Modified));
             }
@@ -4154,7 +4275,7 @@ impl Scene {
             // `diagnostics = false`: the preview discards DOF/conflicts (the
             // commit path recomputes and stores them for the badges), so the
             // per-move `diagnose`/`classify_redundant` work is skipped.
-            let Some((solved, _dof, _conflicts)) = solve_scope(
+            let Some((solved, _dof, _conflicts, _)) = solve_scope(
                 &self.document,
                 &self.named_parameters,
                 &set.local_parameters,
@@ -5188,6 +5309,7 @@ mod tests {
             ],
             &[first_ref],
             true,
+            &[],
         );
 
         let EntityType::Circle(first_circle) = scene.document.get_entity(first).unwrap() else {
@@ -5239,5 +5361,78 @@ mod tests {
             };
             assert!((circle.center_wcs() - driven_center).length() < 1.0e-9);
         }
+    }
+
+    /// A constraint addition's solve can move geometry the command never
+    /// named. The scene records exactly that geometry: never the command's own
+    /// entities, and never an annotation whose label merely refreshed.
+    #[test]
+    fn a_constraint_add_records_only_the_geometry_it_moves_outside_the_command() {
+        use crate::modules::annotate::linear_dim::linear_dimension_entity;
+
+        let long = codec::Handle::new(1);
+        let label = codec::Handle::new(2);
+        let constrained = codec::Handle::new(3);
+        let mut scene = Scene::new();
+        let mut line = codec::entities::Line::from_points(
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(200.0, 0.0, 0.0),
+        );
+        line.common.handle = long;
+        scene.document.add_entity(EntityType::Line(line)).unwrap();
+        let mut other = codec::entities::Line::from_points(
+            Vector3::new(0.0, 50.0, 0.0),
+            Vector3::new(10.0, 60.0, 0.0),
+        );
+        other.common.handle = constrained;
+        scene.document.add_entity(EntityType::Line(other)).unwrap();
+        // A dynamic dimension on the long line. The solve refreshes its label,
+        // but a label is not geometry the solve moved.
+        let dimension = linear_dimension_entity(
+            glam::DVec3::new(0.0, 0.0, 0.0),
+            glam::DVec3::new(200.0, 0.0, 0.0),
+            glam::DVec3::new(100.0, -10.0, 0.0),
+            glam::DVec3::Y,
+            None,
+        );
+        let mut dimension = match dimension {
+            EntityType::Dimension(dimension) => dimension,
+            _ => panic!("the builder must return a dimension"),
+        };
+        dimension.base_mut().common.handle = label;
+        dimension.base_mut().common.layer =
+            super::super::parametric_constraints::DYNAMIC_DIMENSION_LAYER.to_string();
+        scene
+            .document
+            .add_entity(EntityType::Dimension(dimension))
+            .unwrap();
+        let set = scene.parametric_constraint_set_mut(ParametricScope::ModelSpace);
+        let id = set.add(
+            ConstraintKind::DistanceX,
+            vec![ParametricRef::point(long, 0), ParametricRef::point(long, 1)],
+            Some(DrivingValue::Literal(100.0)),
+        );
+        set.dimensions.insert(id, label);
+        let set = scene.parametric_constraint_set_mut(ParametricScope::ModelSpace);
+        set.add(
+            ConstraintKind::Horizontal,
+            vec![ParametricRef::whole(constrained)],
+            None,
+        );
+
+        scene.bump_entities_after_constraint_added(
+            &[(constrained, super::ChangeKind::Modified)],
+            &[],
+            false,
+            &[],
+        );
+
+        // The horizontal constraint moves the named, slanted line as well;
+        // only the line nobody named may be reported.
+        assert_eq!(
+            scene.constraint_network_moves,
+            vec![long],
+            "only the line nobody named is reported"
+        );
     }
 }

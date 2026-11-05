@@ -16,12 +16,59 @@ pub enum Kind {
     XY,
 }
 
+/// Where a Linear parameter's base sits between its definition points.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BaseLocation {
+    #[default]
+    Startpoint,
+    Midpoint,
+}
+
+/// The value set answered at a parameter's Value set option.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ValueSet {
+    None,
+    Increment {
+        increment: f64,
+        minimum: f64,
+        maximum: f64,
+    },
+    List(Vec<f64>),
+}
+
+impl ValueSet {
+    pub(crate) fn record(&self) -> BlockParameterValueSet {
+        match self {
+            Self::None => BlockParameterValueSet {
+                flags: 1,
+                ..Default::default()
+            },
+            Self::Increment {
+                increment,
+                minimum,
+                maximum,
+            } => BlockParameterValueSet {
+                flags: 1 | 2 | 4,
+                minimum: *minimum,
+                maximum: *maximum,
+                increment: *increment,
+                ..Default::default()
+            },
+            Self::List(values) => BlockParameterValueSet {
+                flags: 8,
+                values: values.clone(),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 impl Kind {
     pub(crate) fn parse(text: &str) -> Option<Self> {
         match text.to_ascii_uppercase().as_str() {
             "LINEAR" | "L" => Some(Self::Linear),
-            "POLAR" | "PO" => Some(Self::Polar),
-            "XY" => Some(Self::XY),
+            "POLAR" | "PO" | "P" => Some(Self::Polar),
+            "XY" | "X" => Some(Self::XY),
             _ => None,
         }
     }
@@ -57,6 +104,52 @@ fn graph_handle(document: &Document, definition: Handle) -> Option<Handle> {
         ObjectType::Dictionary(dictionary) => dictionary.get("ACAD_ENHANCEDBLOCK"),
         _ => None,
     }
+}
+
+pub(crate) fn label_names(document: &Document, definition: Handle) -> Vec<String> {
+    let mut names = parameters(document, definition)
+        .into_iter()
+        .flat_map(|p| p.labels)
+        .collect::<Vec<_>>();
+    names.extend(
+        super::block_orientation_parameter::parameters(document, definition)
+            .into_iter()
+            .map(|p| p.label),
+    );
+    names
+}
+
+pub(crate) fn unique_label(names: &[String], prefix: &str) -> String {
+    (1..)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|name| names.iter().all(|old| !old.eq_ignore_ascii_case(name)))
+        .unwrap()
+}
+
+/// The next free distance label name, the default a Linear parameter's label
+/// question shows.
+pub(crate) fn next_distance_label(document: &Document, definition: Handle) -> String {
+    unique_label(&label_names(document, definition), "Distance")
+}
+
+/// The next free distance and angle label names, the defaults a Polar
+/// placement prompt shows for its label questions.
+pub(crate) fn next_polar_labels(document: &Document, definition: Handle) -> [String; 2] {
+    let names = label_names(document, definition);
+    [
+        unique_label(&names, "Distance"),
+        unique_label(&names, "Angle"),
+    ]
+}
+
+/// The next free horizontal and vertical label names, the defaults an XY
+/// placement's two label questions show.
+pub(crate) fn next_xy_labels(document: &Document, definition: Handle) -> [String; 2] {
+    let names = label_names(document, definition);
+    [
+        unique_label(&names, "X Distance"),
+        unique_label(&names, "Y Distance"),
+    ]
 }
 
 pub(crate) fn parameters(document: &Document, definition: Handle) -> Vec<Parameter<'_>> {
@@ -95,7 +188,10 @@ pub(crate) fn parameters(document: &Document, definition: Handle) -> Vec<Paramet
                     Kind::XY,
                     &p.parameter,
                     vec![p.x_label.clone(), p.y_label.clone()],
-                    [p.x_value, p.y_value],
+                    [
+                        p.parameter.definition_end_point.y - p.parameter.definition_base_point.y,
+                        p.parameter.definition_end_point.x - p.parameter.definition_base_point.x,
+                    ],
                 ),
                 _ => return None,
             };
@@ -173,29 +269,80 @@ pub(crate) fn create(
     end: Vector3,
     label: Vector3,
 ) -> Result<Handle, &'static str> {
+    create_with(document, definition, kind, base, end, label, None, None)
+}
+
+/// Writes the value sets a Polar placement collected: the distance set and the
+/// angle set, the latter in radians.
+pub(crate) fn set_polar_value_sets(
+    document: &mut Document,
+    parameter: Handle,
+    distance: Option<&ValueSet>,
+    angle: Option<&ValueSet>,
+) -> Result<(), &'static str> {
+    let Some(ObjectType::DynamicBlock(object)) = document.objects.get_mut(&parameter) else {
+        return Err("The parameter is unavailable.");
+    };
+    let DynamicBlockData::PolarParameter(polar) = &mut object.data else {
+        return Err("The parameter is not a Polar parameter.");
+    };
+    if let Some(set) = distance {
+        polar.distance_value_set = set.record();
+    }
+    if let Some(set) = angle {
+        polar.angle_value_set = set.record();
+    }
+    Ok(())
+}
+
+/// Writes the horizontal and vertical value sets of an XY parameter.
+pub(crate) fn set_xy_value_sets(
+    document: &mut Document,
+    parameter: Handle,
+    horizontal: Option<&ValueSet>,
+    vertical: Option<&ValueSet>,
+) -> Result<(), &'static str> {
+    let Some(ObjectType::DynamicBlock(object)) = document.objects.get_mut(&parameter) else {
+        return Err("The parameter is unavailable.");
+    };
+    let DynamicBlockData::XYParameter(xy) = &mut object.data else {
+        return Err("The parameter is not an XY parameter.");
+    };
+    if let Some(set) = horizontal {
+        xy.x_value_set = set.record();
+    }
+    if let Some(set) = vertical {
+        xy.y_value_set = set.record();
+    }
+    Ok(())
+}
+
+/// Creates a parameter with the placement answers a Linear command collected.
+pub(crate) fn create_with(
+    document: &mut Document,
+    definition: Handle,
+    kind: Kind,
+    base: Vector3,
+    end: Vector3,
+    label: Vector3,
+    base_location: Option<BaseLocation>,
+    value_set: Option<&ValueSet>,
+) -> Result<Handle, &'static str> {
     if let Some(error) = points_error(kind, base, end, label) {
         return Err(error);
     }
-    let mut names = parameters(document, definition)
-        .into_iter()
-        .flat_map(|p| p.labels)
-        .collect::<Vec<_>>();
-    names.extend(
-        super::block_orientation_parameter::parameters(document, definition)
-            .into_iter()
-            .map(|p| p.label),
-    );
-    let unique = |prefix: &str| {
-        (1..)
-            .map(|n| format!("{prefix}{n}"))
-            .find(|name| names.iter().all(|old| !old.eq_ignore_ascii_case(name)))
-            .unwrap()
-    };
+    let names = label_names(document, definition);
+    let unique = |prefix: &str| unique_label(&names, prefix);
     let distance_name = unique("Distance");
     let angle_name = unique("Angle");
-    let x_label = unique("DistanceX");
-    let y_label = unique("DistanceY");
-    let values = offsets(kind, base, end, label);
+    let x_label = unique("X Distance");
+    let y_label = unique("Y Distance");
+    let values = match kind {
+        Kind::XY => [end.x - base.x, end.y - base.y],
+        _ => offsets(kind, base, end, label),
+    };
+    let parameter_name =
+        super::block_authoring::metadata::next_parameter_name(document, definition, kind.name())?;
     let (graph, slots) = authoring::prepare(document, definition)?;
     let (class, cpp) = kind.class();
     let (grip_class, grip_cpp) = match kind {
@@ -221,7 +368,7 @@ pub(crate) fn create(
     };
     let native = BlockTwoPointParameter {
         parameter: BlockParameter {
-            element: element(0, kind.name()),
+            element: element(0, &parameter_name),
             show_properties: true,
             chain_actions: false,
         },
@@ -243,10 +390,14 @@ pub(crate) fn create(
             },
         }),
         property_states: [0, slots.eval + 1, 0, 0],
-        parameter_base_location: 0,
+        parameter_base_location: if base_location == Some(BaseLocation::Midpoint) {
+            1
+        } else {
+            0
+        },
         ..Default::default()
     };
-    let value_set = || BlockParameterValueSet {
+    let default_value_set = || BlockParameterValueSet {
         flags: 1,
         ..Default::default()
     };
@@ -255,7 +406,9 @@ pub(crate) fn create(
             parameter: native,
             distance_name,
             distance: values[0],
-            value_set: value_set(),
+            value_set: value_set
+                .map(ValueSet::record)
+                .unwrap_or_else(default_value_set),
             ..Default::default()
         }),
         Kind::Polar => DynamicBlockData::PolarParameter(BlockPolarParameter {
@@ -263,7 +416,7 @@ pub(crate) fn create(
             distance_name,
             angle_name,
             offset: values[0],
-            distance_value_set: value_set(),
+            distance_value_set: default_value_set(),
             angle_value_set: BlockParameterValueSet {
                 flags: 3,
                 maximum: std::f64::consts::TAU,
@@ -277,8 +430,8 @@ pub(crate) fn create(
             y_label,
             x_value: values[0],
             y_value: values[1],
-            x_value_set: value_set(),
-            y_value_set: value_set(),
+            x_value_set: default_value_set(),
+            y_value_set: default_value_set(),
             ..Default::default()
         }),
     };
@@ -368,6 +521,53 @@ pub(crate) fn graphic(parameter: &Parameter<'_>) -> Graphic {
             Vector3::new(parameter.offsets[1], 0.0, 0.0),
             parameter.labels[1].clone(),
         );
+    } else if parameter.kind == Kind::Polar {
+        let d = end - base;
+        let radius = d.x.hypot(d.y);
+        if radius <= 1e-10 || !radius.is_finite() {
+            return result;
+        }
+        let angle = d.y.atan2(d.x);
+        let at = |t: f64| base + Vector3::new(t.cos(), t.sin(), 0.0) * radius;
+        const DASHES: usize = 72;
+        for i in 0..DASHES {
+            if i % 6 == 5 {
+                continue;
+            }
+            result.lines.push([
+                at(std::f64::consts::TAU * i as f64 / DASHES as f64),
+                at(std::f64::consts::TAU * (i + 1) as f64 / DASHES as f64),
+            ]);
+        }
+        const ARC_STEPS: usize = 24;
+        for i in 0..ARC_STEPS {
+            result.lines.push([
+                at(angle * i as f64 / ARC_STEPS as f64),
+                at(angle * (i + 1) as f64 / ARC_STEPS as f64),
+            ]);
+        }
+        let tip = at(angle);
+        let sign = if angle < 0.0 { -1.0 } else { 1.0 };
+        let (sin, cos) = angle.sin_cos();
+        let direction = Vector3::new(-sin * sign, cos * sign, 0.0);
+        for turn in [-0.5f64, 0.5] {
+            let (s, c) = turn.sin_cos();
+            let towards = Vector3::new(
+                direction.x * c - direction.y * s,
+                direction.x * s + direction.y * c,
+                0.0,
+            );
+            result.lines.push([tip, tip - towards * (radius * 0.12)]);
+        }
+        let bisector = angle * 0.5;
+        let inward = Vector3::new(bisector.cos(), bisector.sin(), 0.0);
+        result.lines.push([
+            base + inward * (radius * 0.92),
+            base + inward * (radius * 0.78),
+        ]);
+        result
+            .labels
+            .push((base + inward * (radius * 0.70), parameter.labels[1].clone()));
     } else {
         let d = end - base;
         let length = d.x.hypot(d.y).hypot(d.z);
@@ -380,22 +580,6 @@ pub(crate) fn graphic(parameter: &Parameter<'_>) -> Graphic {
             dimension_normal(base, end) * parameter.offsets[0],
             parameter.labels[0].clone(),
         );
-        if parameter.kind == Kind::Polar {
-            let angle = d.y.atan2(d.x);
-            let radius = length * 0.25;
-            let at = |angle: f64| base + Vector3::new(angle.cos(), angle.sin(), 0.0) * radius;
-            result.lines.push([base, at(0.0)]);
-            result.lines.push([base, end]);
-            for step in 0..24 {
-                result.lines.push([
-                    at(angle * step as f64 / 24.0),
-                    at(angle * (step + 1) as f64 / 24.0),
-                ]);
-            }
-            result
-                .labels
-                .push((at(angle * 0.5), parameter.labels[1].clone()));
-        }
     }
     result.grips.push((end, parameter.kind == Kind::Linear));
     result
@@ -449,16 +633,20 @@ pub(crate) fn reframe(
             {
                 *point = transform.apply(*point);
             }
-            if let Some(label) = labels.first() {
-                *x = offsets(
-                    kind,
-                    native.definition_base_point,
-                    native.definition_end_point,
-                    transform.apply(*label),
-                )[0];
-            }
-            if let (Some(y), Some(label)) = (y, labels.get(1)) {
-                *y = transform.apply(*label).x - native.definition_base_point.x;
+            if kind == Kind::XY {
+                *x = native.definition_end_point.x - native.definition_base_point.x;
+                if let Some(y) = y {
+                    *y = native.definition_end_point.y - native.definition_base_point.y;
+                }
+            } else if kind == Kind::Linear {
+                if let Some(label) = labels.first() {
+                    *x = offsets(
+                        kind,
+                        native.definition_base_point,
+                        native.definition_end_point,
+                        transform.apply(*label),
+                    )[0];
+                }
             }
             changed += 1;
         }
@@ -496,7 +684,7 @@ mod tests {
     use crate::scene::{block_point_parameter, block_visibility, Scene};
     use codec::{entities::Line, EntityType};
 
-    fn fixture() -> (Scene, Handle) {
+    pub(super) fn fixture() -> (Scene, Handle) {
         let mut scene = Scene::new();
         scene.define_block_raw(
             "PARAMETERS",
@@ -550,7 +738,7 @@ mod tests {
                 }
                 DynamicBlockData::XYParameter(p) => {
                     assert_ne!(p.x_label, p.y_label);
-                    assert_eq!([p.x_value, p.y_value], [5.0, -1.0]);
+                    assert_eq!([p.x_value, p.y_value], [4.0, 4.0]);
                     &p.parameter
                 }
                 _ => panic!("native parameter"),
@@ -695,6 +883,90 @@ mod tests {
     }
 
     #[test]
+    fn polar_parameter_draws_a_dashed_radius_circle_an_arrowed_arc_and_one_label() {
+        let (mut scene, definition) = fixture();
+        create(
+            &mut scene.document,
+            definition,
+            Kind::Polar,
+            Vector3::ZERO,
+            Vector3::new(6.0, 8.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        )
+        .unwrap();
+        let parameter = &parameters(&scene.document, definition)[0];
+        let g = graphic(parameter);
+        let radius = 10.0;
+        let on_circle = |p: Vector3| (p.x.hypot(p.y) - radius).abs() < 1e-9;
+        let mut covered = 0.0;
+        for [a, b] in &g.lines {
+            if on_circle(*a) && on_circle(*b) {
+                let turn = (b.y.atan2(b.x) - a.y.atan2(a.x)).abs();
+                covered += turn.min(std::f64::consts::TAU - turn);
+            }
+        }
+        assert!(
+            covered > std::f64::consts::TAU * 0.8,
+            "the radius circle is drawn around the base: {covered}"
+        );
+        assert!(
+            covered < std::f64::consts::TAU,
+            "the radius circle is dashed: {covered}"
+        );
+        let tip = Vector3::new(6.0, 8.0, 0.0);
+        let barbs = g
+            .lines
+            .iter()
+            .filter(|[a, _]| (*a - tip).length() < 1e-9)
+            .count();
+        assert_eq!(barbs, 2, "the arc carries an arrowhead at the grip");
+        assert!(g.dimensions.is_empty(), "no bracket dimension line");
+        assert_eq!(g.labels.len(), 1, "one label, inside the sector");
+        assert_eq!(g.labels[0].1, parameter.labels[1]);
+        assert!(g.labels[0].0.x.hypot(g.labels[0].0.y) < radius);
+        assert_eq!(g.grips, vec![(tip, false)]);
+    }
+
+    #[test]
+    fn a_linear_placement_stores_the_base_location_and_value_set_it_was_given() {
+        let (mut scene, definition) = fixture();
+        let placed = |scene: &mut Scene, base_location, value_set| {
+            create_with(
+                &mut scene.document,
+                definition,
+                Kind::Linear,
+                Vector3::ZERO,
+                Vector3::new(10.0, 0.0, 0.0),
+                Vector3::new(5.0, 2.0, 0.0),
+                base_location,
+                value_set,
+            )
+            .unwrap()
+        };
+        let list = ValueSet::List(vec![1.0, 2.5, 3.0]);
+        let parameter = placed(&mut scene, Some(BaseLocation::Midpoint), Some(&list));
+        let Some(ObjectType::DynamicBlock(object)) = scene.document.objects.get(&parameter) else {
+            panic!("expected a dynamic block record");
+        };
+        let DynamicBlockData::LinearParameter(native) = &object.data else {
+            panic!("expected a linear parameter");
+        };
+        assert_eq!(native.parameter.parameter_base_location, 1);
+        assert_eq!(native.value_set.flags, 8);
+        assert_eq!(native.value_set.values, vec![1.0, 2.5, 3.0]);
+
+        let parameter = placed(&mut scene, None, None);
+        let Some(ObjectType::DynamicBlock(object)) = scene.document.objects.get(&parameter) else {
+            panic!("expected a dynamic block record");
+        };
+        let DynamicBlockData::LinearParameter(native) = &object.data else {
+            panic!("expected a linear parameter");
+        };
+        assert_eq!(native.parameter.parameter_base_location, 0);
+        assert_eq!(native.value_set.flags, 1, "the default set has no type");
+    }
+
+    #[test]
     fn distance_parameter_upright_reframe_keeps_finite_label_and_grip() {
         let (mut scene, definition) = fixture();
         create(
@@ -799,5 +1071,124 @@ mod tests {
             assert_eq!(Sha256::digest(std::fs::read(&path).unwrap()), checksum);
             eprintln!("{filename}: Linear/Polar/XY appended to existing graph; DWG/DXF passed; original objects/checksum preserved");
         }
+    }
+}
+
+#[cfg(test)]
+mod value_set_tests {
+    use super::*;
+
+    #[test]
+    fn value_sets_are_written_only_to_a_polar_parameter() {
+        let (mut scene, definition) = super::tests::fixture();
+        let linear = create(
+            &mut scene.document,
+            definition,
+            Kind::Linear,
+            Vector3::ZERO,
+            Vector3::UNIT_X,
+            Vector3::UNIT_Y,
+        )
+        .unwrap();
+        let polar = create(
+            &mut scene.document,
+            definition,
+            Kind::Polar,
+            Vector3::ZERO,
+            Vector3::UNIT_X,
+            Vector3::UNIT_Y,
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_polar_value_sets(
+                &mut scene.document,
+                linear,
+                Some(&ValueSet::List(vec![1.0])),
+                None
+            ),
+            Err("The parameter is not a Polar parameter.")
+        );
+        assert_eq!(
+            set_polar_value_sets(
+                &mut scene.document,
+                polar,
+                Some(&ValueSet::Increment {
+                    increment: 5.0,
+                    minimum: 0.0,
+                    maximum: 100.0
+                }),
+                Some(&ValueSet::List(vec![0.0, 1.0])),
+            ),
+            Ok(())
+        );
+
+        let ObjectType::DynamicBlock(object) = &scene.document.objects[&polar] else {
+            panic!("expected a dynamic block record");
+        };
+        let DynamicBlockData::PolarParameter(native) = &object.data else {
+            panic!("expected a polar parameter");
+        };
+        assert_eq!(native.distance_value_set.flags, 1 | 2 | 4);
+        assert_eq!(native.distance_value_set.maximum, 100.0);
+        assert_eq!(native.angle_value_set.flags, 8);
+        assert_eq!(native.angle_value_set.values, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn value_sets_are_written_only_to_an_xy_parameter() {
+        let (mut scene, definition) = super::tests::fixture();
+        let linear = create(
+            &mut scene.document,
+            definition,
+            Kind::Linear,
+            Vector3::ZERO,
+            Vector3::UNIT_X,
+            Vector3::UNIT_Y,
+        )
+        .unwrap();
+        let xy = create(
+            &mut scene.document,
+            definition,
+            Kind::XY,
+            Vector3::ZERO,
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::UNIT_Y,
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_xy_value_sets(
+                &mut scene.document,
+                linear,
+                Some(&ValueSet::List(vec![1.0])),
+                None
+            ),
+            Err("The parameter is not an XY parameter.")
+        );
+        assert_eq!(
+            set_xy_value_sets(
+                &mut scene.document,
+                xy,
+                Some(&ValueSet::Increment {
+                    increment: 2.0,
+                    minimum: 0.0,
+                    maximum: 10.0
+                }),
+                Some(&ValueSet::List(vec![3.0, 4.0])),
+            ),
+            Ok(())
+        );
+
+        let ObjectType::DynamicBlock(object) = &scene.document.objects[&xy] else {
+            panic!("expected a dynamic block record");
+        };
+        let DynamicBlockData::XYParameter(native) = &object.data else {
+            panic!("expected an xy parameter");
+        };
+        assert_eq!(native.x_value_set.flags, 1 | 2 | 4);
+        assert_eq!(native.x_value_set.maximum, 10.0);
+        assert_eq!(native.y_value_set.flags, 8);
+        assert_eq!(native.y_value_set.values, vec![3.0, 4.0]);
     }
 }

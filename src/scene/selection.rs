@@ -78,6 +78,7 @@ impl Scene {
             return;
         }
         self.selected_constraint = None;
+        self.table_cells = None;
         let expanded = self.expanded_with_leaders(handles);
         let mut changed = false;
         for handle in expanded {
@@ -131,6 +132,7 @@ impl Scene {
     }
     pub fn select_entity(&mut self, handle: Handle, exclusive: bool) {
         self.selected_constraint = None;
+        self.table_cells = None;
         let handles = self.handles_expanded_for_leader_annotations(&[handle]);
         let mut changed = false;
 
@@ -154,6 +156,7 @@ impl Scene {
 
     pub fn deselect_all(&mut self) {
         self.selected_constraint = None;
+        self.table_cells = None;
         self.sub_segments.clear();
         if self.selected.is_empty() {
             return;
@@ -161,6 +164,29 @@ impl Scene {
         self.selected.clear();
         self.selected_order.clear();
         self.bump_selection_set();
+    }
+
+    /// Snapshot the current selection as the "previous" set SELECTPREVIOUS
+    /// hands back. Called when a command starts, before its own picks replace
+    /// the set, and skipped by the commands that only read the set.
+    pub(crate) fn remember_selection_set(&mut self) {
+        let current = self.selected_handles_in_order();
+        if current != self.previous_selected {
+            self.previous_selected = current;
+        }
+    }
+
+    /// Swap the current selection with the remembered one. Returns the number
+    /// of objects restored, or `None` when nothing was remembered.
+    pub(crate) fn select_previous(&mut self) -> Option<usize> {
+        if self.previous_selected.is_empty() {
+            return None;
+        }
+        let current = self.selected_handles_in_order();
+        let previous = std::mem::take(&mut self.previous_selected);
+        self.replace_selection_exact(&previous);
+        self.previous_selected = current;
+        Some(previous.len())
     }
 
     /// Script-facing replacement: preserve exactly the validated input order.
@@ -1092,6 +1118,15 @@ impl Scene {
         self.remove_entities(handles, true, false, true);
     }
 
+    /// Erase entities a constraint owns, such as the dimension it draws.
+    /// Ownership, not the layer, decides: a locked layer must not keep a
+    /// measurement alive after the geometry it measured is gone. The
+    /// reference-only skip is bypassed as well; a constraint-owned dimension is
+    /// never plugin-designated.
+    pub(crate) fn erase_constraint_owned(&mut self, handles: &[Handle]) {
+        self.remove_entities(handles, false, false, true);
+    }
+
     /// Roll back entities created by the current command after a downstream
     /// registration failure. These entities were never successful command
     /// results, so locked-layer edit policy must not prevent their removal.
@@ -1681,3 +1716,71 @@ mod tests {
 }
 
 
+
+/// Cells picked in one table: the cell the pick started from and the one it
+/// reaches (a Shift+click or a drag moves the second).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCellSelection {
+    pub table: Handle,
+    pub anchor: (usize, usize),
+    pub end: (usize, usize),
+}
+
+impl TableCellSelection {
+    /// Top row, left column, bottom row, right column.
+    pub fn range(&self) -> (usize, usize, usize, usize) {
+        (
+            self.anchor.0.min(self.end.0),
+            self.anchor.1.min(self.end.1),
+            self.anchor.0.max(self.end.0),
+            self.anchor.1.max(self.end.1),
+        )
+    }
+}
+
+impl Scene {
+    /// Select cells of a table: the table becomes the only selected object.
+    pub fn select_table_cells(&mut self, cells: TableCellSelection) {
+        self.select_entity(cells.table, true);
+        self.table_cells = Some(cells);
+        self.bump_selection_set();
+    }
+
+    /// The cell of a shown table in the current space whose inside holds
+    /// `point` at least `margin` from its edges, topmost table first.
+    pub(crate) fn table_cell_pick(
+        &self,
+        point: glam::DVec3,
+        margin: f64,
+    ) -> Option<(Handle, (usize, usize))> {
+        let block = self.interaction_block_handle();
+        let record = self.document.block_records.iter().find(|r| r.handle == block)?;
+        record.entity_handles.iter().rev().find_map(|&handle| {
+            let Some(EntityType::Table(table)) = self.document.get_entity(handle) else {
+                return None;
+            };
+            let layer = self.document.layers.get(&table.common.layer);
+            if self.entity_temporarily_hidden(handle)
+                || self.is_reference_only(handle)
+                || !self.passes_selection_filter(handle)
+                || layer.is_some_and(|l| l.is_off() || l.is_frozen() || l.is_locked())
+                || table.common.invisible
+            {
+                return None;
+            }
+            let style = table.table_style_handle.and_then(|h| match self.document.objects.get(&h)? {
+                codec::objects::ObjectType::TableStyle(style) => Some(style),
+                _ => None,
+            });
+            crate::modules::annotate::table_cmd::table_cell_inside(table, style, point, margin)
+                .map(|cell| (handle, cell))
+        })
+    }
+
+    /// The table whose cells are selected.
+    pub fn table_cells_handle(&self) -> Option<Handle> {
+        self.table_cells
+            .filter(|cells| self.selected.contains(&cells.table))
+            .map(|cells| cells.table)
+    }
+}

@@ -111,7 +111,7 @@ fn explode_insert_golden_block_members() {
 }
 
 #[test]
-fn explode_mline_golden_three_lines_per_segment() {
+fn explode_mline_golden_two_lines_per_segment() {
     let doc = Document::new();
     let ml = MLine::from_points(&[
         Vector3::new(0.0, 0.0, 0.0),
@@ -120,8 +120,29 @@ fn explode_mline_golden_three_lines_per_segment() {
         Vector3::new(8.0, 4.0, 0.0),
     ]);
     let pieces = explode_entity(&EntityType::MLine(ml), &doc);
-    assert_eq!(pieces.len(), 9, "3 segments × (spine + 2 offsets)");
-    assert!(pieces.iter().all(|p| matches!(p, EntityType::Line(_))));
+    // One Line per Standard element per segment, as drawn; there is no spine
+    // (#2538). Element placement is covered by the explode `mline_tests`.
+    assert_eq!(pieces.len(), 6, "3 segments × 2 Standard elements");
+    // `from_points` stores no element distances, so this is the fallback
+    // placement: ±0.5 square to each leg, meeting on the miter.
+    let expected = [
+        ((0.0, 0.5), (3.5, 0.5)),
+        ((3.5, 0.5), (3.5, 4.5)),
+        ((3.5, 4.5), (8.0, 4.5)),
+        ((0.0, -0.5), (4.5, -0.5)),
+        ((4.5, -0.5), (4.5, 3.5)),
+        ((4.5, 3.5), (8.0, 3.5)),
+    ];
+    let near = |v: Vector3, (x, y): (f64, f64)| (v.x - x).abs() < 1e-9 && (v.y - y).abs() < 1e-9;
+    for (start, end) in expected {
+        assert!(
+            pieces.iter().any(|p| matches!(
+                p,
+                EntityType::Line(l) if near(l.start, start) && near(l.end, end)
+            )),
+            "missing {start:?} → {end:?} in {pieces:?}"
+        );
+    }
 }
 
 #[test]
@@ -317,7 +338,7 @@ struct FixtureHandles {
 /// explodable polyline + mline + insert, a non-explodable survivor line that
 /// must survive, and two leaders attached to the polyline that must be
 /// erased via annotation coupling even though they are never planned.
-/// The planned replacement order poly (2 pieces) → mline (9) → insert (6)
+/// The planned replacement order poly (2 pieces) → mline (6) → insert (6)
 /// is deliberate: it is what makes a mis-ordered flattened add in
 /// `apply_explode_replacements` fail `document_state` below instead of
 /// coincidentally passing.

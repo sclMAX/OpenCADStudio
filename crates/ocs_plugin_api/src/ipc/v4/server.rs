@@ -16,14 +16,6 @@ const DEFAULT_NOTIFY_RATE_LIMIT: f64 = 1000.0;
 /// Minimum interval between verbose drop logs to avoid spam.
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
-macro_rules! vlog {
-    ($($arg:tt)*) => {{
-        if crate::process::verbose() {
-            eprintln!($($arg)*);
-        }
-    }};
-}
-
 /// A frame delivered from the V4 reader thread to the host main thread.
 pub enum HostIncoming {
     Response {
@@ -146,7 +138,10 @@ pub fn run_host_reader_thread(
                     break;
                 }
                 Err(e) => {
-                    vlog!("[plugin] V4 host reader error: {e}");
+                    // Always logged: the break marks the connection dead
+                    // while the runner may still run, and this line is the
+                    // only record of why.
+                    eprintln!("[plugin] V4 host reader error: {e}");
                     break;
                 }
             }

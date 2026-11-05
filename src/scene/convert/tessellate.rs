@@ -33,7 +33,7 @@ fn split_ds(v: f64) -> (f32, f32) {
 }
 
 #[inline]
-fn split_ds_xyz(x: f64, y: f64, z: f64) -> ([f32; 3], [f32; 3]) {
+pub(crate) fn split_ds_xyz(x: f64, y: f64, z: f64) -> ([f32; 3], [f32; 3]) {
     let (xh, xl) = split_ds(x);
     let (yh, yl) = split_ds(y);
     let (zh, zl) = split_ds(z);
@@ -1282,7 +1282,8 @@ pub fn tessellate(
                 {
                     let a = pattern[0];
                     let p = pattern_length;
-                    let k = ((ref_total - a) / p).round().max(1.0);
+                    // Every whole period the centre line holds.
+                    let k = (ref_total / p).floor().max(1.0);
                     Some(((ref_total - k * p + a) * 0.5).max(1e-4))
                 } else {
                     None
@@ -1711,14 +1712,12 @@ pub fn tessellate(
                         });
                     }
                 }
-                // Empty input (no glyphs) → emit a single empty wire so the
-                // entity still has a hit-test target via snap_pts. With SDF on
-                // this is the normal path (strokes suppressed) and the wire
-                // also carries the glyph quads built above.
-                if bins.is_empty() {
+                // Built for both branches below: text with run-less strokes
+                // (underline, a fraction rule) takes the stroke route, and its
+                // mask and frame must not be lost there.
+                let mtext_chrome = || {
                     let mut wires: Vec<WireModel> = Vec::new();
-                    wires.extend(field_background.take());
-                    // MTEXT background and frame follow the glyph bounds.
+                    // MTEXT background mask and frame follow the glyph bounds.
                     if text_aabb != WireModel::UNBOUNDED_AABB {
                         if let EntityType::MText(m) = entity {
                             let has_fill = m.background_fill_flags & 0x03 != 0;
@@ -1854,6 +1853,16 @@ pub fn tessellate(
                             }
                         }
                     }
+                    wires
+                };
+                // Empty input (no glyphs) → emit a single empty wire so the
+                // entity still has a hit-test target via snap_pts. With SDF on
+                // this is the normal path (strokes suppressed) and the wire
+                // also carries the glyph quads built above.
+                if bins.is_empty() {
+                    let mut wires: Vec<WireModel> = Vec::new();
+                    wires.extend(field_background.take());
+                    wires.extend(mtext_chrome());
                     // Debug (env OCS_TEXT_BOX): draw a rectangle around the glyph
                     // bounds as a separate outline wire so the text box is
                     // visible for testing. The empty text wire below is left
@@ -1950,6 +1959,7 @@ pub fn tessellate(
 
                 let mut out: Vec<WireModel> = Vec::new();
                 out.extend(field_background);
+                out.extend(mtext_chrome());
                 let mut is_first = true;
                 for bin in bins {
                     let wire_color = match bin.color {
@@ -4063,5 +4073,46 @@ mod tests {
         assert_eq!(inst.start_width, 25.0);
         // params.w (end_width) is at end_angle (physical start, 5.0)
         assert_eq!(inst.params[3], 5.0);
+    }
+
+    #[test]
+    fn mtext_mask_and_frame_draw_on_text_with_run_less_strokes() {
+        // An underline or a fraction rule is a run-less stroke, which sends
+        // the text down the stroke route; its mask and frame are drawn there
+        // too, exactly as for plain text.
+        let wires = |value: &str, flags: i32| {
+            let mut text =
+                codec::entities::MText::with_value(value, codec::types::Vector3::new(0., 0., 0.));
+            text.height = 2.5;
+            text.background_fill_flags = flags;
+            text.background_color = codec::types::Color::Index(1);
+            tessellate(
+                &codec::Document::new(),
+                Handle::new(123),
+                &EntityType::MText(Box::new(text)),
+                false,
+                [1.0; 4],
+                0.0,
+                [0.0; 8],
+                1.0,
+                1.0,
+                None,
+                None,
+                [0.0; 4],
+                false,
+            )
+        };
+        for value in ["plain", r"\Lunder\l", r"a\S1/2;"] {
+            let bare = wires(value, 0);
+            let fill = wires(value, 0x01);
+            assert_eq!(fill.len(), bare.len() + 1, "{value}: fill");
+            assert!(
+                fill.iter()
+                    .any(|w| !w.fill_tris.is_empty() && w.points.is_empty()),
+                "{value}: the fill is a filled wire"
+            );
+            assert_eq!(wires(value, 0x02).len(), bare.len() + 1, "{value}: mask");
+            assert_eq!(wires(value, 0x10).len(), bare.len() + 1, "{value}: frame");
+        }
     }
 }

@@ -185,6 +185,7 @@ pub(crate) fn points_error(
     None
 }
 
+#[cfg(test)]
 pub(crate) fn create(
     document: &mut Document,
     definition: Handle,
@@ -193,20 +194,33 @@ pub(crate) fn create(
     end: Vector3,
     reference: Vector3,
 ) -> Result<Handle, &'static str> {
+    create_with_label(document, definition, kind, base, end, reference, None, None)
+}
+
+/// The next free `Flip state<n>` label the placement prompt offers.
+pub(crate) fn next_flip_state_label(document: &Document, definition: Handle) -> String {
+    super::block_distance_parameter::unique_label(
+        &super::block_distance_parameter::label_names(document, definition),
+        "Flip state",
+    )
+}
+
+pub(crate) fn create_with_label(
+    document: &mut Document,
+    definition: Handle,
+    kind: Kind,
+    base: Vector3,
+    end: Vector3,
+    reference: Vector3,
+    label_offset: Option<f64>,
+    value_set: Option<&super::block_distance_parameter::ValueSet>,
+) -> Result<Handle, &'static str> {
     if let Some(error) = points_error(kind, base, end, reference)
         .or_else(|| placement_error(document, definition, kind))
     {
         return Err(error);
     }
-    let mut names = super::block_distance_parameter::parameters(document, definition)
-        .into_iter()
-        .flat_map(|p| p.labels)
-        .collect::<Vec<_>>();
-    names.extend(
-        parameters(document, definition)
-            .into_iter()
-            .map(|p| p.label),
-    );
+    let names = super::block_distance_parameter::label_names(document, definition);
     let prefix = match kind {
         Kind::Rotation => "Angle",
         Kind::Alignment => "Alignment",
@@ -216,6 +230,13 @@ pub(crate) fn create(
         .map(|n| format!("{prefix}{n}"))
         .find(|name| names.iter().all(|old| !old.eq_ignore_ascii_case(name)))
         .unwrap();
+    let element_name = if kind == Kind::Rotation {
+        super::block_authoring::metadata::next_parameter_name(document, definition, kind.name())?
+    } else if kind == Kind::Alignment {
+        label.clone()
+    } else {
+        kind.name().to_owned()
+    };
     let (graph, slots) = authoring::prepare(document, definition)?;
     let (class, cpp, grip_class, grip_cpp) = kind.classes();
     register_classes(
@@ -239,14 +260,7 @@ pub(crate) fn create(
     };
     let native = BlockTwoPointParameter {
         parameter: BlockParameter {
-            element: element(
-                0,
-                if kind == Kind::Alignment {
-                    &label
-                } else {
-                    kind.name()
-                },
-            ),
+            element: element(0, &element_name),
             show_properties: true,
             chain_actions: false,
         },
@@ -279,12 +293,14 @@ pub(crate) fn create(
             parameter: native,
             definition_base_angle_point: reference,
             angle_name: label,
-            angle: (end - base).length() * 0.15,
-            value_set: BlockParameterValueSet {
-                flags: 3,
-                maximum: std::f64::consts::TAU,
-                ..Default::default()
-            },
+            angle: label_offset.unwrap_or((end - base).length() * 0.15),
+            value_set: value_set
+                .map(|set| set.record())
+                .unwrap_or(BlockParameterValueSet {
+                    flags: 3,
+                    maximum: std::f64::consts::TAU,
+                    ..Default::default()
+                }),
             ..Default::default()
         }),
         Kind::Alignment => DynamicBlockData::AlignmentParameter(BlockAlignmentParameter {
@@ -382,6 +398,55 @@ pub(crate) fn create(
     Ok(handles[0])
 }
 
+/// Frame of the drawn rotation arc: in-plane axes `u` (base-angle direction) and
+/// `v`, the radius, and the counterclockwise sweep in radians (a zero default
+/// angle draws the full turn).
+pub(crate) fn rotation_arc(
+    base: Vector3,
+    end: Vector3,
+    reference: Vector3,
+) -> Option<(Vector3, Vector3, f64, f64)> {
+    let d = end - base;
+    let radius = d.x.hypot(d.y).hypot(d.z);
+    if !radius.is_finite() || radius <= 1e-10 {
+        return None;
+    }
+    let reference = reference - base;
+    let u = reference.normalize();
+    let mut v = if u.z.abs() < 1e-10 && d.z.abs() < 1e-10 {
+        Vector3::new(-u.y, u.x, 0.0)
+    } else {
+        d - u * d.dot(&u)
+    };
+    if v.length() <= 1e-10 {
+        v = Vector3::new(-u.y, u.x, 0.0);
+    }
+    if v.length() <= 1e-10 {
+        v = Vector3::UNIT_Y;
+    }
+    let v = v.normalize();
+    let mut sweep = d.dot(&v).atan2(d.dot(&u)).rem_euclid(std::f64::consts::TAU);
+    if sweep.abs() <= 1e-10 {
+        sweep = std::f64::consts::TAU;
+    }
+    Some((u, v, radius, sweep))
+}
+
+/// Distance from the arc midpoint to the picked label point, stored as the
+/// parameter's label offset.
+pub(crate) fn rotation_label_offset(
+    base: Vector3,
+    end: Vector3,
+    reference: Vector3,
+    label: Vector3,
+) -> Option<f64> {
+    let (u, v, radius, sweep) = rotation_arc(base, end, reference)?;
+    let middle = sweep * 0.5;
+    let anchor = base + (u * middle.cos() + v * middle.sin()) * radius;
+    let length = (label - anchor).length();
+    length.is_finite().then_some(length)
+}
+
 pub(crate) fn graphic(parameter: &Parameter<'_>) -> Graphic {
     let base = parameter.native.definition_base_point;
     let end = parameter.native.definition_end_point;
@@ -393,24 +458,9 @@ pub(crate) fn graphic(parameter: &Parameter<'_>) -> Graphic {
     }
     match parameter.kind {
         Kind::Rotation => {
-            let reference = parameter.reference - base;
-            let u = reference.normalize();
-            let mut v = if u.z.abs() < 1e-10 && d.z.abs() < 1e-10 {
-                Vector3::new(-u.y, u.x, 0.0)
-            } else {
-                d - u * d.dot(&u)
+            let Some((u, v, radius, angle)) = rotation_arc(base, end, parameter.reference) else {
+                return result;
             };
-            if v.length() <= 1e-10 {
-                v = Vector3::new(-u.y, u.x, 0.0);
-            }
-            if v.length() <= 1e-10 {
-                v = Vector3::UNIT_Y;
-            }
-            let v = v.normalize();
-            let mut angle = d.dot(&v).atan2(d.dot(&u)).rem_euclid(std::f64::consts::TAU);
-            if angle.abs() <= 1e-10 {
-                angle = std::f64::consts::TAU;
-            }
             let at = |angle: f64, r: f64| base + (u * angle.cos() + v * angle.sin()) * r;
             result
                 .lines

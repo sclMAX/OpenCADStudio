@@ -587,7 +587,7 @@ impl OpenCADStudio {
                         .iter()
                         .map(|session| session.br_handle)
                         .collect();
-                    self.push_undo_snapshot(i, format!("Delete block {name}"));
+                    self.push_undo_snapshot(i, crate::app::document::HistoryLabel::formatted(format!("Delete block {name}"), "delete-block", name.to_owned().into()));
                     let outcome = crate::scene::block_service::delete(
                         &mut self.tabs[i].scene,
                         &name,
@@ -932,9 +932,11 @@ impl OpenCADStudio {
     }
 }
 
-/// The block records of `doc` the palette lists (as `custom_block_names`):
-/// not model space, paper space or a layout's, whose contents are the
-/// drawing itself and can be large.
+/// The block records of `doc` whose contents the palette tracks for change
+/// propagation (as `changed_block_names`): not model space, paper space or a
+/// layout's, whose contents are the drawing itself and can be large. Unlike
+/// `Scene::custom_block_names`, this keeps anonymous records, because a
+/// generated record can hold a named one and so carries its changes.
 fn palette_records(doc: &codec::Document) -> impl Iterator<Item = &codec::tables::BlockRecord> {
     use codec::TableEntry;
     doc.block_records

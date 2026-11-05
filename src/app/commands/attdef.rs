@@ -40,6 +40,7 @@ impl OpenCADStudio {
                     .collect();
                 let command = AttdefCommand::new(
                     "-ATTDEF",
+                    self.tabs[i].id,
                     defaults.style_name,
                     defaults.height,
                     defaults.width_factor,
@@ -98,7 +99,7 @@ impl OpenCADStudio {
         match parts.next().map(str::trim).filter(|v| !v.is_empty()) {
             None => {
                 self.command_line
-                    .push_output(&format!("Enter new value for AFLAGS <{current}>:"));
+                    .push_output(&crate::ui::command_line::value_prompt("AFLAGS", &current));
                 self.pending_setvar = Some("AFLAGS".to_string());
             }
             Some(v) => match v.parse::<u8>().ok().filter(|v| *v <= 63) {
@@ -107,7 +108,7 @@ impl OpenCADStudio {
                     self.command_line
                         .push_error("Requires an integer between 0 and 63.");
                     self.command_line
-                        .push_output(&format!("Enter new value for AFLAGS <{current}>:"));
+                        .push_output(&crate::ui::command_line::value_prompt("AFLAGS", &current));
                     self.pending_setvar = Some("AFLAGS".to_string());
                 }
             },
@@ -125,6 +126,7 @@ impl OpenCADStudio {
             .map(|s| s.name.clone())
             .collect();
         styles.sort_by_key(|s| s.to_lowercase());
+        let drawing = self.tabs[i].id;
         let session = attdef::session();
         self.attdef_dialog = Some(AttdefDialogState {
             aflags: session.aflags,
@@ -141,7 +143,7 @@ impl OpenCADStudio {
             on_screen: session.on_screen,
             coords: ["0".into(), "0".into(), "0".into()],
             align_below: false,
-            can_align_below: session.last.is_some(),
+            can_align_below: session.last_in(drawing).is_some(),
             error: None,
             field: None,
         });
@@ -325,12 +327,14 @@ impl OpenCADStudio {
         // The choice is kept with the user settings, as the reference keeps it.
         self.persist_settings_if_changed();
         self.reset_command_start_state(i);
+        let drawing = self.tabs[i].id;
         if state.align_below {
-            let previous = attdef::session().last.clone();
+            let previous = attdef::session().last_in(drawing).cloned();
             if let Some(previous) = previous {
                 let entity = attdef::build_below(&spec, &previous);
-                self.tabs[i].active_cmd = Some(Box::new(AttdefPlaceCommand::new(spec.clone())));
-                attdef::remember(&spec, &entity);
+                self.tabs[i].active_cmd =
+                    Some(Box::new(AttdefPlaceCommand::new(spec.clone(), drawing)));
+                attdef::remember(drawing, &spec, &entity);
                 return self.apply_cmd_result(crate::command::CmdResult::CommitAndExit(entity));
             }
         }
@@ -339,7 +343,7 @@ impl OpenCADStudio {
         } else {
             crate::command::WorkingPlane::default()
         };
-        let mut command = AttdefPlaceCommand::new(spec);
+        let mut command = AttdefPlaceCommand::new(spec, drawing);
         command.set_working_plane(plane);
         if state.on_screen {
             self.command_line.push_info(&command.prompt());

@@ -84,8 +84,9 @@ const WEB_ALIAS_KEY: &str = "opencadstudio.aliases";
 /// version 10 the block command-line forms and block editor shortcuts;
 /// version 11 IO (INSERTOBJ); version 12 DLU (DATALINKUPDATE); version 13 SP
 /// (SPELL); version 14 the multileader set (MLE, LEAD; LE and MLA retargeted,
-/// MLR / MLAL / QL dropped); version 15 TS (TABLESTYLE) and CT (CTABLESTYLE).
-const DEFAULT_ALIASES_VERSION: u32 = 15;
+/// MLR / MLAL / QL dropped); version 15 TS (TABLESTYLE) and CT (CTABLESTYLE);
+/// version 16 dropped WO (WIPEOUT has no alias).
+const DEFAULT_ALIASES_VERSION: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
 const WEB_ALIAS_VERSION_KEY: &str = "opencadstudio.aliases.version";
@@ -139,6 +140,7 @@ fn retargeted_at(version: u32) -> &'static [(&'static str, &'static str, &'stati
             ("MLAL", "MLEADERALIGN", ""),
             ("QL", "QLEADER", ""),
         ],
+        16 => &[("WO", "WIPEOUT", "")],
         _ => &[],
     }
 }
@@ -205,7 +207,7 @@ fn default_map() -> FxHashMap<String, String> {
 }
 
 /// Sorted factory-default rows for the ALIASEDIT reset action.
-pub(super) fn default_alias_rows() -> Vec<(String, String)> {
+pub(crate) fn default_alias_rows() -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = default_map().into_iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows

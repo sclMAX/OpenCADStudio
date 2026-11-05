@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::settings::UserSettings;
-use crate::ui::ribbon::CollapseMode;
+use crate::ui::ribbon::RibbonLayout;
 use crate::ui::statusbar::statusbar_config::StatusBarConfig;
 use crate::ui::window::plot::PlotDialogState;
 
@@ -32,12 +32,14 @@ pub struct AppConfig {
     pub dock: crate::ui::dock::DockState,
     /// Whether the optional Graphic Attributes palette is visible.
     pub show_graphic_attributes: bool,
+    /// Whether the Command History pallet is open.
+    pub show_command_history: bool,
     /// Graphic Attributes creates fills on the current layer instead of the
     /// layer of the filled object.
     pub graphic_fills_on_current_layer: bool,
     /// Add a newly selected annotation scale to existing annotative objects.
     pub annotation_auto_scale: i8,
-    /// Ribbon collapse density.
+    /// Ribbon layout.
     pub ribbon: RibbonConfig,
     /// Print dialog preferences (only the persisted fields; runtime state is
     /// skipped by `PlotDialogState`'s serde attributes).
@@ -58,6 +60,7 @@ impl Default for AppConfig {
             statusbar: StatusBarConfig::default(),
             dock: crate::ui::dock::DockState::default(),
             show_graphic_attributes: false,
+            show_command_history: false,
             graphic_fills_on_current_layer: false,
             annotation_auto_scale: -4,
             ribbon: RibbonConfig::default(),
@@ -553,7 +556,10 @@ pub struct StartConfig {
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RibbonConfig {
-    pub collapse: CollapseMode,
+    /// Hidden tabs and panels, panel order, panel titles, minimize state and
+    /// pinned slide-outs, stored as fields of this section.
+    #[serde(flatten)]
+    pub layout: RibbonLayout,
 }
 
 impl AppConfig {
@@ -728,6 +734,123 @@ mod tests {
         let serialized = serde_json::to_string(&original).expect("serialize config");
         let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
         assert!(restored.show_graphic_attributes);
+    }
+
+    #[test]
+    fn ribbon_layout_defaults_and_round_trips() {
+        use crate::ui::ribbon::{MinimizePref, RibbonMinimize};
+
+        // A config from before the layout settings keeps loading, with the
+        // default layout; the panel density it may still hold is ignored.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"collapse":"Compact"}}"#).expect("old config");
+        assert!(old.ribbon.layout == RibbonLayout::default());
+        assert!(old.ribbon.layout.show_panel_titles);
+        assert!(old.ribbon.layout.search_expanded);
+
+        let mut original = AppConfig::default();
+        let layout = &mut original.ribbon.layout;
+        layout.hidden_tabs.insert("manage".into());
+        layout.hidden_panels.insert("draw/Groups".into());
+        layout.panel_order.insert(
+            "draw".into(),
+            vec!["draw/Modify".into(), "draw/Draw".into()],
+        );
+        layout.show_panel_titles = false;
+        layout.minimize = RibbonMinimize::PanelTitles;
+        layout.minimize_pref = MinimizePref::Tabs;
+        layout.pinned_slideouts.insert("draw/Draw".into());
+        layout.search_expanded = false;
+
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        // The fields sit directly in the ribbon section.
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["hidden_tabs"][0], "manage");
+        assert_eq!(value["ribbon"]["minimize"], "PanelTitles");
+        assert_eq!(value["ribbon"]["search_expanded"], false);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
+    fn quick_access_toolbar_defaults_and_round_trips() {
+        use crate::ui::ribbon::{QatBuiltin, QatItem};
+
+        // A config saved before the toolbar was customizable shows today's
+        // toolbar.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"search_expanded":false}}"#).expect("old config");
+        assert_eq!(old.ribbon.layout.qat, crate::ui::ribbon::default_qat());
+        assert!(!old.ribbon.layout.qat_below);
+        assert!(old.ribbon.layout.qat_faces.is_empty());
+
+        let mut original = AppConfig::default();
+        let layout = &mut original.ribbon.layout;
+        layout.qat = vec![
+            QatItem::Command("QSAVE".into()),
+            QatItem::Separator,
+            QatItem::Builtin(QatBuiltin::LayerCombo),
+            QatItem::Command("ZOOM E".into()),
+            QatItem::Builtin(QatBuiltin::DimStyle),
+        ];
+        layout.qat_below = true;
+        layout
+            .qat_faces
+            .insert("MEASURE_MENU".into(), "AREA".into());
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["qat"][0]["Command"], "QSAVE");
+        assert_eq!(value["ribbon"]["qat"][1], "Separator");
+        assert_eq!(value["ribbon"]["qat"][2]["Builtin"], "LayerCombo");
+        assert_eq!(value["ribbon"]["qat"][4]["Builtin"], "DimStyle");
+        assert_eq!(value["ribbon"]["qat_below"], true);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
+    }
+
+    #[test]
+    fn floating_panels_default_and_round_trip() {
+        use crate::ui::ribbon::FloatingPanel;
+
+        // A config from before floating panels has none, and a saved panel
+        // missing newer fields loads with their defaults.
+        let old: AppConfig =
+            serde_json::from_str(r#"{"ribbon":{"minimize":"Off"}}"#).expect("old config");
+        assert!(old.ribbon.layout.floating.is_empty());
+        let partial: AppConfig = serde_json::from_str(
+            r#"{"ribbon":{"floating":[{"key":"draw/Draw","module_id":"draw","x":10,"y":20}]}}"#,
+        )
+        .expect("partial panel");
+        let panel = &partial.ribbon.layout.floating[0];
+        assert_eq!((panel.x, panel.y, panel.z), (10.0, 20.0, 0));
+        assert!(!panel.extras_right && !panel.pinned);
+
+        let mut original = AppConfig::default();
+        original.ribbon.layout.floating = vec![
+            FloatingPanel {
+                key: "draw/Draw".into(),
+                module_id: "draw".into(),
+                x: 120.5,
+                y: 300.0,
+                extras_right: true,
+                pinned: true,
+                z: 2,
+            },
+            FloatingPanel {
+                key: "draw/Modify".into(),
+                module_id: "draw".into(),
+                x: 400.0,
+                y: 300.0,
+                z: 1,
+                ..FloatingPanel::default()
+            },
+        ];
+        let serialized = serde_json::to_string(&original).expect("serialize config");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(value["ribbon"]["floating"][0]["key"], "draw/Draw");
+        assert_eq!(value["ribbon"]["floating"][0]["extras_right"], true);
+        let restored: AppConfig = serde_json::from_str(&serialized).expect("deserialize config");
+        assert!(restored.ribbon == original.ribbon);
     }
 
     #[test]

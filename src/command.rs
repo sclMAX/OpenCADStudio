@@ -1830,6 +1830,7 @@ pub enum CmdResult {
         definition: Handle,
         action: Handle,
         expected: Box<codec::objects::ObjectType>,
+        point_choices: Option<(i32, Vec<(Handle, i32, String)>)>,
         targets: Vec<Handle>,
         frame: Option<Vec<DVec3>>,
         rotate_only: Option<Vec<Handle>>,
@@ -1854,6 +1855,7 @@ pub enum CmdResult {
         kind: crate::scene::block_actions::Kind,
         parameter: Handle,
         xy_key_point: Option<crate::scene::block_actions::XyKeyPoint>,
+        point_choices: Option<(i32, Vec<(Handle, i32, String)>)>,
         targets: Vec<Handle>,
         location: DVec3,
         frame: Option<Vec<DVec3>>,
@@ -1883,14 +1885,32 @@ pub enum CmdResult {
         parameter: Handle,
         value: crate::scene::block_actions::Value,
     },
-    /// Place or relocate a Basepoint, or place a Lookup parameter.
+    /// Place or relocate a Basepoint, or place a Lookup parameter. A Lookup
+    /// takes its grip count, where `None` keeps the default one grip.
     PlaceBlockSingleParameter {
         document_id: u64,
         definition: Handle,
         kind: crate::modules::block_editor::single_parameter::Kind,
         location: DVec3,
+        grips: Option<usize>,
+        /// Answers given to the placement prompt's options; a missing answer
+        /// keeps the parameter's own default.
+        options: crate::modules::block_editor::single_parameter::Options,
     },
-    /// Place a native Rotation, Alignment or Flip parameter.
+    /// An action type was chosen that has no geometry action of its own:
+    /// continue with Lookup parameter selection.
+    StartBlockLookupAction {
+        document: u64,
+        definition: Handle,
+    },
+    /// The chosen Lookup parameter's property table should open for editing.
+    OpenBlockLookupTable {
+        document: u64,
+        definition: Handle,
+        name: String,
+    },
+    /// Place a native Rotation, Alignment or Flip parameter. Rotation takes a
+    /// label location, which becomes the label's distance from the arc.
     PlaceBlockOrientationParameter {
         document_id: u64,
         definition: Handle,
@@ -1899,8 +1919,14 @@ pub enum CmdResult {
         base: DVec3,
         end: DVec3,
         reference: DVec3,
+        label_offset: Option<f64>,
+        grips: Option<usize>,
+        /// Answers given to the base-point prompt's options; a missing answer
+        /// keeps the parameter's own default.
+        options: crate::modules::block_editor::orientation_parameter::Options,
     },
-    /// Place a native two-point parameter after its base, end and label picks.
+    /// Place a native two-point parameter: Linear and Polar take a base, end and
+    /// label pick; XY takes its grip count and labels itself at the endpoint.
     PlaceBlockDistanceParameter {
         document_id: u64,
         definition: Handle,
@@ -1908,6 +1934,11 @@ pub enum CmdResult {
         base: DVec3,
         end: DVec3,
         label: DVec3,
+        /// XY parameter grip count chosen at authoring time, when asked.
+        grips: Option<usize>,
+        /// Answers given to the base-point prompt's options; a missing answer
+        /// keeps the parameter's own default.
+        options: crate::modules::block_editor::distance_parameter::Options,
     },
     /// Place a native Point parameter after both authoring picks complete.
     PlaceBlockPointParameter {
@@ -1915,6 +1946,9 @@ pub enum CmdResult {
         definition: Handle,
         location: DVec3,
         label: DVec3,
+        /// Answers given to the placement prompt's options; a missing answer
+        /// keeps the parameter's own default.
+        options: crate::modules::block_editor::point_parameter::Options,
     },
     /// Place the visibility parameter in the definition that requested it.
     PlaceBlockVisibilityParameter {
@@ -1931,6 +1965,11 @@ pub enum CmdResult {
     /// A QuickCalc pick finished: the point, distance or angle it measured,
     /// for the pallet's input.
     QuickCalcPick(crate::app::calc::Value),
+    /// The Table Style window's starting-table pick ended: the picked
+    /// object, or none when the pick was left with Enter or Esc.
+    TableTemplatePick(Option<Handle>),
+    /// Turn a layer off (or back on) and keep the command for its next pick.
+    SetLayerOn { layer: String, on: bool },
     /// Command is still waiting for the next point; show updated prompt.
     NeedPoint,
     /// Update the committed-segment wire (normal colour) and keep collecting points.
@@ -1945,6 +1984,8 @@ pub enum CmdResult {
     CommitEntitiesAndExit(Vec<EntityType>),
     /// Commit an opencadcodec entity to the document and end the command.
     CommitAndExit(EntityType),
+    /// `CommitAndExit`, then print the message.
+    CommitAndReport(EntityType, String),
     /// Commit a dimension using the drawing's association mode.
     CommitDimension {
         entity: EntityType,
@@ -2031,6 +2072,13 @@ pub enum CmdResult {
         hatch: HatchModel,
         boundaries: Vec<EntityType>,
         entity_style: Option<(codec::types::Color, codec::types::Transparency)>,
+    },
+    /// Commit one hatch, print `message` and keep the command at its prompt
+    /// (HATCH's drawn boundaries).
+    CommitHatchContinue {
+        hatch: HatchModel,
+        entity_style: Option<(codec::types::Color, codec::types::Transparency)>,
+        message: String,
     },
     /// Commit independently editable hatch entities for every selected region.
     CommitHatches {
@@ -2254,6 +2302,10 @@ pub enum CmdResult {
     /// Opens the Text to MText Settings dialog from TXT2MTXT's selection
     /// prompt; the command keeps its prompt.
     OpenTxt2MtxtSettings,
+    /// Opens the Property Settings window from MATCHPROP's destination
+    /// prompt, showing this source object's values; the command keeps its
+    /// prompt.
+    OpenMatchPropSettings(Handle),
     /// Opens the Auto Constrain settings dialog from the selection prompt.
     OpenAutoConstrainSettings,
     /// Adds an ordered Coincident relation.  Point/point selections create a
@@ -2341,6 +2393,12 @@ pub enum CmdResult {
         dimensions: Vec<Handle>,
         offset: Option<f64>,
     },
+    /// An associative array arrow grip: set these parameters on the array
+    /// referenced by `insert` and rebuild its items.
+    EditAssocArray {
+        insert: Handle,
+        changes: Vec<(&'static str, f64)>,
+    },
     /// Cancel: discard any preview and end the command.
     Cancel,
     /// Cleanly end the command without reporting cancellation.
@@ -2380,11 +2438,20 @@ pub enum CmdResult {
     /// command calls of a script). A plugin command's script starts from an
     /// empty selection.
     Script(String),
-    /// Move `dest` entities to the layer of the `src` entity; end command.
+    /// Merge several layers in a single undo step; end command.
+    MergeLayers {
+        sources: Vec<String>,
+        target: String,
+    },
+    /// Move `dest` entities to the layer of the `src` entity, or put copies
+    /// of them there when `copy` is set and offer placement of those copies.
     MatchEntityLayer {
         dest: Vec<Handle>,
         src: Handle,
+        copy: bool,
     },
+    /// Translate the copies already owned by COPYTOLAYER's undo snapshot; end command.
+    MoveLayerCopies(Vec<Handle>, DVec3),
     /// Copy all visual properties (layer/color/linetype/lineweight) from `src` to `dest`; end command.
     MatchProperties {
         dest: Vec<Handle>,
@@ -2603,6 +2670,9 @@ pub enum CmdResult {
         /// A Shift+window excludes points inside this area without adding a
         /// new crossing window or subtracting whole entities.
         subtract_window: Option<(DVec3, DVec3)>,
+        /// Objects taken out with Shift+click. They stay out when the crossing
+        /// windows are queried again for this command.
+        removed_handles: Vec<Handle>,
     },
     /// Stretch entities: move only vertices/endpoints inside any gathered
     /// crossing window.
@@ -3016,6 +3086,11 @@ impl CommandSuggestion {
 }
 
 pub trait CadCommand: Send {
+    /// The table cell this command edits (table, row, column): Tab and
+    /// Shift+Tab move its editor to the next or previous cell.
+    fn table_cell(&self) -> Option<(Handle, usize, usize)> {
+        None
+    }
     /// Preserve source appearance for commands that extract existing entities.
     fn preserve_commit_style(&self) -> bool {
         false
@@ -3083,6 +3158,11 @@ pub trait CadCommand: Send {
     /// Remove one selected vertex in STRETCH's crossing-window collection stage.
     /// Other commands keep the normal Shift+grip behavior.
     fn remove_stretch_point(&mut self, _handle: Handle, _world: DVec3) -> bool {
+        false
+    }
+
+    /// Remove a whole object in STRETCH's crossing-window collection stage.
+    fn remove_stretch_entity(&mut self, _handle: Handle) -> bool {
         false
     }
 
@@ -3183,9 +3263,10 @@ pub trait CadCommand: Send {
         false
     }
 
-    /// Take a typed coordinate at an object prompt as a pick at that point.
+    /// Take a typed coordinate at an object prompt as a pick at that point,
+    /// as a click there would; a step that reads points itself keeps them.
     fn typed_point_picks_entity(&self) -> bool {
-        false
+        !self.entity_pick_accepts_points()
     }
 
     /// A constraint point the host resolved for a `CheckConstraintPoint`
@@ -3611,6 +3692,41 @@ pub trait CadCommand: Send {
         false
     }
 
+    /// Consume an eligible Block Editor marker click while gathering a selection.
+    /// The returned name is drawing-authored and is shown as selection feedback.
+    fn on_selection_marker_click(
+        &mut self,
+        _scene: &Scene,
+        _position: iced::Point,
+        _context: PointPickContext,
+        _remove: bool,
+        _replace: bool,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Whether a Point marker is in this command's pending target selection.
+    fn selection_marker_selected(&self, _handle: Handle) -> bool {
+        false
+    }
+
+    /// Clear pending marker selections when an entity pick replaces the set.
+    fn clear_selection_markers(&mut self) {}
+
+    /// Gather eligible Block Editor markers within a viewport selection region.
+    fn on_selection_marker_region(
+        &mut self,
+        _scene: &Scene,
+        _polygon: &[iced::Point],
+        _context: PointPickContext,
+        _crossing: bool,
+        _remove: bool,
+        _replace: bool,
+        _geometry_hit: bool,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The command takes associative dimensions only. The host drops every
     /// other object from a completed selection, says how many it dropped, and
     /// hands the command what is left.
@@ -3695,6 +3811,12 @@ pub trait CadCommand: Send {
     /// HPGAPTOL as the command currently has it, so a gap tolerance changed
     /// at its prompt is kept for later boundary picks. Default `None`.
     fn hatch_gap_tolerance(&self) -> Option<f64> {
+        None
+    }
+
+    /// The boundary method HATCH was switched to (0 pick internal point,
+    /// 1 select objects, 2 draw), kept for its next start. Default `None`.
+    fn hatch_start_method(&self) -> Option<u8> {
         None
     }
 
@@ -3907,6 +4029,16 @@ mod constraint_registry_tests {
                 "{target} must validate in ALIASEDIT"
             );
         }
+        // Every command the shipped alias file points at validates too (#2452).
+        let unknown: Vec<&str> = include_str!("../assets/ocad.pgp")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with(';'))
+            .filter_map(|line| line.split_once(','))
+            .filter_map(|(_, target)| target.trim().strip_prefix('*'))
+            .filter(|target| !names.iter().any(|name| name.eq_ignore_ascii_case(target)))
+            .collect();
+        assert!(unknown.is_empty(), "alias targets missing from the registry: {unknown:?}");
     }
 
     /// Ensures every constraint command remains discoverable by autocomplete
@@ -3937,6 +4069,10 @@ mod constraint_registry_tests {
             "FXCONSTRAINT",
             "GCFIX",
             "SYCONSTRAINT",
+            "GCPARALLEL",
+            "GCCOLLINEAR",
+            "GCTANGENT",
+            "GCSYMMETRIC",
             "DCONSTRAINT",
             "ACONSTRAINT",
         ] {

@@ -1,5 +1,18 @@
 use super::*;
 
+/// The symbol-kind words `XBIND` accepts.
+fn xbind_kind(word: &str) -> Option<crate::io::xref::XbindKind> {
+    use crate::io::xref::XbindKind;
+    match word.to_ascii_uppercase().as_str() {
+        "LAYER" | "LAYERS" | "LA" => Some(XbindKind::Layer),
+        "BLOCK" | "BLOCKS" | "B" => Some(XbindKind::Block),
+        "LTYPE" | "LINETYPE" | "LTYPES" | "LT" => Some(XbindKind::Linetype),
+        "STYLE" | "STYLES" | "TEXTSTYLE" | "TEXT" => Some(XbindKind::TextStyle),
+        "DIMSTYLE" | "DIMSTYLES" | "DIM" => Some(XbindKind::DimStyle),
+        _ => None,
+    }
+}
+
 impl OpenCADStudio {
     /// Shared per-reference status reporting for XRELOAD and XREF Reload.
     /// Extracted verbatim from the XRELOAD arm — no behavior change.
@@ -522,11 +535,13 @@ impl OpenCADStudio {
                     .collect();
                 let existing_names = self.tabs[i].scene.custom_block_names();
                 let default_unit = self.tabs[i].scene.document.header.insertion_units;
+                let precision = self.tabs[i].scene.document.header.linear_unit_precision;
                 self.block_definition = Some(
                     crate::ui::window::block_definition::BlockDefinitionState::new(
                         existing_names,
                         handles,
                         default_unit,
+                        precision,
                     ),
                 );
                 self.active_modal = Some(crate::app::ModalKind::BlockDefinition);
@@ -540,9 +555,7 @@ impl OpenCADStudio {
                     .collect();
                 if parts.len() == 3 {
                     if let Some(state) = self.block_definition.as_mut() {
-                        state.base_point_x = format!("{:.4}", parts[0]);
-                        state.base_point_y = format!("{:.4}", parts[1]);
-                        state.base_point_z = format!("{:.4}", parts[2]);
+                        state.set_base_point(glam::DVec3::new(parts[0], parts[1], parts[2]));
                     }
                 }
                 self.tabs[i].active_cmd = None;
@@ -576,9 +589,7 @@ impl OpenCADStudio {
                     .collect();
                 if parts.len() == 3 {
                     if let Some(state) = self.wblock.as_mut() {
-                        state.base_point_x = format!("{:.4}", parts[0]);
-                        state.base_point_y = format!("{:.4}", parts[1]);
-                        state.base_point_z = format!("{:.4}", parts[2]);
+                        state.show_base_point(glam::DVec3::new(parts[0], parts[1], parts[2]));
                     }
                 }
                 self.tabs[i].active_cmd = None;
@@ -618,12 +629,23 @@ impl OpenCADStudio {
                 let blocks = self.tabs[i].scene.custom_block_names();
                 let ranked = self.ranked_block_names(&blocks);
                 let snapshot = self.block_usage_snapshot();
+                // The remembered name belongs to this drawing; offering one it
+                // does not define would leave Enter with nothing to answer.
+                let remembered = self.tabs[i].insname.clone();
+                let default_name = if blocks
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&remembered))
+                {
+                    remembered
+                } else {
+                    String::new()
+                };
                 let cmd = InsertBlockCommand::classic(
                     ranked,
                     snapshot,
                     self.cliprompt_lines.clamp(0, 50) as u8,
                     self.block_catalog(),
-                    self.insname.clone(),
+                    default_name,
                 );
                 self.command_line.push_info(&cmd.prompt());
                 self.command_line.set_step_options(cmd.options());
@@ -898,6 +920,7 @@ impl OpenCADStudio {
                     .collect();
                 let existing_blocks = self.tabs[i].scene.custom_block_names();
                 let default_unit = self.tabs[i].scene.document.header.insertion_units;
+                let precision = self.tabs[i].scene.document.header.linear_unit_precision;
                 // "new block" in the drawing's folder, or in Documents for an
                 // unsaved drawing; the file type is added when it is written.
                 let folder = self.tabs[i]
@@ -914,6 +937,7 @@ impl OpenCADStudio {
                     handles,
                     default_unit,
                     default_path,
+                    precision,
                 ));
                 self.active_modal = Some(crate::app::ModalKind::WriteBlock);
             }
@@ -956,6 +980,7 @@ impl OpenCADStudio {
             // (XREFMAN was a provisional name and is not kept, not even as an
             // alias.) The XREF command below is untouched.
             "EXTERNALREFERENCES" => {
+                self.pallet_as_window(crate::ui::dock::PanelId::ExternalReferences);
                 self.show_external_references = true;
                 // Always open expanded so the panel is immediately usable;
                 // dock it on the right if the user closed it from the layout.
@@ -975,6 +1000,178 @@ impl OpenCADStudio {
                     "ERSTATE = {} (read only)",
                     u8::from(self.show_external_references)
                 ));
+            }
+
+            // XBIND / -XBIND — copy named symbols out of one reference and
+            // leave the reference attached. The bound copy uses the same
+            // `PLAN$0$WALLS` names a full BIND produces.
+            //   XBIND                         list the drawing references
+            //   XBIND <reference>             list its bindable symbols
+            //   XBIND <reference> <kind> <name> [<name>…] [<kind> <name>…]
+            cmd if cmd.eq_ignore_ascii_case("XBIND")
+                || cmd.to_ascii_uppercase().starts_with("XBIND ")
+                || cmd.eq_ignore_ascii_case("-XBIND")
+                || cmd.to_ascii_uppercase().starts_with("-XBIND ") =>
+            {
+                let rest = cmd
+                    .trim_start_matches('-')
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("");
+                let base_dir: std::path::PathBuf = self.tabs[i]
+                    .current_path
+                    .as_ref()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let entries = crate::io::xref::collect_entries_with_prev(
+                    &self.tabs[i].scene.document,
+                    &base_dir,
+                    self.tabs[i].xref_unloaded.as_set(),
+                    &self.tabs[i].xref_stat_cache.0,
+                );
+                let direct: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry.parent_key.is_none())
+                    .collect();
+                let mut words = rest.split_whitespace();
+                let Some(pattern) = words.next() else {
+                    if direct.is_empty() {
+                        self.command_line
+                            .push_info(crate::t!("No drawing references to bind from.").as_ref());
+                    } else {
+                        self.command_line
+                            .push_output(crate::t!("Bindable references:").as_ref());
+                        for entry in &direct {
+                            self.command_line
+                                .push_output(crate::tf!("  {}", entry.name).as_ref());
+                        }
+                        self.command_line.push_info(
+                            crate::t!(
+                                "Usage: XBIND <reference> <layer|block|ltype|style|dimstyle> <name> …"
+                            )
+                            .as_ref(),
+                        );
+                    }
+                    return Some(self.finish_dispatch(cmd));
+                };
+                let matched: Vec<_> = direct
+                    .iter()
+                    .filter(|entry| crate::io::xref_model::wildcard_match(&entry.name, pattern))
+                    .collect();
+                if matched.is_empty() {
+                    self.command_line.push_error(
+                        crate::tf!("XBIND: no reference matches '{}'.", pattern).as_ref(),
+                    );
+                    return Some(self.finish_dispatch(cmd));
+                }
+                if matched.len() > 1 {
+                    let names: Vec<&str> = matched.iter().map(|entry| entry.name.as_str()).collect();
+                    self.command_line.push_error(
+                        crate::tf!(
+                            "XBIND: '{}' matches more than one reference ({}).",
+                            pattern,
+                            names.join(", ")
+                        )
+                        .as_ref(),
+                    );
+                    return Some(self.finish_dispatch(cmd));
+                }
+                let entry = matched[0];
+                let mut requests: Vec<(crate::io::xref::XbindKind, String)> = Vec::new();
+                let mut kind: Option<crate::io::xref::XbindKind> = None;
+                let mut parse_error = None;
+                for word in words {
+                    if let Some(found) = xbind_kind(word) {
+                        kind = Some(found);
+                        continue;
+                    }
+                    match kind {
+                        Some(kind) => requests.push((
+                            kind,
+                            word.trim_matches('"').to_string(),
+                        )),
+                        None => {
+                            parse_error = Some(word.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(word) = parse_error {
+                    self.command_line.push_error(
+                        crate::tf!(
+                            "XBIND: name a symbol type before '{}' (layer, block, ltype, style, dimstyle).",
+                            word
+                        )
+                        .as_ref(),
+                    );
+                    return Some(self.finish_dispatch(cmd));
+                }
+                if requests.is_empty() {
+                    match crate::io::xref::xbind_list(
+                        &self.tabs[i].scene.document,
+                        entry.key,
+                        &base_dir,
+                    ) {
+                        Ok(symbols) => {
+                            if symbols.is_empty() {
+                                self.command_line.push_info(
+                                    crate::tf!("No bindable symbols in \"{}\".", entry.name)
+                                        .as_ref(),
+                                );
+                            } else {
+                                self.command_line.push_output(
+                                    crate::tf!("Bindable symbols in \"{}\":", entry.name).as_ref(),
+                                );
+                                for (kind, name) in symbols {
+                                    self.command_line.push_output(
+                                        crate::tf!("  {} {}", kind.label(), name).as_ref(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => self.command_line.push_error(&error),
+                    }
+                    return Some(self.finish_dispatch(cmd));
+                }
+                self.push_undo_snapshot(i, "XBIND");
+                match crate::io::xref::xbind_symbols(
+                    &mut self.tabs[i].scene.document,
+                    entry.key,
+                    &base_dir,
+                    &requests,
+                ) {
+                    Ok(outcome) => {
+                        for (kind, source_name, host_name) in &outcome.imported {
+                            self.command_line.push_output(
+                                crate::tf!(
+                                    "XBIND: \"{}\" {} {} -> {}",
+                                    outcome.reference,
+                                    kind.label(),
+                                    source_name,
+                                    host_name
+                                )
+                                .as_ref(),
+                            );
+                        }
+                        for (kind, pattern) in &outcome.missing {
+                            self.command_line.push_error(
+                                crate::tf!(
+                                    "XBIND: no {} matching '{}' in \"{}\".",
+                                    kind.label(),
+                                    pattern,
+                                    outcome.reference
+                                )
+                                .as_ref(),
+                            );
+                        }
+                        if !outcome.imported.is_empty() {
+                            self.tabs[i].dirty = true;
+                            self.post_ref_op(i);
+                        }
+                    }
+                    Err(error) => self.command_line.push_error(&error),
+                }
+                return Some(self.finish_dispatch(cmd));
             }
 
             cmd if cmd.eq_ignore_ascii_case("XREF")
@@ -1794,6 +1991,77 @@ mod tests {
         );
     }
 
+    // The Write Block dialog prints coordinates the way the drawing prints
+    // them, and a picked point lands in the same field.
+    #[test]
+    fn write_block_dialog_prints_coordinates_at_the_drawing_precision() {
+        let mut app = fresh_app();
+        let i = app.active_tab;
+        app.tabs[i].scene.document.header.linear_unit_precision = 2;
+        let _ = app.run_command_line("WBLOCK");
+        let state = app.wblock.as_ref().expect("the dialog opens");
+        assert_eq!(state.base_point_x, "0.00", "bare zero at LUPREC 2");
+        let _ = app.dispatch_command("WBLOCK_POINT_PICKED 2.5 7.126 0");
+        let state = app.wblock.as_ref().expect("the dialog stays open");
+        assert_eq!(state.base_point_x, "2.50");
+        assert_eq!(state.base_point_y, "7.13");
+        assert_eq!(state.base_point_z, "0.00");
+    }
+
+    // The Block dialog prints its base point the same way the drawing does, and
+    // a point picked from the drawing lands in the same fields.
+    #[test]
+    fn block_dialog_prints_coordinates_at_the_drawing_precision() {
+        let mut app = fresh_app();
+        let i = app.active_tab;
+        app.tabs[i].scene.document.header.linear_unit_precision = 2;
+        app.tabs[i].scene.define_block_raw(
+            "PRE_BASE",
+            codec::Vector3::new(10.0, 5.0, 0.0),
+            vec![codec::EntityType::Line(codec::entities::Line::from_points(
+                codec::Vector3::new(10.0, 5.0, 0.0),
+                codec::Vector3::new(30.0, 5.0, 0.0),
+            ))],
+        );
+        let _ = app.run_command_line("BLOCK");
+        let state = app
+            .block_definition
+            .as_ref()
+            .expect("the dialog opens with the drawing's precision");
+        assert_eq!(state.base_point_x, "0.00", "bare zero at LUPREC 2");
+        let _ = app.dispatch_command("BLOCK_POINT_PICKED 2.5 7.126 0");
+        let state = app
+            .block_definition
+            .as_ref()
+            .expect("the dialog stays open");
+        assert_eq!(state.base_point_x, "2.50");
+        assert_eq!(state.base_point_y, "7.13");
+        assert_eq!(state.base_point_z, "0.00");
+        assert_eq!(
+            state.parse_base_point(),
+            glam::DVec3::new(2.5, 7.13, 0.0),
+            "the printed text reads back as the point it shows"
+        );
+
+        // Choosing an existing definition prefills from its base, printed the
+        // same way rather than at a fixed number of decimals.
+        let _ = app.update(crate::app::Message::BlockDefNameSelect(
+            "PRE_BASE".to_string(),
+        ));
+        let state = app
+            .block_definition
+            .as_ref()
+            .expect("the dialog stays open");
+        assert_eq!(state.base_point_x, "10.00");
+        assert_eq!(state.base_point_y, "5.00");
+        assert_eq!(state.base_point_z, "0.00");
+        assert_eq!(
+            state.parse_base_point(),
+            glam::DVec3::new(10.0, 5.0, 0.0),
+            "the prefilled base reads back exactly"
+        );
+    }
+
     /// Run one command line and return only the command-line text it appended.
     fn run_capture(app: &mut OpenCADStudio, cmd: &str) -> String {
         let start = app.command_line.history.len();
@@ -1803,6 +2071,91 @@ mod tests {
             .map(|e| e.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn define_line_block(app: &mut OpenCADStudio, tab: usize, name: &str) {
+        let mut line = codec::entities::Line::new();
+        line.start = codec::types::Vector3::ZERO;
+        line.end = codec::types::Vector3::new(10.0, 0.0, 0.0);
+        app.tabs[tab]
+            .scene
+            .define_block_from_owned_entities(
+                vec![codec::EntityType::Line(line)],
+                name,
+                glam::DVec3::ZERO,
+            )
+            .unwrap();
+    }
+
+    fn feed(app: &mut OpenCADStudio, text: &str) {
+        let _ = app.update(crate::app::Message::CommandInput(text.to_string()));
+        let _ = app.update(crate::app::Message::CommandSubmit);
+    }
+
+    // -INSERT remembers the last block used in *this* drawing, so the
+    // bracketed default is always one of the definitions it offers.
+    #[test]
+    fn insert_default_name_is_remembered_per_drawing() {
+        let mut app = fresh_app();
+        let first = app.active_tab;
+        define_line_block(&mut app, first, "ALPHA");
+        app.record_block_insert("ALPHA");
+        app.tabs
+            .push(crate::app::document::DocumentTab::new_drawing(2));
+        app.active_tab = 1;
+        define_line_block(&mut app, 1, "BETA");
+        app.record_block_insert("BETA");
+        app.tabs[1].active_cmd = None;
+
+        app.active_tab = first;
+        let out = run_capture(&mut app, "-INSERT");
+        assert!(out.contains("<ALPHA>"), "{out}");
+        assert!(!out.contains("<BETA>"), "{out}");
+        app.tabs[first].active_cmd = None;
+
+        app.active_tab = 1;
+        let out = run_capture(&mut app, "-INSERT");
+        assert!(out.contains("<BETA>"), "{out}");
+        assert!(!out.contains("<ALPHA>"), "{out}");
+    }
+
+    // A remembered name that no longer names a definition of the drawing is
+    // not offered as the default.
+    #[test]
+    fn insert_default_name_is_dropped_when_the_block_is_not_defined() {
+        let mut app = fresh_app();
+        let i = app.active_tab;
+        define_line_block(&mut app, i, "REAL");
+        let _ = app.run_command_line("INSNAME GHOST");
+        let out = run_capture(&mut app, "-INSERT");
+        assert!(out.contains("Enter block name or [?]:"), "{out}");
+        assert!(!out.contains("GHOST"), "{out}");
+    }
+
+    // `?` prints the definitions into the transcript and returns to the name
+    // prompt, so the operator can still pick one.
+    #[test]
+    fn insert_listing_prints_and_returns_to_the_name_prompt() {
+        let mut app = fresh_app();
+        let i = app.active_tab;
+        define_line_block(&mut app, i, "ALPHA");
+        let _ = app.run_command_line("-INSERT");
+        let start = app.command_line.history.len();
+        feed(&mut app, "?");
+        feed(&mut app, "*");
+        let out = app.command_line.history[start..]
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("Defined blocks."), "{out}");
+        assert!(out.contains("\"ALPHA\""), "{out}");
+        let cmd = app.tabs[i]
+            .active_cmd
+            .as_ref()
+            .expect("-INSERT stays active after the listing");
+        assert_eq!(cmd.prompt(), "Enter block name or [?]:");
+        assert!(out.contains("Enter block name or [?]:"), "{out}");
     }
 
     // ATTMAN and BATTMAN open the Block Attribute Manager. A drawing without

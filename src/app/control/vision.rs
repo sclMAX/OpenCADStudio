@@ -226,6 +226,8 @@ pub(crate) fn compute_grounding(
         handle: codec::Handle,
         entity_type: &'static str,
         layer: String,
+        owner: codec::Handle,
+        space: Option<String>,
         screen_pixel: [i32; 2],
         screen_bounds: [i32; 4],
         world_center: [f64; 3],
@@ -235,6 +237,13 @@ pub(crate) fn compute_grounding(
 
     let selected_set: std::collections::HashSet<codec::Handle> =
         tab.scene.selected_handles_in_order().into_iter().collect();
+    let space_names: rustc_hash::FxHashMap<codec::Handle, String> = tab
+        .scene
+        .document
+        .block_records
+        .iter()
+        .map(|record| (record.handle, record.name.clone()))
+        .collect();
 
     let mut candidates = Vec::new();
 
@@ -281,11 +290,14 @@ pub(crate) fn compute_grounding(
                 let area = (width * (f64::from(s_max_y) - f64::from(s_min_y)).abs()) as f32;
                 let selected = selected_set.contains(&handle);
                 let layer = entity.common().layer.clone();
+                let owner = entity.common().owner_handle;
 
                 candidates.push(Candidate {
                     handle,
                     entity_type: crate::entities::names::ui_name(entity),
                     layer,
+                    owner,
+                    space: space_names.get(&owner).cloned(),
                     screen_pixel: [px, py],
                     screen_bounds: [s_min_x, s_min_y, s_max_x, s_max_y],
                     world_center: [center.x, center.y, center.z],
@@ -316,6 +328,11 @@ pub(crate) fn compute_grounding(
                 "handle": format!("{:X}", cand.handle.value()),
                 "type": cand.entity_type,
                 "layer": cand.layer,
+                "owner": format!("{:X}", cand.owner.value()),
+                "space": cand.space,
+                "constraints": crate::app::automation::constraint_records_json(
+                    &tab.scene, cand.handle,
+                ),
                 "screen_pixel": cand.screen_pixel,
                 "screen_bounds": cand.screen_bounds,
                 "world_center": cand.world_center,
@@ -550,6 +567,127 @@ mod tests {
     }
 
     #[test]
+    fn grounding_names_the_space_each_visible_entity_is_drawn_in() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 20,0 30,0"}"#);
+        let q = app.automation_op(r#"{"op":"query","type":"Line","detail":"summary"}"#);
+        let handles: Vec<String> = q["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(handles.len(), 2, "{q}");
+        let doc = app.automation_op(r#"{"protocol":1,"op":"state"}"#)["document_id"]
+            .as_u64()
+            .unwrap();
+        let defined = app.automation_op(&format!(
+            r#"{{"protocol":1,"op":"block_define","request_id":"g1","document_id":{doc},"name":"SPACE_SRC","base":[0,0,0],"handles":["{}"]}}"#,
+            handles[1]
+        ));
+        assert_eq!(defined["ok"], true, "{defined}");
+
+        app.tabs[0].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+        app.tabs[0].scene.fit_all();
+        let grounding = compute_grounding(&app, 800.0, 600.0, 800, 600);
+        let visible = |space: &str| {
+            grounding
+                .visible_entities
+                .iter()
+                .find(|entity| entity["space"] == space)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{space} is not grounded: {:?}",
+                        grounding.visible_entities
+                    )
+                })
+                .clone()
+        };
+        let model = visible("*Model_Space");
+        assert_eq!(model["handle"], handles[0].as_str(), "{model}");
+        let child = visible("SPACE_SRC");
+        assert_ne!(child["owner"], model["owner"], "{model} {child}");
+        assert_ne!(child["handle"], model["handle"], "{model} {child}");
+    }
+
+    #[test]
+    fn grounding_names_the_constraints_on_each_visible_entity() {
+        use crate::scene::parametric_constraints::{
+            ConstraintKind, ParametricRef, ParametricScope,
+        };
+
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        let line = app.automation_op(r#"{"op":"query","type":"Line","detail":"summary"}"#)
+            ["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let doc = app.automation_op(r#"{"protocol":1,"op":"state"}"#)["document_id"]
+            .as_u64()
+            .unwrap();
+        let defined = app.automation_op(&format!(
+            r#"{{"protocol":1,"op":"block_define","request_id":"gc1","document_id":{doc},"name":"CONST_DEF","base":[0,0,0],"handles":["{line}"]}}"#
+        ));
+        assert_eq!(defined["ok"], true, "{defined}");
+
+        let i = app.active_tab;
+        let definition = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .iter()
+            .find(|record| record.name == "CONST_DEF")
+            .expect("definition exists")
+            .handle;
+        let child = app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .find(|entity| entity.common().owner_handle == definition)
+            .expect("the definition holds the line")
+            .common()
+            .handle;
+        app.tabs[i]
+            .scene
+            .parametric_constraint_set_mut(ParametricScope::Block(definition))
+            .add(
+                ConstraintKind::Vertical,
+                vec![ParametricRef::whole(child)],
+                None,
+            );
+        let child_hex = format!("{:X}", child.value());
+
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+        app.tabs[i].scene.fit_all();
+        let grounding = compute_grounding(&app, 800.0, 600.0, 800, 600);
+        let visible = grounding
+            .visible_entities
+            .iter()
+            .find(|entity| entity["space"] == "CONST_DEF")
+            .unwrap_or_else(|| {
+                panic!(
+                    "CONST_DEF is not grounded: {:?}",
+                    grounding.visible_entities
+                )
+            });
+        assert_eq!(
+            visible["constraints"],
+            json!([{
+                "kind": "Vertical",
+                "participants": [child_hex],
+                "enabled": true,
+                "conflict": null,
+                "form": null
+            }]),
+            "{visible}"
+        );
+    }
+
+    #[test]
     fn test_pyramid_tiling_manifest_and_bounds() {
         let wb = [0.0, 0.0, 200.0, 100.0];
         let manifest = compute_pyramid_manifest("sess_test", "Millimeters", wb, 3, 512);
@@ -598,5 +736,59 @@ mod tests {
         assert_eq!(point_to_tile(wb, 1, 175.0, 75.0), (1, 0));
         assert_eq!(point_to_tile(wb, 1, 25.0, 25.0), (0, 1));
         assert_eq!(point_to_tile(wb, 1, 175.0, 25.0), (1, 1));
+    }
+
+    /// A capture annotated a block reference as a single pixel at its
+    /// insertion point, so a block drawn forty units away from that point was
+    /// described as sitting where nothing of it paints.
+    #[test]
+    fn the_capture_annotation_covers_where_a_reference_draws() {
+        use codec::entities::{EntityType, Insert, Line};
+        use codec::types::Vector3;
+
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        app.tabs[i].scene.define_block_raw(
+            "GROUND_REF",
+            Vector3::ZERO,
+            vec![EntityType::Line(Line::from_points(
+                Vector3::new(10.0, 5.0, 0.0),
+                Vector3::new(20.0, 10.0, 0.0),
+            ))],
+        );
+        app.tabs[i].scene.add_entity(EntityType::Insert(Insert::new(
+            "GROUND_REF".to_string(),
+            Vector3::new(-40.0, 0.0, 0.0),
+        )));
+
+        app.tabs[i].scene.selection.borrow_mut().view.vp_size = (800.0, 600.0);
+        app.tabs[i].scene.fit_all();
+        let grounding = compute_grounding(&app, 800.0, 600.0, 800, 600);
+        let annotated = grounding
+            .visible_entities
+            .iter()
+            .find(|entity| entity["type"] == "Block Reference")
+            .expect("the reference is annotated");
+
+        let center = annotated["world_center"]
+            .as_array()
+            .expect("the annotated centre");
+        let [x, y]: [f64; 2] = [center[0].as_f64().unwrap(), center[1].as_f64().unwrap()];
+        assert!(
+            (x + 25.0).abs() < 1e-6 && (y - 7.5).abs() < 1e-6,
+            "the reference is described where it draws, not at its \
+             insertion point (-40, 0): {annotated}"
+        );
+
+        let bounds = annotated["screen_bounds"]
+            .as_array()
+            .expect("the annotated screen box");
+        let corners: Vec<i64> = bounds.iter().map(|v| v.as_i64().unwrap()).collect();
+        assert!(
+            corners[2] - corners[0] > 1 && corners[3] - corners[1] > 1,
+            "a reference with painted extent is annotated as a box, \
+             not a pixel: {annotated}"
+        );
     }
 }

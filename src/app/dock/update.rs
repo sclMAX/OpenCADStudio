@@ -132,6 +132,12 @@ impl OpenCADStudio {
                 }
             }
             DockMsg::FloatBarPointer(p) => self.dock_float_pointer = p,
+            #[cfg(not(target_arch = "wasm32"))]
+            DockMsg::Detach(id) => {
+                let _ = self.detach_panel(id);
+            }
+            #[cfg(target_arch = "wasm32")]
+            DockMsg::Detach(_) => {}
             DockMsg::FloatDockingToggle(id) => {
                 self.dock_float_menu = None;
                 if self.dock.toggle_float_docking(id) {
@@ -144,6 +150,9 @@ impl OpenCADStudio {
                 // Anything else (closed, floating, on the other edge) moves
                 // here and opens, in its own group here if it has one, else
                 // as a new group; adding a pallet ends the menu's job.
+                // Called from the dock, a pallet in a window of its own comes
+                // back as a pallet.
+                self.dock.detached.remove(&id);
                 let here = self.dock.location(id).map(|(s, _)| s) == Some(side);
                 if !here {
                     self.dock.dock(id, side, usize::MAX);
@@ -472,13 +481,18 @@ impl OpenCADStudio {
     }
 
     /// Whether a popup a pallet opened is showing: a colour dropdown in the
-    /// Layer Manager or Properties, or the Select Color window.
+    /// Layer Manager or Properties, one of the Properties lists, or the
+    /// Select Color window.
     fn dock_popup_open(&self) -> bool {
         let tab = &self.tabs[self.active_tab];
         tab.layers.color_picker_row.is_some()
             || tab.properties.color_picker_open
             || tab.properties.bg_color_picker_open
             || tab.properties.open_color_field.is_some()
+            || tab.properties.hatch_pattern_picker_open
+            || tab.properties.edit_choice_open.is_some()
+            || tab.properties.open_block_picker.is_some()
+            || tab.properties.open_choice.is_some()
             || self.color_picker.is_some()
     }
 
@@ -506,13 +520,17 @@ impl OpenCADStudio {
         use crate::ui::dock::{DockDrag, PanelId};
         let mut task = iced::Task::none();
         if open
-            && id == PanelId::AuthoringPalettes
+            && matches!(id, PanelId::AuthoringPalettes | PanelId::ParametersManager)
             && self.tabs[self.active_tab]
                 .active_block_edit_session()
                 .is_none()
         {
-            self.command_line
-                .push_error(crate::t!("Open the Block Editor to use Authoring Palettes.").as_ref());
+            let tool = if id == PanelId::ParametersManager {
+                "Open the Block Editor to use the Parameters Manager."
+            } else {
+                "Open the Block Editor to use Authoring Palettes."
+            };
+            self.command_line.push_error(crate::t!(tool).as_ref());
             return task;
         }
         if open {
@@ -528,9 +546,13 @@ impl OpenCADStudio {
                         self.save_config();
                     }
                     PanelId::BlockPalette => self.open_blocks_palette(None),
+                    PanelId::ParametersManager => {
+                        self.show_parameters_manager = true;
+                        self.dock_open_at_default(id);
+                        self.save_config();
+                    }
                     PanelId::AuthoringPalettes => {
                         self.show_authoring_palettes = true;
-                        self.ribbon.show_authoring_palettes = true;
                         self.dock_open_at_default(id);
                         self.save_config();
                     }
@@ -557,6 +579,12 @@ impl OpenCADStudio {
                         }
                     }
                     PanelId::QuickCalc => self.quick_calc.show = true,
+                    PanelId::CommandHistory => {
+                        self.show_command_history = true;
+                        self.sync_command_history_panel();
+                        self.dock_open_at_default(id);
+                        self.save_config();
+                    }
                     PanelId::Plugin(num) => {
                         if let Some(panel_id) = self.plugin_panel_by_num.get(&num) {
                             if let Some(panel) = self.plugin_panels.get_mut(panel_id) {
@@ -576,7 +604,27 @@ impl OpenCADStudio {
             }
             PanelId::AuthoringPalettes => {
                 self.show_authoring_palettes = false;
-                self.ribbon.show_authoring_palettes = false;
+            }
+            PanelId::ParametersManager => {
+                // Closing the pane moves the click off an open cell, which is how
+                // every other route out of a cell applies what was typed. A cell
+                // left on another definition is not this pane's to apply, so it
+                // goes with the pane instead of printing a refusal.
+                let i = self.active_tab;
+                let cell_of_this_session = self.tabs[i]
+                    .parameters_panel
+                    .editing
+                    .as_ref()
+                    .is_some_and(|edit| {
+                        self.tabs[i]
+                            .active_block_edit_session()
+                            .is_some_and(|session| session.br_handle == edit.definition)
+                    });
+                if cell_of_this_session {
+                    let _ = self.commit_parameters_manager(false);
+                }
+                self.show_parameters_manager = false;
+                self.tabs[i].parameters_panel = Default::default();
             }
             PanelId::ExternalReferences => self.show_external_references = false,
             PanelId::Browser => self.show_browser = false,
@@ -593,6 +641,10 @@ impl OpenCADStudio {
             PanelId::Properties => {
                 self.show_properties = false;
                 self.ribbon.set_properties(false);
+                // A hidden panel must not leave its list behind to keep the
+                // keyboard guard swallowing keys.
+                self.tabs[self.active_tab].properties.open_block_picker = None;
+                self.tabs[self.active_tab].properties.open_choice = None;
             }
             PanelId::Layers => {
                 self.show_layers = false;
@@ -600,6 +652,10 @@ impl OpenCADStudio {
             }
             PanelId::Laywalk => self.close_layer_walk(false),
             PanelId::QuickCalc => self.quick_calc.show = false,
+            PanelId::CommandHistory => {
+                self.show_command_history = false;
+                self.save_config();
+            }
             PanelId::GraphicAttributes => {
                 self.show_graphic_attributes = false;
                 self.ribbon.set_graphic_attributes(false);
@@ -673,9 +729,23 @@ impl OpenCADStudio {
         if self.clean_screen && !(id == PanelId::Properties && self.clean_screen_properties) {
             return false;
         }
+        self.dock_panel_wanted(id)
+    }
+
+    /// Whether pallet `id` is open, wherever it is shown: the main window
+    /// hides pallets on the Start page and in clean screen, a window of its
+    /// own does not.
+    pub(crate) fn dock_panel_wanted(&self, id: crate::ui::dock::PanelId) -> bool {
+        use crate::ui::dock::PanelId;
         match id {
             PanelId::Properties => self.show_properties,
             PanelId::BlockPalette => self.show_block_palette,
+            PanelId::ParametersManager => {
+                self.show_parameters_manager
+                    && self.tabs[self.active_tab]
+                        .active_block_edit_session()
+                        .is_some()
+            }
             PanelId::AuthoringPalettes => {
                 self.show_authoring_palettes
                     && self.tabs[self.active_tab]
@@ -698,6 +768,7 @@ impl OpenCADStudio {
                     && !(tab.layer_walk_picking && tab.active_cmd.is_some())
             }
             PanelId::QuickCalc => self.quick_calc.show,
+            PanelId::CommandHistory => self.show_command_history,
             PanelId::GraphicAttributes => self.show_graphic_attributes,
             PanelId::Plugin(num) => {
                 if let Some(panel_id) = self.plugin_panel_by_num.get(&num) {

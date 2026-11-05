@@ -183,6 +183,7 @@ client needs to act:
 | `hand_seed` | The drawing's handle seed, hex — a monotonically advancing per-file object counter |
 | `documents[]` | Every open document: `id`, `title`, `path`, `dirty`, `revision` |
 | `selection[]` | Handles currently selected, in pick order |
+| `block_editor` | The definition open in the block editor, `{name, handle}`, or `null` — while set, created geometry joins that definition |
 | `command` | An interactive command's state, when one is running: `accepts[]`, `options[]`, `input_example` |
 | `operation` | The `request_id` of the operation currently pending, when one is |
 | `capabilities` | Feature list (also available as the dedicated `capabilities` read) |
@@ -218,7 +219,7 @@ and stable; branch on it, not on message text.
 | `document_required`, `document_not_active`, `document_closed` | Envelope addressing problem | yes (refresh state) |
 | `document_dirty` | Closing would lose unsaved changes | no — resend with `"discard":true` to confirm |
 | `entity_absent` | A listed handle does not exist (the message names them) | refresh and re-read |
-| `command_busy` | An interactive command is active | finish or `cancel` first |
+| `command_busy` | An interactive command is active; the reply names it (`command`, `document_id`) and the client holding it (`owner_client_id`, null when the user holds it) | finish or `cancel` first |
 | `gui_required` | Operation needs the editor window (`view_focus`, and the picks of §6.12 over headless transports) | headless sessions only |
 | `busy` | Async work still running | poll `operation` |
 | `interactive_pending` | Another person-pick (§6.12) is already waiting for the user | wait for it, or retract it with `cancel` |
@@ -228,7 +229,7 @@ and stable; branch on it, not on message text.
 | `name_required`, `entities_required`, `selection_required`, `app_required`, `path_required`, `handles_required`, `block_required` | Missing mandatory field | no |
 | `unknown_entity_type`, `invalid_radius`, `invalid_vertices`, `invalid_point`, `invalid_text`, `invalid_scale`, `invalid_paper`, `invalid_handle`, `invalid_xdata`, `invalid_sysvar_value` | Validation failures — nothing commits | no |
 | `unknown_sysvar` | Variable outside the registry (§6.7) | no |
-| `layout_exists`, `layout_missing`, `layer_failed`, `block_failed`, `block_missing`, `block_protected`, `selection_set_missing`, `template_missing`, `template_failed`, `save_failed` | Domain refusals, self-explanatory | no |
+| `layout_exists`, `layout_missing`, `layer_failed`, `block_failed`, `block_missing`, `block_protected`, `block_cycle`, `selection_set_missing`, `template_missing`, `template_failed`, `save_failed` | Domain refusals, self-explanatory | no |
 
 Unknown routes answer `code:"unknown_route"` (HTTP 404). A timed-out parked
 request answers `code:"response_timeout"`.
@@ -274,9 +275,14 @@ and `color` (index); any other field is refused (`unknown_entity_field`).
 | `Point` | `location` |
 | `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
 | `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg`, `style` |
-| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
+| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg`, `attributes` (`{"TAG":"value"}`; tags are case-insensitive, the ones left out keep their default; unknown or constant tags are refused) |
 | `Solid` | `corners` (3 or 4 `[x,y,z]`) |
 | `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
+
+While `state.block_editor` names a definition, the whole batch is authored
+inside it, on the editor's own undo stack, exactly like `run`; an `Insert`
+that would nest the open definition inside itself is refused
+(`block_cycle`) before anything commits.
 
 Result: `{"handles":[…],"created":N,"layers_created":[…]}` → HTTP 201.
 
@@ -286,7 +292,7 @@ Result: `{"handles":[…],"created":N,"layers_created":[…]}` → HTTP 201.
 |---|---|---|
 | `entities_delete` | `handles` | Every handle must exist; nothing is erased otherwise (`entity_absent` names them) |
 | `entities_transform` | `handles`, `action`, per-action params | `move`/`copy`: `vector:[dx,dy(,dz)]` (copy returns new handles in `result.created`); `rotate`: `center`, `angle_deg`; `scale`: `center`, `factor` (≠ 0); `mirror`: `axis:[[x1,y1],[x2,y2]]`, optional `copy:true`; `array`: `rows`, `columns`, `row_spacing`, `column_spacing` |
-| `entities_copy_to` | `handles`, `document_id` (target) | Cross-document clone; referenced layer definitions travel along; result `created[]` + `count` |
+| `entities_copy_to` | `handles`, `document_id` (target) | Cross-document clone; the dependencies the interactive copy carries travel along (layers, linetypes, styles, and the block definitions the source holds for the copied references); result `created[]` + `count` |
 
 ### 6.3a Node graph — `node_graph`
 
@@ -341,6 +347,34 @@ Text entities return the raw string in `value` plus a formatting-free
 rendering in `text`; degenerate-width text bounds are widened with a
 documented estimate (height × 0.8 × character count) so region filters stay
 usable.
+
+Every returned entity, at every detail level including `summary`, carries
+`owner` (the owning block record's handle, uppercase hex; `0` when unowned) and
+`space` (that record's name:
+`*Model_Space` for drawing geometry, a layout's record on a sheet, a
+definition such as `*U1` for its children), so definition geometry can be
+filtered out of a drawing result. The capture's `visible_entities` /
+`annotations` records carry the same two fields.
+
+Every entity returned above `summary` detail also carries `constraints`: one
+entry per constraint the solver holds on it — `kind` (the constraint's
+canonical kind name, shared by the constraint commands and reports),
+`participants` (every distinct entity handle the constraint relates, in
+reference order), `enabled` (`false` for a constraint kept but not solved),
+`conflict` (`null`, or `Redundant` when the solver found the constraint
+already implied by the rest, `Conflicting` when removing it would let the rest
+solve without satisfying it) and `form` (`Dynamic` or `Annotational` for a
+dimensional constraint's dimension; `null` when the record is not a
+dimensional constraint's dimension — a geometric constraint, or a dimension
+that does not resolve). An
+empty array states that the entity carries no
+constraint. A `fields`
+projection that does not name `constraints` drops it, like any other property.
+The same array is on each `records` `entities` row, each `get_selection`
+entity, each `user_select` hand-over and each capture candidate, so the
+association the solver enforces is enumerable from every read surface. The
+`user_select` hand-over follows its `detail` too: `summary` leaves the array
+out.
 
 Companion reads: `entities` (alias), `layers`, `header`, `records`
 (paged, filterable database records), `record_schema` (generated type
@@ -397,6 +431,7 @@ implicitly on write. An empty (or absent) `data` list removes the record.
 | `textsize`, `filletrad`, `pdmode`, `pdsize` | defaults for new content | ✓ |
 | `mirrtext` (`0`/`1`), `insunits`, `osmode` | behaviour flags | ✓ |
 | `extmin`, `extmax` | model-space extents `[x,y,z]` | read-only |
+| `constraintstatus` | constraint state of the active space: `{scope, constraint_count, enabled_count, dof}` — `scope` is the name of the block record in force (`*Model_Space` outside an editor), the two counts are constraint totals (all vs still solved), and `dof` is the solver's remaining degrees of freedom, `null` until it has solved that space | read-only |
 
 `{"op":"sysvar","set":{"ltscale":2.5}}` applies the whole object atomically
 (`unknown_sysvar` / `invalid_sysvar_value` refuse it all);

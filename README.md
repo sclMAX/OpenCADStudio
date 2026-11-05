@@ -56,6 +56,13 @@
 
 Open CAD Studio is a cross-platform application for technical drawing, layout work, and solid modeling. It reads and writes DWG and DXF drawings natively, with a shared editing core across the desktop and browser versions.
 
+The experimental **IFCCAD** format choice exchanges supported CAD drawings in
+`.ifcx` files. General IFCX BIM models are not supported by this drawing route.
+This alpha functionality is for testing only: later versions may not reopen
+these files, and backward compatibility or migration is not guaranteed. Keep
+original drawings and separate DWG/DXF copies. See the
+[IFCCAD workflow and compatibility guide](docs/ifccad.md).
+
 The project is under active development. Keep backups of important production drawings and report reproducible problems through [GitHub Issues](https://github.com/HakanSeven12/OpenCADStudio/issues).
 
 ## Highlights
@@ -79,6 +86,7 @@ The project is under active development. Keep backups of important production dr
 | DXF | Read and write; versioned save targets from R14 through 2018 |
 | BAK / SV$ | Open drawing backups and autosave files |
 | OBJ | Import polygon meshes |
+| SVG / SVGZ | Import vector shapes as a block (`SVGIN`, or `IMPORT`) |
 | LandXML | Import `CgPoint` survey points |
 | STL | Export 3D mesh data |
 | STEP AP203 | Export 3D mesh data |
@@ -94,18 +102,18 @@ Use the desktop application for native file associations, file-manager thumbnail
 
 ## Install
 
-Download all current packages from the [latest release](https://github.com/HakanSeven12/OpenCADStudio/releases/latest).
+Download the package for your computer from the [download page](https://www.opencadstudio.com/download/); every link there is the latest release. All files are also on the [latest release](https://github.com/HakanSeven12/OpenCADStudio/releases/latest) page.
 
 ### Windows
 
-Choose one of these signed x86-64 packages:
+Choose one of these signed packages, `x86_64` for Intel and AMD processors or `arm64` for ARM processors:
 
-- `OpenCADStudio-*-windows-x86_64-installer.msi` — recommended installer with Start Menu shortcuts, DWG/DXF file associations, and drawing thumbnails.
-- `OpenCADStudio-*-windows-x86_64-portable.exe` — standalone application; no installation required.
+- `OpenCADStudio-*-windows-x86_64-installer.msi` / `…-windows-arm64-installer.msi` — recommended installer with Start Menu shortcuts, DWG/DXF file associations, and drawing thumbnails.
+- `OpenCADStudio-*-windows-x86_64-portable.exe` / `…-windows-arm64-portable.exe` — standalone application; no installation required.
 
 ### Linux
 
-Download the x86-64 AppImage, make it executable, and run it:
+Download the AppImage (`linux-x86_64` or `linux-aarch64` for ARM), make it executable, and run it:
 
 ```bash
 chmod +x OpenCADStudio-*-linux-x86_64.AppImage
@@ -133,9 +141,9 @@ sudo snap install --dangerous OpenCADStudio-*-linux-x86_64.snap
 
 ### macOS
 
-The published macOS package supports Apple Silicon:
+Packages are published for Apple Silicon and Intel Macs:
 
-1. Download `OpenCADStudio-*-macos-arm64.dmg`.
+1. Download `OpenCADStudio-*-macos-arm64.dmg` (Apple Silicon) or `OpenCADStudio-*-macos-x86_64.dmg` (Intel).
 2. Open the image and drag `OpenCADStudio.app` into **Applications**.
 3. If Gatekeeper blocks the first launch, approve the app from **System Settings → Privacy & Security**.
 

@@ -10,7 +10,7 @@ import tempfile
 import threading
 
 
-def probe(command: list[str], timeout: float = 10) -> None:
+def probe(command: list[str], timeout: float = float(os.environ.get("OCS_HANDSHAKE_TIMEOUT", "10"))) -> None:
     # A separate process group lets a failed probe clean up a broken launcher
     # and any GUI child it incorrectly spawned. Never touch existing editors.
     with tempfile.TemporaryFile() as stderr:
@@ -62,7 +62,8 @@ def probe(command: list[str], timeout: float = 10) -> None:
             )
             process.stdin.flush()
             tools = request(2, "tools/list", {})
-            assert {tool["name"] for tool in tools["tools"]} == {
+            # The core tools; intent tools may sit beside them.
+            assert {tool["name"] for tool in tools["tools"]} >= {
                 "ocs_sessions", "ocs_read", "ocs_execute", "ocs_capture",
             }, tools
             request(3, "ping", {})

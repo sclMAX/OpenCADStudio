@@ -19,6 +19,9 @@ impl OpenCADStudio {
             base,
             end,
             reference,
+            label_offset,
+            grips,
+            options,
         } = result
         else {
             unreachable!()
@@ -52,18 +55,76 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.push_undo_snapshot(i, &format!("{} parameter", kind.name()));
-        let parameter = crate::scene::block_orientation_parameter::create(
+        let parameter = crate::scene::block_orientation_parameter::create_with_label(
             &mut self.tabs[i].scene.document,
             definition,
             kind,
             vector(base),
             vector(end),
             vector(reference),
+            label_offset,
+            options
+                .value_set
+                .as_ref()
+                .filter(|_| kind == crate::scene::block_orientation_parameter::Kind::Rotation),
         )
         .expect("validated parameter placement");
+        if let Some(count) = grips
+            .filter(|_| kind == crate::scene::block_orientation_parameter::Kind::Rotation)
+            .filter(|count| *count != 1)
+        {
+            crate::scene::block_grips::config::set(
+                &mut self.tabs[i].scene.document,
+                definition,
+                parameter,
+                Some(count),
+            )
+            .expect("validated Rotation grip count");
+        }
         if perpendicular {
             crate::scene::block_orientation_parameter::set_alignment_type(&mut self.tabs[i].scene.document, definition, parameter, true)
                 .expect("validated Alignment parameter placement");
+        }
+        let option_error = {
+            use crate::scene::block_authoring::metadata;
+            let document = &mut self.tabs[i].scene.document;
+            let description = options.description.as_deref().map(|value| {
+                metadata::set_text(document, definition, parameter, metadata::Field::Description, value)
+            });
+            let named = matches!(
+                kind,
+                crate::scene::block_orientation_parameter::Kind::Rotation
+                    | crate::scene::block_orientation_parameter::Kind::Flip
+            );
+            let parameter_name =
+                options.name.as_deref().filter(|_| named).map(|value| {
+                    metadata::set_parameter_name(document, definition, parameter, value)
+                });
+            let label = options.label.as_deref().filter(|_| named).map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::Name,
+                    value,
+                )
+            });
+            let chain = options
+                .chain
+                .map(|value| metadata::set_chain(document, definition, parameter, value));
+            let palette = options
+                .palette
+                .map(|value| metadata::set_visible(document, definition, parameter, value));
+            parameter_name
+                .into_iter()
+                .chain(label)
+                .chain(description)
+                .chain(chain)
+                .chain(palette)
+                .find_map(Result::err)
+        };
+        if let Some(error) = option_error {
+            self.command_line.push_error(crate::t!(error).as_ref());
         }
         self.tabs[i].scene.bump_geometry();
         self.tabs[i].dirty = true;
@@ -87,6 +148,8 @@ impl OpenCADStudio {
             base,
             end,
             label,
+            grips,
+            options,
         } = result
         else {
             unreachable!()
@@ -116,15 +179,144 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.push_undo_snapshot(i, &format!("{} parameter", kind.name()));
-        let parameter = crate::scene::block_distance_parameter::create(
+        let parameter = crate::scene::block_distance_parameter::create_with(
             &mut self.tabs[i].scene.document,
             definition,
             kind,
             vector(base),
             vector(end),
             vector(label),
+            options
+                .base_location
+                .filter(|_| kind == crate::scene::block_distance_parameter::Kind::Linear),
+            options
+                .value_set
+                .as_ref()
+                .filter(|_| kind == crate::scene::block_distance_parameter::Kind::Linear),
         )
         .expect("validated parameter placement");
+        if kind == crate::scene::block_distance_parameter::Kind::Polar {
+            crate::scene::block_distance_parameter::set_polar_value_sets(
+                &mut self.tabs[i].scene.document,
+                parameter,
+                options.value_set.as_ref(),
+                options.angle_value_set.as_ref(),
+            )
+            .expect("a placed polar parameter carries its value sets");
+        }
+        if kind == crate::scene::block_distance_parameter::Kind::XY {
+            crate::scene::block_distance_parameter::set_xy_value_sets(
+                &mut self.tabs[i].scene.document,
+                parameter,
+                options.value_set.as_ref(),
+                options.vertical_value_set.as_ref(),
+            )
+            .expect("a placed xy parameter carries its value sets");
+        }
+        if let Some(count) = grips
+            .filter(|_| kind == crate::scene::block_distance_parameter::Kind::XY)
+            .filter(|count| *count != 1)
+        {
+            crate::scene::block_grips::config::set(
+                &mut self.tabs[i].scene.document,
+                definition,
+                parameter,
+                Some(count),
+            )
+            .expect("validated XY grip count");
+        }
+        let option_error = {
+            use crate::scene::block_authoring::metadata;
+            let document = &mut self.tabs[i].scene.document;
+            let labels = matches!(
+                kind,
+                crate::scene::block_distance_parameter::Kind::Linear
+                    | crate::scene::block_distance_parameter::Kind::Polar
+                    | crate::scene::block_distance_parameter::Kind::XY
+            );
+            let parameter_name = options.name.as_deref().filter(|_| labels);
+            let parameter_name = parameter_name
+                .map(|value| metadata::set_parameter_name(document, definition, parameter, value));
+            let description = options.description.as_deref().map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::Description,
+                    value,
+                )
+            });
+            let distance_label = options
+                .distance_label
+                .as_deref()
+                .filter(|_| kind != crate::scene::block_distance_parameter::Kind::XY);
+            let distance_label = distance_label.map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::Name,
+                    value,
+                )
+            });
+            let horizontal_label = options
+                .horizontal_label
+                .as_deref()
+                .filter(|_| kind == crate::scene::block_distance_parameter::Kind::XY);
+            let horizontal_label = horizontal_label.map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::Name,
+                    value,
+                )
+            });
+            let vertical_label = options
+                .vertical_label
+                .as_deref()
+                .filter(|_| kind == crate::scene::block_distance_parameter::Kind::XY);
+            let vertical_label = vertical_label.map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::SecondaryName,
+                    value,
+                )
+            });
+            let angle_label = options.angle_label.as_deref().filter(|_| {
+                kind == crate::scene::block_distance_parameter::Kind::Polar
+            });
+            let angle_label = angle_label.map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::SecondaryName,
+                    value,
+                )
+            });
+            let chain = options
+                .chain
+                .map(|value| metadata::set_chain(document, definition, parameter, value));
+            let palette = options
+                .palette
+                .map(|value| metadata::set_visible(document, definition, parameter, value));
+            parameter_name
+                .into_iter()
+                .chain(description)
+                .chain(distance_label)
+                .chain(angle_label)
+                .chain(horizontal_label)
+                .chain(vertical_label)
+                .chain(chain)
+                .chain(palette)
+                .find_map(Result::err)
+        };
+        if let Some(error) = option_error {
+            self.command_line.push_error(crate::t!(error).as_ref());
+        }
         self.tabs[i].scene.bump_geometry();
         self.tabs[i].dirty = true;
         self.tabs[i].active_cmd = None;
@@ -147,12 +339,13 @@ impl OpenCADStudio {
         };
         match kind.to_ascii_uppercase().as_str() {
             "BASEPOINT"|"BASE"|"B" => crate::scene::block_basepoint::placement_error(&tab.scene.document,session.br_handle),
-            "LOOKUP"|"K" => crate::scene::block_lookup::placement_error(&tab.scene.document,session.br_handle),
-            "POINT" | "P" | "" => crate::scene::block_point_parameter::placement_error(
+            "LOOKUP" => crate::scene::block_lookup::placement_error(&tab.scene.document,session.br_handle),
+            "POINT" | "O" => crate::scene::block_point_parameter::placement_error(
                 &tab.scene.document,
                 session.br_handle,
             ),
-            "LINEAR" | "L" | "POLAR" | "PO" | "XY" => {
+            "" => None,
+            "LINEAR" | "L" | "POLAR" | "PO" | "P" | "XY" | "X" => {
                 crate::scene::block_distance_parameter::placement_error(
                     &tab.scene.document,
                     session.br_handle,
@@ -162,7 +355,7 @@ impl OpenCADStudio {
             "VISIBILITY" | "V" => {
                 visibility::placement_error(&tab.scene.document, session.br_handle)
             }
-            _ => Some("Supported parameter types: Point, Linear, Polar, XY, Rotation, Alignment, Flip, Visibility, Lookup, Basepoint."),
+            _ => Some("Invalid option keyword."),
         }
     }
 
@@ -175,6 +368,7 @@ impl OpenCADStudio {
             definition,
             location,
             label,
+            options,
         } = result
         else {
             unreachable!()
@@ -208,6 +402,46 @@ impl OpenCADStudio {
             codec::types::Vector3::new(label.x, label.y, label.z),
         )
         .expect("validated Point placement");
+        let option_error = {
+            use crate::scene::block_authoring::metadata;
+            let document = &mut self.tabs[i].scene.document;
+            let name = options
+                .name
+                .map(|value| metadata::set_parameter_name(document, definition, parameter, &value));
+            let description = options.description.map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::Description,
+                    &value,
+                )
+            });
+            let label = options.label.map(|value| {
+                metadata::set_text(
+                    document,
+                    definition,
+                    parameter,
+                    metadata::Field::Name,
+                    &value,
+                )
+            });
+            let chain = options
+                .chain
+                .map(|value| metadata::set_chain(document, definition, parameter, value));
+            let palette = options
+                .palette
+                .map(|value| metadata::set_visible(document, definition, parameter, value));
+            name.into_iter()
+                .chain(description)
+                .chain(label)
+                .chain(chain)
+                .chain(palette)
+                .find_map(Result::err)
+        };
+        if let Some(error) = option_error {
+            self.command_line.push_error(crate::t!(error).as_ref());
+        }
         self.tabs[i].scene.bump_geometry();
         self.tabs[i].dirty = true;
         self.tabs[i].active_cmd = None;
@@ -407,6 +641,23 @@ impl OpenCADStudio {
                         .push_error(crate::t!("This Parameter Set is not supported yet.").as_ref());
                     return Some(Task::none());
                 };
+                // Starting a row replaces whatever the previous row left
+                // half-done; a follow-up from an earlier run must not fire
+                // against this one's parameter.
+                self.tabs[i].pending_parameter_set_follow_up = None;
+                let already_authored = set.parameter == "VISIBILITY"
+                    && self.tabs[i]
+                        .active_block_edit_session()
+                        .is_some_and(|session| {
+                            visibility::parameter(&self.tabs[i].scene.document, session.br_handle)
+                                .is_some()
+                        });
+                if already_authored {
+                    // A row on a definition that already has the parameter is a
+                    // request to edit it, not a placement that failed: the
+                    // states dialog is where its states are managed.
+                    return Some(self.dispatch_command(set.follow_up));
+                }
                 if let Some(error) = self.parameter_placement_error(set.parameter) {
                     self.command_line.push_error(crate::t!(error).as_ref());
                     return Some(Task::none());
@@ -458,7 +709,11 @@ impl OpenCADStudio {
                             self.tabs[i].id,
                             block,
                             kind,
-                        );
+                        )
+                        .with_default_name(crate::scene::block_lookup::next_name(
+                            &self.tabs[i].scene.document,
+                            block,
+                        ));
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                     return Some(Task::none());
@@ -466,7 +721,26 @@ impl OpenCADStudio {
                 if let Some(kind) =
                     crate::scene::block_orientation_parameter::Kind::parse(parameter_type)
                 {
-                    let command = crate::modules::block_editor::orientation_parameter::OrientationParameterCommand::new(self.tabs[i].id,block,kind);
+                    let mut command = crate::modules::block_editor::orientation_parameter::OrientationParameterCommand::new(self.tabs[i].id,block,kind);
+                    if kind == crate::scene::block_orientation_parameter::Kind::Rotation {
+                        let name = crate::scene::block_authoring::metadata::next_parameter_name(
+                            &self.tabs[i].scene.document,
+                            block,
+                            kind.name(),
+                        )
+                        .unwrap_or_else(|_| kind.name().to_owned());
+                        // The label question shows the plain word; the created
+                        // parameter takes the name the prompt offered.
+                        command = command.with_name(name).with_label("Angle".to_owned());
+                    } else if kind == crate::scene::block_orientation_parameter::Kind::Flip {
+                        // Scene creation always names a Flip parameter `Flip`,
+                        // so the prompt default must not be numbered.
+                        let label = crate::scene::block_orientation_parameter::next_flip_state_label(
+                            &self.tabs[i].scene.document,
+                            block,
+                        );
+                        command = command.with_name("Flip".to_owned()).with_label(label);
+                    }
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                     return Some(Task::none());
@@ -474,18 +748,59 @@ impl OpenCADStudio {
                 if let Some(kind) =
                     crate::scene::block_distance_parameter::Kind::parse(parameter_type)
                 {
-                    let command = crate::modules::block_editor::distance_parameter::DistanceParameterCommand::new(self.tabs[i].id, block, kind);
+                    let mut command = crate::modules::block_editor::distance_parameter::DistanceParameterCommand::new(self.tabs[i].id, block, kind);
+                    let name = crate::scene::block_authoring::metadata::next_parameter_name(
+                        &self.tabs[i].scene.document,
+                        block,
+                        kind.name(),
+                    )
+                    .unwrap_or_else(|_| kind.name().to_owned());
+                    command = command.with_name(name);
+                    command = match kind {
+                        crate::scene::block_distance_parameter::Kind::Polar => {
+                            let [distance, angle] =
+                                crate::scene::block_distance_parameter::next_polar_labels(
+                                    &self.tabs[i].scene.document,
+                                    block,
+                                );
+                            command.with_labels(distance, angle)
+                        }
+                        crate::scene::block_distance_parameter::Kind::Linear => {
+                            // A Linear parameter asks for one label only.
+                            let distance =
+                                crate::scene::block_distance_parameter::next_distance_label(
+                                    &self.tabs[i].scene.document,
+                                    block,
+                                );
+                            command.with_labels(distance, String::new())
+                        }
+                        crate::scene::block_distance_parameter::Kind::XY => {
+                            let [horizontal, vertical] =
+                                crate::scene::block_distance_parameter::next_xy_labels(
+                                    &self.tabs[i].scene.document,
+                                    block,
+                                );
+                            command.with_xy_labels(horizontal, vertical)
+                        }
+                    };
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
                     return Some(Task::none());
                 }
                 if parameter_type.eq_ignore_ascii_case("POINT")
-                    || parameter_type.eq_ignore_ascii_case("P")
+                    || parameter_type.eq_ignore_ascii_case("O")
                 {
                     let command =
                         crate::modules::block_editor::point_parameter::PointParameterCommand::new(
                             self.tabs[i].id,
                             block,
+                        )
+                        .with_defaults(
+                            "Point".to_owned(),
+                            crate::scene::block_point_parameter::next_position_name(
+                                &self.tabs[i].scene.document,
+                                block,
+                            ),
                         );
                     self.command_line.push_info(&command.prompt());
                     self.tabs[i].active_cmd = Some(Box::new(command));
@@ -495,12 +810,8 @@ impl OpenCADStudio {
                     && !parameter_type.eq_ignore_ascii_case("VISIBILITY")
                     && !parameter_type.eq_ignore_ascii_case("V")
                 {
-                    self.command_line.push_error(
-                        crate::t!(
-                            "Supported parameter types: Point, Linear, Polar, XY, Rotation, Alignment, Flip, Visibility, Lookup, Basepoint."
-                        )
-                        .as_ref(),
-                    );
+                    self.command_line
+                        .push_error(crate::t!("Invalid option keyword.").as_ref());
                     return Some(Task::none());
                 }
                 let command = crate::modules::block_editor::visibility_parameter::VisibilityParameterCommand::new(self.tabs[i].id, block, parameter_type.is_empty());
@@ -551,6 +862,16 @@ impl OpenCADStudio {
                 };
                 let shown = match fields.as_slice() {
                     ["NEW", name] => visibility::add_state(document, parameter, name, current),
+                    ["NEW", name, choice] => {
+                        let mode = if choice.eq_ignore_ascii_case("SHOW") {
+                            visibility::NewStateVisibility::Show
+                        } else if choice.eq_ignore_ascii_case("HIDE") {
+                            visibility::NewStateVisibility::Hide
+                        } else {
+                            visibility::NewStateVisibility::Keep
+                        };
+                        visibility::add_state_with(document, block, parameter, name, current, mode)
+                    }
                     ["SET", name] => index(document, name),
                     ["RENAME", from, to] => {
                         if let Some(state) = index(document, from) {
@@ -649,6 +970,28 @@ impl OpenCADStudio {
                 };
                 self.tabs[i].pending_action_pair = Some((parameter, kind, 0));
                 self.start_parameter_pair_action(parameter, kind, 0)
+            }
+            Some("BLOOKUPTABLE") => {
+                // The row asks for its table editor directly: the command of
+                // the same name is the one the action-bar preference refuses,
+                // so routing through it would leave the row inert. It opens the
+                // table of the parameter the row just placed, not whichever one
+                // the definition happens to list first.
+                let definition = self.tabs[i]
+                    .active_block_edit_session()
+                    .map(|session| session.br_handle);
+                let name = definition
+                    .and_then(|definition| {
+                        crate::scene::block_lookup::parameters(
+                            &self.tabs[i].scene.document,
+                            definition,
+                        )
+                        .into_iter()
+                        .find(|(handle, _)| *handle == parameter)
+                        .map(|(_, parameter)| parameter.lookup_name.clone())
+                    })
+                    .unwrap_or_default();
+                self.open_lookup_table(&name)
             }
             Some(command) if command.starts_with("BACTION ") => {
                 self.start_block_action_for_parameter(

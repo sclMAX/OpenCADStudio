@@ -26,10 +26,17 @@ pub const MENU_ROW_H: f32 = 22.0;
 pub const MENU_SEP_H: f32 = 7.0;
 /// Vertical padding inside the menu panel above the first row.
 pub const MENU_PAD_TOP: f32 = 4.0;
-/// Column width without keyword hints (the width the menu always had).
-pub const MENU_WIDTH: f32 = 200.0;
-/// Column width when any row carries a right-aligned keyword hint.
-pub const MENU_WIDTH_WITH_HINTS: f32 = 236.0;
+/// The row layout the renderer uses, for sizing the menu to its widest row:
+/// side padding, icon gutter, gap after it, indent of a submenu's items,
+/// least gap before a hint or check, and the check and caret.
+const ROW_PAD_LEFT: f32 = 6.0;
+const ROW_PAD_RIGHT: f32 = 12.0;
+const GUTTER_W: f32 = 18.0;
+const GUTTER_GAP: f32 = 4.0;
+const CHILD_INDENT: f32 = 14.0;
+const END_GAP: f32 = 16.0;
+const CHECK_W: f32 = 10.0;
+const CARET_W: f32 = 9.0;
 /// How many recent entries the Recent Input / Repeat lists show.
 pub const RECENT_LIMIT: usize = 10;
 
@@ -42,6 +49,8 @@ pub enum SubmenuId {
     DrawOrder,
     Isolate,
     SnapOverrides,
+    /// A submenu of a menu-bar menu opened from the keyboard.
+    MenuBar(u16),
 }
 
 /// Glyph drawn in a row's icon gutter (commercial solutions show one for object snaps
@@ -86,6 +95,8 @@ pub enum MenuAction {
     FeedInput(String),
     /// Run a command line string (`Message::Command`).
     Command(String),
+    /// Run a menu-bar line (`Message::MenuCommand`).
+    MenuLine(String),
     /// One-shot "Mid Between 2 Points" snap override.
     Mtp,
     /// One-shot base point and offset modifier.
@@ -231,11 +242,18 @@ impl ContextMenu {
                 }),
                 MenuRow::Separator => {}
                 MenuRow::Submenu {
-                    id, items, open, ..
+                    id,
+                    items,
+                    open,
+                    label,
+                    ..
                 } => {
                     out.push(Selectable {
                         action: MenuAction::ToggleSubmenu(*id),
-                        mnemonic: None,
+                        mnemonic: label
+                            .chars()
+                            .find(|c| c.is_alphanumeric())
+                            .and_then(|c| c.to_uppercase().next()),
                         enabled: !items.is_empty(),
                         header: Some(*id),
                     });
@@ -287,7 +305,7 @@ impl ContextMenu {
     /// excluding) `from` and wrapping, so repeated presses cycle through rows
     /// sharing a letter (PLINE's CEnter / CLose both answer to `C`).
     pub fn find_mnemonic(&self, ch: char, from: Option<usize>) -> Option<usize> {
-        let ch = ch.to_ascii_uppercase();
+        let ch = ch.to_uppercase().next().unwrap_or(ch);
         let rows = self.selectable();
         if rows.is_empty() {
             return None;
@@ -345,12 +363,37 @@ impl ContextMenu {
         h
     }
 
-    fn has_hints(&self) -> bool {
-        self.rows.iter().any(|row| match row {
-            MenuRow::Item(item) => item.hint.is_some(),
-            MenuRow::Separator => false,
-            MenuRow::Submenu { items, .. } => items.iter().any(|item| item.hint.is_some()),
-        })
+    /// As wide as the widest row, with its hint or check (a submenu's
+    /// items count even while it is closed, so opening it keeps the width).
+    fn fit_width(&self) -> f32 {
+        use crate::ui::style::text_metrics::width;
+        let item_w = |item: &MenuItem, indent: f32| {
+            let mut end = 0.0;
+            if let Some(hint) = &item.hint {
+                end += GUTTER_GAP + width(hint, 11.0, false);
+            }
+            if item.checked {
+                end += GUTTER_GAP + CHECK_W;
+            }
+            if end > 0.0 {
+                end += END_GAP - GUTTER_GAP;
+            }
+            indent + width(&item.label, 12.0, item.default) + end
+        };
+        let widest = self
+            .rows
+            .iter()
+            .map(|row| match row {
+                MenuRow::Item(item) => item_w(item, 0.0),
+                MenuRow::Separator => 0.0,
+                MenuRow::Submenu { label, items, .. } => items
+                    .iter()
+                    .map(|item| item_w(item, CHILD_INDENT))
+                    .fold(width(label, 12.0, false) + END_GAP + CARET_W, f32::max),
+            })
+            .fold(0.0, f32::max);
+        // The panel's border on both sides.
+        ROW_PAD_LEFT + GUTTER_W + GUTTER_GAP + widest + ROW_PAD_RIGHT + 2.0
     }
 }
 
@@ -428,14 +471,60 @@ pub fn build_context_menu(ctx: &MenuContext, open_submenu: Option<SubmenuId>) ->
         ),
         MenuContext::Grip(grip) => grip_rows(grip),
     };
-    let mut menu = ContextMenu {
-        rows,
-        width: MENU_WIDTH,
-    };
-    if menu.has_hints() {
-        menu.width = MENU_WIDTH_WITH_HINTS;
+    let idle = matches!(ctx, MenuContext::Idle { .. });
+    let mut rows = rows;
+    if idle {
+        give_mnemonics(&mut rows);
     }
-    menu
+    ContextMenu::from_rows(rows)
+}
+
+impl ContextMenu {
+    /// A menu of `rows`, as wide as they need.
+    pub fn from_rows(rows: Vec<MenuRow>) -> Self {
+        let mut menu = ContextMenu { rows, width: 0.0 };
+        menu.width = menu.fit_width();
+        menu
+    }
+}
+
+/// Rows without a letter take the first letter of their label, so every row
+/// of a menu can be picked from the keyboard (shared letters cycle).
+pub fn give_mnemonics(rows: &mut [MenuRow]) {
+    let first = |label: &str| {
+        label
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().next().unwrap_or(c))
+    };
+    for row in rows {
+        match row {
+            MenuRow::Item(item) if item.mnemonic.is_none() => item.mnemonic = first(&item.label),
+            MenuRow::Submenu { items, .. } => {
+                for item in items.iter_mut().filter(|item| item.mnemonic.is_none()) {
+                    item.mnemonic = first(&item.label);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A row that runs a menu-bar line; `None` greys it out.
+pub fn menu_line_item(
+    label: String,
+    line: Option<String>,
+    hint: String,
+    icon: Option<&'static [u8]>,
+) -> MenuItem {
+    let enabled = line.is_some();
+    let mut item = MenuItem::new(label, MenuAction::MenuLine(line.unwrap_or_default()))
+        .enabled(enabled);
+    if !hint.is_empty() {
+        item = item.hint(hint);
+    }
+    item.icon = icon.map(MenuIcon::Tool);
+    item
 }
 
 /// Keyboard letter for an option keyword: its first ASCII alphanumeric.
@@ -909,7 +998,8 @@ mod tests {
         assert_eq!(close.action, MenuAction::Option("C".into()));
         assert!(item_at(&menu, 0).default);
         assert_eq!(menu.default_index(), 0);
-        assert_eq!(menu.width, MENU_WIDTH_WITH_HINTS);
+        // As wide as its widest row with that row's hint.
+        assert!(menu.width > 0.0 && menu.width == menu.fit_width());
     }
 
     #[test]

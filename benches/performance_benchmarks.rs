@@ -797,6 +797,7 @@ fn bench_ui_ribbon_view_construction(runner: &mut BenchmarkRunner) {
             LayerInfo {
                 name: "0".to_string(),
                 color: Color::TRANSPARENT,
+                stored_color: codec::types::Color::Index(7),
                 visible: true,
                 frozen: false,
                 locked: false,
@@ -805,6 +806,7 @@ fn bench_ui_ribbon_view_construction(runner: &mut BenchmarkRunner) {
             LayerInfo {
                 name: "DRAWING".to_string(),
                 color: Color::TRANSPARENT,
+                stored_color: codec::types::Color::Index(7),
                 visible: true,
                 frozen: false,
                 locked: false,
@@ -813,6 +815,7 @@ fn bench_ui_ribbon_view_construction(runner: &mut BenchmarkRunner) {
             LayerInfo {
                 name: "DIMENSIONS".to_string(),
                 color: Color::TRANSPARENT,
+                stored_color: codec::types::Color::Index(7),
                 visible: true,
                 frozen: false,
                 locked: false,
@@ -821,6 +824,7 @@ fn bench_ui_ribbon_view_construction(runner: &mut BenchmarkRunner) {
             LayerInfo {
                 name: "ANNOTATIONS".to_string(),
                 color: Color::TRANSPARENT,
+                stored_color: codec::types::Color::Index(7),
                 visible: true,
                 frozen: false,
                 locked: false,
@@ -850,7 +854,7 @@ fn bench_ui_ribbon_view_construction(runner: &mut BenchmarkRunner) {
 
     // Warm-up for allocator and tree settling
     for _ in 0..10 {
-        let _ = black_box(ribbon.view(false, false, 0, 0, false, None));
+        let _ = black_box(ribbon.view(None, false, false, false, 0, 0, false, None));
     }
 
     let n = if runner.quick_mode { 20 } else { 100 };
@@ -860,7 +864,7 @@ fn bench_ui_ribbon_view_construction(runner: &mut BenchmarkRunner) {
     for _ in 0..runs {
         let t0 = Instant::now();
         for _ in 0..n {
-            let elem = ribbon.view(false, false, 0, 0, false, None);
+            let elem = ribbon.view(None, false, false, false, 0, 0, false, None);
             black_box(elem);
         }
         let per_us = (t0.elapsed().as_micros() as f64) / (n as f64);

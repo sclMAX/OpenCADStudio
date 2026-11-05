@@ -221,6 +221,7 @@ fn to_render(ml: &MultiLeader, document: &codec::Document) -> Option<RenderEntit
                 rot += std::f32::consts::PI;
             }
             Some(layout_mtext(&MTextRenderOpts {
+                layer_color: None,
                 // Not an MTEXT: text in a fixed box, never columnar.
                 columns: Default::default(),
                 value: &ctx.text_string,
@@ -249,6 +250,7 @@ fn to_render(ml: &MultiLeader, document: &codec::Document) -> Option<RenderEntit
                 rectangle_height: 0.0,
                 vertical_text: false,
                 want_glyph_boxes: false,
+                break_long_words: false,
             }))
         } else {
             None
@@ -349,8 +351,8 @@ fn to_render(ml: &MultiLeader, document: &codec::Document) -> Option<RenderEntit
                 }
             }
 
-            // Arrowhead
-            if draw_arrow {
+            // Arrowhead; a leader of type None draws neither it nor the landing.
+            if draw_arrow && !invisible {
                 let tip = &line.points[0];
                 let tip_f = p3(tip);
                 let next = if line.points.len() >= 2 {
@@ -380,7 +382,7 @@ fn to_render(ml: &MultiLeader, document: &codec::Document) -> Option<RenderEntit
         }
 
         // Horizontal landing from the leader end to the text's near edge.
-        if dogleg > 0.0 {
+        if dogleg > 0.0 && !invisible {
             points.push(nan);
             points.push(elbow_pt);
             points.push(text_edge_pt);
@@ -480,6 +482,7 @@ fn text_box_geom(ml: &MultiLeader) -> ([f64; 2], [f64; 3]) {
             is_vertical: false,
         };
         let layout = layout_mtext(&MTextRenderOpts {
+            layer_color: None,
             columns: Default::default(),
             value: &ctx.text_string,
             insertion: [0.0, 0.0, 0.0],
@@ -497,6 +500,7 @@ fn text_box_geom(ml: &MultiLeader) -> ([f64; 2], [f64; 3]) {
             rectangle_height: 0.0,
             vertical_text: vertical,
             want_glyph_boxes: false,
+            break_long_words: false,
         });
         let lb = layout.local_bounds;
         let nat = if lb[0] <= lb[2] {
@@ -1033,7 +1037,7 @@ fn yes_no_value(field: &str, value: &str) -> String {
             | "enable_dogleg"
             | "extend_leader_to_text"
             | "enable_annotation_scale"
-            | "background_fill_enabled"
+            | "background_mask_fill_on"
     );
     if !flag || value == "toggle" || value == "true" || value == "false" {
         return value.to_string();
@@ -1205,8 +1209,8 @@ fn properties(ml: &MultiLeader) -> Vec<PropSection> {
             ),
             bool_toggle(
                 t!("Background mask").as_ref(),
-                "background_fill_enabled",
-                ctx.background_fill_enabled,
+                "background_mask_fill_on",
+                ctx.background_mask_fill_on,
             ),
             choice(
                 t!("Attachment type").as_ref(),
@@ -1393,15 +1397,6 @@ fn apply_geom_prop(ml: &mut MultiLeader, field: &str, value: &str) {
                 !ml.context.background_fill_enabled
             } else {
                 value == "true"
-            };
-            // Properties offers only this switch, no fill colour, so a mask
-            // switched on there uses the drawing background like AutoCAD.
-            // Without a colour of its own the fill would inherit the text
-            // colour and hide the text (#2131).
-            if ml.context.background_fill_enabled
-                && ml.context.background_fill_color.rgb().is_none()
-            {
-                ml.context.background_mask_fill_on = true;
             }
         }
         "background_mask_fill_on" => {
@@ -1409,6 +1404,15 @@ fn apply_geom_prop(ml: &mut MultiLeader, field: &str, value: &str) {
                 !ml.context.background_mask_fill_on
             } else {
                 value == "true"
+            };
+            // Properties offers only this switch, no fill colour, so a mask
+            // switched on there fills with the drawing background. Without a
+            // colour of its own the fill would inherit the text colour and
+            // hide the text (#2131).
+            if ml.context.background_mask_fill_on
+                && ml.context.background_fill_color.rgb().is_none()
+            {
+                ml.context.background_fill_enabled = true;
             }
         }
         "background_scale_factor" => {
@@ -2016,6 +2020,138 @@ impl MultiLeaderTess for MultiLeader {
         world_per_pixel: Option<f32>,
         bg_color: [f32; 4],
     ) -> Vec<crate::scene::model::wire_model::WireModel> {
+        // The leader, text and mask are laid out in f32. At large absolute
+        // coordinates (survey drawings far from the origin) f32 steps grow to
+        // tens of units, so a label collapses: its mask shrinks to nothing and
+        // its text and leader snap to rounded points. Build everything around
+        // the text location instead, then lift the wires back to world
+        // double-single, like the MLINE complex-linetype path does.
+        let o = self.context.text_location;
+        let origin = [o.x, o.y, o.z];
+        let mut local = self.clone();
+        local.translate(codec::types::Vector3::new(-o.x, -o.y, -o.z));
+        let (mut wires, world_wires) = local.tessellate_in_frame(
+            self,
+            document,
+            handle,
+            selected,
+            entity_color,
+            line_weight_px,
+            anno_scale,
+            active_viewport,
+            annotation_scale_handle,
+            block_cache,
+            view_aabb,
+            world_per_pixel,
+            bg_color,
+        );
+        for (i, wire) in wires.iter_mut().enumerate() {
+            if !world_wires.contains(&i) {
+                lift_wire_to_world(wire, origin);
+            }
+        }
+        wires
+    }
+}
+
+/// Shift a wire built around `origin` back to world coordinates: everything
+/// `shift_wire_to_world` covers plus the fills, pick triangles, snap points,
+/// key vertices and tangents a MULTILEADER emits.
+fn lift_wire_to_world(w: &mut crate::scene::model::wire_model::WireModel, origin: [f64; 3]) {
+    use crate::scene::convert::tessellate::{shift_wire_to_world, split_ds_xyz};
+    shift_wire_to_world(w, origin);
+    let lift = |tris: &mut Vec<[f32; 3]>, low: &mut Vec<[f32; 3]>| {
+        if tris.is_empty() {
+            return;
+        }
+        let mut hi = Vec::with_capacity(tris.len());
+        let mut lo = Vec::with_capacity(tris.len());
+        for (i, p) in tris.iter().enumerate() {
+            let l = low.get(i).copied().unwrap_or([0.0; 3]);
+            let (h, l) = split_ds_xyz(
+                p[0] as f64 + l[0] as f64 + origin[0],
+                p[1] as f64 + l[1] as f64 + origin[1],
+                p[2] as f64 + l[2] as f64 + origin[2],
+            );
+            hi.push(h);
+            lo.push(l);
+        }
+        *tris = hi;
+        *low = lo;
+    };
+    lift(&mut w.fill_tris, &mut w.fill_tris_low);
+    lift(&mut w.pick_tris, &mut w.pick_tris_low);
+    let offset = DVec3::from_array(origin);
+    for (p, _) in &mut w.snap_pts {
+        *p += offset;
+    }
+    for v in &mut w.key_vertices {
+        for k in 0..3 {
+            v[k] += origin[k];
+        }
+    }
+    for run in &mut w.searchable_text {
+        for k in 0..3 {
+            run.origin[k] += origin[k];
+        }
+    }
+    for tangent in &mut w.tangent_geoms {
+        if let TangentGeom::Line { p1, p2 } = tangent {
+            for p in [p1, p2] {
+                for k in 0..3 {
+                    p[k] = (p[k] as f64 + origin[k]) as f32;
+                }
+            }
+        }
+    }
+}
+
+/// Tessellation of a MULTILEADER already moved into a local frame.
+trait MultiLeaderFrameTess {
+    /// `world` is the same leader at its real position: block content is
+    /// expanded from it, since the block path keeps its own precision.
+    /// Returns the wires and the range of those already in world coordinates.
+    fn tessellate_in_frame(
+        &self,
+        world: &MultiLeader,
+        document: &codec::Document,
+        handle: codec::Handle,
+        selected: bool,
+        entity_color: [f32; 4],
+        line_weight_px: f32,
+        anno_scale: f32,
+        active_viewport: Option<codec::Handle>,
+        annotation_scale_handle: Option<codec::Handle>,
+        block_cache: Option<&crate::scene::cache::block_cache::BlockCache>,
+        view_aabb: Option<[f32; 4]>,
+        world_per_pixel: Option<f32>,
+        bg_color: [f32; 4],
+    ) -> (
+        Vec<crate::scene::model::wire_model::WireModel>,
+        std::ops::Range<usize>,
+    );
+}
+
+impl MultiLeaderFrameTess for MultiLeader {
+    fn tessellate_in_frame(
+        &self,
+        world: &MultiLeader,
+        document: &codec::Document,
+        handle: codec::Handle,
+        selected: bool,
+        entity_color: [f32; 4],
+        line_weight_px: f32,
+        anno_scale: f32,
+        active_viewport: Option<codec::Handle>,
+        annotation_scale_handle: Option<codec::Handle>,
+        block_cache: Option<&crate::scene::cache::block_cache::BlockCache>,
+        view_aabb: Option<[f32; 4]>,
+        world_per_pixel: Option<f32>,
+        bg_color: [f32; 4],
+    ) -> (
+        Vec<crate::scene::model::wire_model::WireModel>,
+        std::ops::Range<usize>,
+    ) {
         use crate::scene::convert::tessellate::{
             append_arrow, arrow_from_block, color_or_inherit, ArrowKind, DimGeom,
         };
@@ -2204,7 +2340,9 @@ impl MultiLeaderTess for MultiLeader {
                     }
                 }
 
-                if draw_arrow {
+                // A leader of type None draws neither its arrowhead nor its
+                // landing: only the content shows.
+                if draw_arrow && !invisible {
                     let tip = &line.points[0];
                     let tip_f = p3(tip);
                     let next = if line.points.len() >= 2 {
@@ -2234,7 +2372,8 @@ impl MultiLeaderTess for MultiLeader {
                 ml.text_attachment_direction,
                 codec::entities::multileader::TextAttachmentDirectionType::Vertical
             );
-            if ml.enable_landing
+            if !invisible
+                && ml.enable_landing
                 && ml.enable_dogleg
                 && root.landing_distance > 0.0
                 && !vertical_attach
@@ -2336,7 +2475,8 @@ impl MultiLeaderTess for MultiLeader {
             ..Default::default()
         });
 
-        let host = codec::EntityType::MultiLeader(Box::new(ml.clone()));
+        let world_start = wires.len();
+        let host = codec::EntityType::MultiLeader(Box::new(world.clone()));
         for block_use in crate::scene::render_graph::entity_render_block_uses(document, &host, 1.0)
             .into_iter()
             .filter(|block_use| {
@@ -2366,6 +2506,7 @@ impl MultiLeaderTess for MultiLeader {
                 .wires,
             );
         }
+        let world_wires = world_start..wires.len();
 
         // ── Text strokes / frame / background fill ──────────────────────────────
         // Strip inline format codes, split / word-wrap into lines, then place each
@@ -2473,6 +2614,7 @@ impl MultiLeaderTess for MultiLeader {
             // fractions, …) reaches the stroke output. Stroke origins are
             // already in offset-relative space because we pass local_ins_x/y.
             let layout = layout_mtext(&MTextRenderOpts {
+                layer_color: None,
                 // Not an MTEXT: text in a fixed box, never columnar.
                 columns: Default::default(),
                 value: &ctx.text_string,
@@ -2495,6 +2637,7 @@ impl MultiLeaderTess for MultiLeader {
                     codec::entities::multileader::FlowDirectionType::Vertical
                 ),
                 want_glyph_boxes: false,
+                break_long_words: false,
             });
             let line_widths = &layout.line_widths;
             let max_line_w = line_widths.iter().cloned().fold(0.0_f32, f32::max);
@@ -2736,7 +2879,7 @@ impl MultiLeaderTess for MultiLeader {
             }
 
             // Text frame / background-fill rectangle in local frame, then rotated to WCS.
-            if ml.text_frame || ctx.background_fill_enabled {
+            if ml.text_frame || ctx.background_mask_fill_on {
                 // Border offset is a scale factor around the laid-out text box.
                 let pad = height * ((ctx.background_scale_factor.max(1.0) as f32 - 1.0) * 0.5);
                 // Box the glyphs that were actually laid out (valid for
@@ -2768,10 +2911,13 @@ impl MultiLeaderTess for MultiLeader {
                 });
 
                 // Background fill — emit two triangles; renders under the text strokes.
-                if ctx.background_fill_enabled {
+                // Code 292 (`background_mask_fill_on`) switches the fill on;
+                // code 291 (`background_fill_enabled`) only picks the drawing
+                // background over the stored fill colour.
+                if ctx.background_mask_fill_on {
                     let mut fill_color = if selected {
                         line_color
-                    } else if ctx.background_mask_fill_on {
+                    } else if ctx.background_fill_enabled {
                         bg_color
                     } else {
                         color_or_inherit(&ctx.background_fill_color, entity_color)
@@ -2876,7 +3022,7 @@ impl MultiLeaderTess for MultiLeader {
             }
         }
 
-        wires
+        (wires, world_wires)
     }
 }
 
@@ -2938,9 +3084,9 @@ mod tests {
         ml.context.text_string = "123".to_string();
         ml.context.text_height = 10.0;
         ml.path_type = MultiLeaderPathType::StraightLineSegments;
-        apply_geom_prop(&mut ml, "background_fill_enabled", "toggle");
-        assert!(ml.context.background_fill_enabled);
+        apply_geom_prop(&mut ml, "background_mask_fill_on", "toggle");
         assert!(ml.context.background_mask_fill_on);
+        assert!(ml.context.background_fill_enabled);
 
         let text_color = [1.0, 1.0, 1.0, 1.0];
         let bg_color = [0.1, 0.2, 0.3, 1.0];
@@ -2963,6 +3109,49 @@ mod tests {
             .find(|w| w.fill_tris.len() == 6 && w.points.is_empty() && w.text_verts.is_empty())
             .expect("Should produce a background mask quad");
         assert_eq!(mask.color, bg_color);
+    }
+
+    #[test]
+    fn background_fill_follows_codes_292_and_291() {
+        // Code 292 switches the text background fill on and code 291 picks
+        // the drawing background as its colour. A label saved with 291 on and
+        // 292 off has no fill: it used to be filled with its stored grey.
+        let mask_color = |color_on: bool, fill_on: bool| {
+            let mut ml = MultiLeader::default();
+            ml.content_type = LeaderContentType::MText;
+            ml.context.text_string = "LABEL".to_string();
+            ml.context.text_height = 10.0;
+            ml.path_type = MultiLeaderPathType::Invisible;
+            ml.context.background_fill_color = codec::types::Color::from_rgb(200, 200, 200);
+            ml.context.background_scale_factor = 1.5;
+            ml.context.background_fill_enabled = color_on;
+            ml.context.background_mask_fill_on = fill_on;
+            let wires = ml.tessellate(
+                &Document::default(),
+                codec::Handle::default(),
+                false,
+                [1.0, 1.0, 0.0, 1.0],
+                1.0,
+                1.0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                [0.1, 0.2, 0.3, 1.0],
+            );
+            wires
+                .iter()
+                .find(|w| w.fill_tris.len() == 6 && w.points.is_empty() && w.text_verts.is_empty())
+                .map(|w| w.color)
+        };
+        let grey = 200.0 / 255.0;
+
+        assert_eq!(mask_color(true, false), None, "291 alone draws no fill");
+        let stored = mask_color(false, true).expect("292 fills");
+        assert!(stored[..3].iter().all(|c| (c - grey).abs() < 1e-3), "{stored:?}");
+        assert_eq!(mask_color(true, true), Some([0.1, 0.2, 0.3, 1.0]));
+        assert_eq!(mask_color(false, false), None);
     }
 
     /// Vertical extent of everything a tessellated MLEADER draws.
@@ -3174,6 +3363,66 @@ mod tests {
         )
     }
 
+    /// Every drawn position of an MLEADER (leader, mask, glyphs, searchable
+    /// text), read back in f64 and moved by `-offset`.
+    fn drawn_positions(wires: &[WireModel], offset: [f64; 2]) -> Vec<[f64; 2]> {
+        let ds = |hi: &[[f32; 3]], lo: &[[f32; 3]]| -> Vec<[f64; 2]> {
+            hi.iter()
+                .enumerate()
+                .filter(|(_, p)| p[0].is_finite())
+                .map(|(i, p)| {
+                    let l = lo.get(i).copied().unwrap_or([0.0; 3]);
+                    [
+                        p[0] as f64 + l[0] as f64 - offset[0],
+                        p[1] as f64 + l[1] as f64 - offset[1],
+                    ]
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        for w in wires {
+            out.extend(ds(&w.points, &w.points_low));
+            out.extend(ds(&w.fill_tris, &w.fill_tris_low));
+            let (pos, low): (Vec<_>, Vec<_>) =
+                w.text_verts.iter().map(|v| (v.pos, v.pos_low)).unzip();
+            out.extend(ds(&pos, &low));
+            out.extend(
+                w.searchable_text
+                    .iter()
+                    .map(|run| [run.origin[0] - offset[0], run.origin[1] - offset[1]]),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn far_from_origin_label_draws_as_near_the_origin() {
+        // Survey drawings sit where f32 steps are tens of units: the leader,
+        // mask and text must keep the shape they have near the origin, not
+        // collapse to a few rounded points.
+        let mut near = landed_leader(
+            "DREN 1\\PPROFUNDIDAD=1.80m",
+            TextAttachmentType::MiddleOfText,
+        );
+        near.context.background_fill_enabled = true;
+        near.context.background_mask_fill_on = true;
+        near.context.background_scale_factor = 1.5;
+        let offset = [334_050_780.44, 6_218_261_561.70];
+        let mut far = near.clone();
+        far.translate(codec::types::Vector3::new(offset[0], offset[1], 0.0));
+
+        let near_pts = drawn_positions(&tess(&near), [0.0, 0.0]);
+        let far_pts = drawn_positions(&tess(&far), offset);
+        assert!(near_pts.len() > 10);
+        assert_eq!(near_pts.len(), far_pts.len());
+        for (a, b) in near_pts.iter().zip(&far_pts) {
+            assert!(
+                (a[0] - b[0]).abs() < 1.0e-3 && (a[1] - b[1]).abs() < 1.0e-3,
+                "{a:?} is drawn at {b:?} far from the origin"
+            );
+        }
+    }
+
     fn text_bottom(wires: &[WireModel]) -> f32 {
         wires
             .iter()
@@ -3358,6 +3607,33 @@ mod tests {
         assert_eq!(ml.block_scale.x, 1.0);
         assert_eq!(ml.block_rotation, 0.0);
         assert_eq!(ml.text_attachment_point, TextAttachmentPointType::Left);
+    }
+
+    #[test]
+    fn leader_type_none_draws_no_arrowhead_or_landing() {
+        // A leader of type None (path type Invisible) shows only its content.
+        // The arrowhead used to be drawn at the hidden leader's tip and the
+        // landing beside the text, so a site plan's street labels picked up
+        // stray dots and dashes.
+        let tip = [-341.0, -387.0];
+        let near = |p: &[f64; 2], q: [f64; 2], r: f64| (p[0] - q[0]).hypot(p[1] - q[1]) < r;
+        let on_landing = |p: &[f64; 2]| p[1].abs() < 1.0 && p[0] > -1.0 && p[0] < DOGLEG;
+
+        let mut shown = landed_leader("LABEL", TextAttachmentType::MiddleOfText);
+        shown.context.arrowhead_size = 40.0;
+        let shown_pts = drawn_positions(&tess(&shown), [0.0, 0.0]);
+        assert!(shown_pts.iter().any(|p| near(p, tip, 50.0)));
+        assert!(shown_pts.iter().any(on_landing));
+
+        let mut hidden = shown.clone();
+        hidden.path_type = MultiLeaderPathType::Invisible;
+        let hidden_pts = drawn_positions(&tess(&hidden), [0.0, 0.0]);
+        assert!(!hidden_pts.is_empty(), "the text still draws");
+        assert!(
+            !hidden_pts.iter().any(|p| near(p, tip, 50.0)),
+            "no arrowhead at the hidden leader's tip"
+        );
+        assert!(!hidden_pts.iter().any(on_landing), "no landing");
     }
 }
 

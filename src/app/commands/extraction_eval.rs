@@ -131,7 +131,7 @@ impl OpenCADStudio {
             self.extraction_outdated = Some(prompt);
             return Task::none();
         }
-        if self.active_modal == Some(ModalKind::ExtractionOutdated) {
+        if self.focus_dialog(ModalKind::ExtractionOutdated) {
             self.active_modal = None;
             self.reset_modal_geometry();
         }
@@ -173,7 +173,7 @@ impl OpenCADStudio {
                     ));
                 }
                 self.command_line
-                    .push_output(&format!("Enter new value for DXEVAL <{current}>:"));
+                    .push_output(&crate::ui::command_line::value_prompt("DXEVAL", &current));
                 self.pending_setvar = Some("DXEVAL".into());
             }
         }

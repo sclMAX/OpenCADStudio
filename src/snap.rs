@@ -701,7 +701,7 @@ impl Snapper {
         // does not create accidental tracking points.
         const DWELL_MS: u128 = 250;
         const DWELL_PX: f32 = 8.0;
-        const MIN_OBSERVATIONS: u8 = 3;
+        const MIN_OBSERVATIONS: u8 = 1;
 
         match snap_world {
             None => {
@@ -734,24 +734,17 @@ impl Snapper {
                         && elapsed >= DWELL_MS
                     {
                         self.dwell_acquired = true;
-                        // Dwelling over an already-acquired point removes it;
-                        // otherwise acquire it.
-                        let existing = self.tracking_points.iter().position(|t| {
-                            let d = (*t - p).length();
-                            d < self.grid_spacing as f64 * 0.1
-                        });
+                        // Coming back to an acquired point and pausing on it
+                        // releases it; otherwise the pause acquires it. Staying
+                        // on the point (jitter inside the aperture) does
+                        // neither, as `dwell_acquired` latches until the cursor
+                        // leaves.
+                        let existing = self
+                            .tracking_points
+                            .iter()
+                            .position(|t| (*t - p).length() <= tracking_point_tolerance(p));
                         match existing {
-                            Some(idx) => {
-                                self.tracking_points.remove(idx);
-
-                                if idx < self.tracking_dirs.len() {
-                                    self.tracking_dirs.remove(idx);
-                                }
-
-                                if idx < self.tracking_perp_dirs.len() {
-                                    self.tracking_perp_dirs.remove(idx);
-                                }
-                            }
+                            Some(index) => self.release_tracking_point(index),
                             None => self.acquire_tracking_point(p, wires, endpoints_only),
                         }
                     }
@@ -768,6 +761,39 @@ impl Snapper {
             }
         }
     }
+    /// A pointer move the snap pass did not sample: when the cursor is
+    /// farther than the snap aperture from the point it was dwelling on, that
+    /// dwell ends as a sampled move off the point would end it, so coming back
+    /// and pausing again acquires or releases afresh. Smaller moves keep it.
+    pub fn note_unsampled_move<W: WireSource + ?Sized>(
+        &mut self,
+        cursor: iced::Point,
+        wires: &W,
+        view_rot: glam::Mat4,
+        eye: glam::DVec3,
+        bounds: iced::Rectangle,
+        now: Instant,
+    ) {
+        let Some(point) = self.last_snap_world else {
+            return;
+        };
+        let screen = world_to_screen(point, view_rot, eye, bounds);
+        let (dx, dy) = (screen.x - cursor.x, screen.y - cursor.y);
+        if dx * dx + dy * dy <= self.osnap_radius_px.powi(2) {
+            return;
+        }
+        self.update_otrack_dwell(None, wires, view_rot, eye, bounds, now);
+    }
+
+    /// Return whether this acquisition point has already been captured.
+    /// Used when the fast cursor preview needs to preserve dwell state without
+    /// repeatedly scanning geometric directions for an already acquired point.
+    pub fn has_tracking_point(&self, point: DVec3) -> bool {
+        self.tracking_points
+            .iter()
+            .any(|p| (*p - point).length() <= tracking_point_tolerance(point))
+    }
+
     /// Immediately acquire the explicitly engaged grip as a tracking point.
     ///
     /// A grip was deliberately selected by the user, so unlike ordinary cursor
@@ -786,6 +812,17 @@ impl Snapper {
 
         self.acquire_tracking_point(p, wires, endpoints_only);
     }
+    /// Drop the tracking point at `index` with its edge directions.
+    fn release_tracking_point(&mut self, index: usize) {
+        self.tracking_points.remove(index);
+        if index < self.tracking_dirs.len() {
+            self.tracking_dirs.remove(index);
+        }
+        if index < self.tracking_perp_dirs.len() {
+            self.tracking_perp_dirs.remove(index);
+        }
+    }
+
     /// Add `p` as a tracking point (capturing its corner edge directions) unless
     /// it is already tracked; drops the oldest when the 4-point cap is reached.
     /// Edge directions are scanned once here, at acquisition, so OTRACK can align
@@ -799,7 +836,7 @@ impl Snapper {
         if self
             .tracking_points
             .iter()
-            .any(|t| (*t - p).length() < self.grid_spacing as f64 * 0.1)
+            .any(|t| (*t - p).length() <= tracking_point_tolerance(p))
         {
             return;
         }
@@ -872,6 +909,31 @@ impl Snapper {
         ucs_x: DVec3,
         ucs_y: DVec3,
     ) -> Option<OtrackHit> {
+        self.otrack_snap_stable(
+            cursor_world, view_rot, eye, bounds, polar_step_deg, last_point,
+            required_crossing_ray, ortho, ucs_x, ucs_y, None,
+        )
+    }
+
+    pub fn otrack_snap_stable(
+        &self,
+        cursor_world: DVec3,
+        view_rot: glam::Mat4,
+        eye: glam::DVec3,
+        bounds: iced::Rectangle,
+        polar_step_deg: Option<f32>,
+        last_point: Option<DVec3>,
+        required_crossing_ray: Option<(DVec3, DVec3)>,
+        // Ortho on: the axis from `last_point` is a hard lock. Only crossings of
+        // an acquired ray with that axis lock; single tracking rays are
+        // suppressed so the cursor can't leave the ortho axis. (#218)
+        ortho: bool,
+        // UCS axes in world space: tracking rays follow the active UCS while
+        // their world geometry stays in f64.
+        ucs_x: DVec3,
+        ucs_y: DVec3,
+        previous_ray: Option<(DVec3, DVec3)>,
+    ) -> Option<OtrackHit> {
         // A point created by typed distance along Extension/OTRACK carries
         // that source direction for exactly one following point. Perpendicular
         // OSNAP may use it even when F11 tracking itself is off.
@@ -884,6 +946,13 @@ impl Snapper {
         if (!self.otrack_enabled || self.tracking_points.is_empty()) && carried_perp.is_none() {
             return None;
         }
+
+        // Prefer the same acquired reference when two currently valid
+        // tracking rays lie within four screen pixels of each other.
+        // The point is always recomputed on a live ray: no stale guide.
+        let rank_ray = |base: DVec3, dir: DVec3, distance_px: f32| {
+            otrack_ray_score(previous_ray, base, dir, distance_px)
+        };
 
         let cursor_screen = world_to_screen(cursor_world, view_rot, eye, bounds);
         // Use the same aperture as OSNAP so the catch distance is uniform.
@@ -940,10 +1009,9 @@ impl Snapper {
                     kind: TrackingKind::Generic,
                 });
             }
-            // Extension rays along the corner's own edges (world-space geometry
-            // directions — already oriented, no UCS rotation). Included in the
-            // single-ray set so pulling the cursor along a segment's extension
-            // locks to it. (#219)
+            // Tracking along the corner's own supporting lines (both
+            // outward extension and the segment interior). Directions are
+            // stored in world space and are orientation-independent here.
             if let Some(edirs) = self.tracking_dirs.get(gi) {
                 for &d in edirs {
                     rays.push(Ray {
@@ -1066,7 +1134,16 @@ impl Snapper {
                     continue;
                 }
                 let sd = screen_dist(x);
-                if sd < r && best_x.as_ref().map_or(true, |(bd, _)| sd < *bd) {
+                if sd < r {
+                    let ranking_ray = if rays[i].group != POLAR_GROUP && rays[i].group != ORTHO_GROUP {
+                        &rays[i]
+                    } else {
+                        &rays[j]
+                    };
+                    let score = rank_ray(ranking_ray.origin, ranking_ray.dir, sd);
+                    if !best_x.as_ref().map_or(true, |(bd, _)| score < *bd) {
+                        continue;
+                    }
                     // Report an acquired tracking ray (not an auxiliary
                     // last_point ray) as base/dir for typed-distance entry.
                     let (ot, other) =
@@ -1088,7 +1165,7 @@ impl Snapper {
                     };
                     let dir_out = outward(ot);
                     best_x = Some((
-                        sd,
+                        score,
                         OtrackHit {
                             aligned: x,
                             dir: dir_out,
@@ -1128,10 +1205,11 @@ impl Snapper {
                 ray.origin.z,
             );
             let sd = screen_dist(aligned);
-            if sd < r && best.as_ref().map_or(true, |(bd, _)| sd < *bd) {
+            let score = rank_ray(ray.origin, ray.dir, sd);
+            if sd < r && best.as_ref().map_or(true, |(bd, _)| score < *bd) {
                 let dir_out = if t >= 0.0 { ray.dir } else { -ray.dir };
                 best = Some((
-                    sd,
+                    score,
                     OtrackHit {
                         aligned,
                         dir: dir_out,
@@ -1341,6 +1419,23 @@ impl Snapper {
         eye: DVec3,
         bounds: Rectangle,
     ) -> Option<SnapResult> {
+        self.snap_discrete_preview_stable(
+            cursor_screen, wires, view_rot, eye, bounds, None,
+        )
+    }
+
+    /// Keep an acquired discrete point only while it is independently found
+    /// among this frame's *real* candidates. Hysteresis avoids oscillation
+    /// between nearly equidistant block vertices without phantom old snaps.
+    pub fn snap_discrete_preview_stable<W: WireSource + ?Sized>(
+        &self,
+        cursor_screen: Point,
+        wires: &W,
+        view_rot: Mat4,
+        eye: DVec3,
+        bounds: Rectangle,
+        previous: Option<SnapResult>,
+    ) -> Option<SnapResult> {
         // An unindexed source can represent the entire drawing. Avoid turning
         // the fast path into another full-scene scan while its spatial index is
         // being prepared; small drawings can still use the direct fallback.
@@ -1356,6 +1451,7 @@ impl Snapper {
         let mut best_rank = u8::MAX;
         let mut best_sub = u8::MAX;
         let mut best_d2 = f32::MAX;
+        let mut retained: Option<(SnapResult, f32)> = None;
 
         let mut try_pt =
             |world: DVec3, snap_type: SnapType, src: Option<DimensionAssociationSource>| {
@@ -1368,6 +1464,15 @@ impl Snapper {
                     return;
                 }
                 let (tier, sub) = (snap_tier(snap_type), snap_priority(snap_type));
+                if previous.is_some_and(|old| same_discrete_snap(old, world, snap_type)) {
+                    retained = Some((SnapResult {
+                        world, screen, snap_type, tangent_obj: None,
+                        extension_base: None, extension_base2: None,
+                        extension_origin: None, extension_dir: None,
+                        viewport: None, source: src, secondary_source: None,
+                        model_point: None,
+                    }, d2));
+                }
                 if snap_better(tier, d2, sub, (best_rank, best_d2, best_sub)) {
                     best_rank = tier;
                     best_sub = sub;
@@ -1390,7 +1495,7 @@ impl Snapper {
             };
 
         self.for_each_discrete_feature(wires, || wires.iter(), &mut try_pt);
-        best
+        keep_stable_snap(best, retained, cursor_screen)
     }
 
     /// Visit every enabled discrete feature of `wires`: pre-baked hints
@@ -1428,7 +1533,15 @@ impl Snapper {
             } else {
                 self.snap_enabled && self.is_on(snap_type)
             };
-            on.then_some(snap_type)
+            // A solid's vertices and edge middles also answer the 2D
+            // Endpoint and Midpoint modes (#2153).
+            let planar = match hint {
+                SnapHint::Vertex => Some(SnapType::Endpoint),
+                SnapHint::EdgeMidpoint => Some(SnapType::Midpoint),
+                _ => None,
+            }
+            .filter(|planar| self.snap_enabled && self.is_on(*planar));
+            on.then_some(snap_type).or(planar)
         };
         if let Some(points) = wires.snap_points() {
             for point_ref in points {
@@ -1554,7 +1667,29 @@ impl Snapper {
         grid_axes: (Vec3, Vec3, Vec3),
         construction_ray: Option<(glam::DVec3, glam::DVec3)>,
     ) -> Option<SnapResult> {
-        self.snap_with_additional_construction_rays(
+        self.snap_stable(
+            cursor_world, cursor_screen, wires, view_rot, eye, bounds,
+            grid_origin, grid_axes, construction_ray, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn snap_stable<W: WireSource + ?Sized>(
+        &self,
+        cursor_world: glam::DVec3,
+        cursor_screen: Point,
+        wires: &W,
+        view_rot: Mat4,
+        eye: glam::DVec3,
+        bounds: Rectangle,
+        // Grid origin and live drafting axes, so grid snap lands on the same
+        // rotated or isometric grid the user sees.
+        grid_origin: Vec3,
+        grid_axes: (Vec3, Vec3, Vec3),
+        construction_ray: Option<(glam::DVec3, glam::DVec3)>,
+        previous: Option<SnapResult>,
+    ) -> Option<SnapResult> {
+        self.snap_with_additional_construction_rays_stable(
             cursor_world,
             cursor_screen,
             wires,
@@ -1565,6 +1700,7 @@ impl Snapper {
             grid_axes,
             construction_ray,
             &[],
+            previous,
         )
         .map(|hit| self.on_osnap_z_plane(hit))
     }
@@ -1596,6 +1732,30 @@ impl Snapper {
         grid_axes: (Vec3, Vec3, Vec3),
         construction_ray: Option<(glam::DVec3, glam::DVec3)>,
         additional_construction_rays: &[(glam::DVec3, glam::DVec3)],
+    ) -> Option<SnapResult> {
+        self.snap_with_additional_construction_rays_stable(
+            cursor_world, cursor_screen, wires, view_rot, eye, bounds,
+            grid_origin, grid_axes, construction_ray, additional_construction_rays, None,
+        )
+    }
+
+    /// The selected feature must still be enumerated in the *current* frame:
+    /// a stale preview never captures the mouse merely because it was nearby
+    /// on an earlier frame. Continuous modes do not get sticky.
+    #[allow(clippy::too_many_arguments)]
+    pub fn snap_with_additional_construction_rays_stable<W: WireSource + ?Sized>(
+        &self,
+        cursor_world: glam::DVec3,
+        cursor_screen: Point,
+        wires: &W,
+        view_rot: Mat4,
+        eye: glam::DVec3,
+        bounds: Rectangle,
+        grid_origin: Vec3,
+        grid_axes: (Vec3, Vec3, Vec3),
+        construction_ray: Option<(glam::DVec3, glam::DVec3)>,
+        additional_construction_rays: &[(glam::DVec3, glam::DVec3)],
+        previous: Option<SnapResult>,
     ) -> Option<SnapResult> {
         // Object-snap selection is priority-then-distance, NOT nearest-wins.
         // "Continuous" snaps (Nearest, Perpendicular, …) sit on the geometry
@@ -1802,6 +1962,9 @@ impl Snapper {
         // instead of recomputing `world_to_screen`. The slot is consumed by
         // every `try_pt` call, so it can never go stale.
         let pre_screen = std::cell::Cell::new(None::<Point>);
+        // A candidate counts as retained only after passing this frame's
+        // bounds, enabled-mode and snap-aperture tests.
+        let retained = std::cell::Cell::new(None::<(SnapResult, f32)>);
 
         let mut try_pt = |world: glam::DVec3,
                           snap_type: SnapType,
@@ -1829,6 +1992,15 @@ impl Snapper {
                 return;
             }
             let (tier, sub) = (snap_tier(snap_type), snap_priority(snap_type));
+            if previous.is_some_and(|old| same_discrete_snap(old, world, snap_type)) {
+                retained.set(Some((SnapResult {
+                    world, screen, snap_type, tangent_obj: None,
+                    extension_base: None, extension_base2: None,
+                    extension_origin: None, extension_dir: None,
+                    viewport: None, source: src, secondary_source: secondary,
+                    model_point: None,
+                }, d2)));
+            }
             // Coincident 3D features share pixels (top and bottom face
             // centres coincide in plan view): break exact ties by eye depth
             // so the nearer one wins instead of whichever was evaluated
@@ -2275,7 +2447,7 @@ impl Snapper {
             }
         }
 
-        // ── Extension — persistent rays captured at endpoint acquisition ──
+        // ── Extension — persistent full support lines captured at endpoint acquisition ──
         // The source geometry may be far outside the cursor's spatial query by
         // the time its extension is used. Keep the outward incident directions
         // captured with each tracking point instead of rescanning either the
@@ -2297,7 +2469,7 @@ impl Snapper {
                 }
             }
 
-            // Extended intersection: intersect only outward rays whose infinite
+            // Extended intersection: intersect both directions of acquired edges whose infinite
             // lines pass near the cursor. At most four acquired points × six
             // directions participate, independent of drawing density.
             let filter2 = (self.osnap_radius_px * 2.0).powi(2);
@@ -2331,7 +2503,7 @@ impl Snapper {
                     }
                     let t1 = ((b0.x - a0.x) * d2.y - (b0.y - a0.y) * d2.x) / denom;
                     let t2 = ((b0.x - a0.x) * d1.y - (b0.y - a0.y) * d1.x) / denom;
-                    if t1 < 0.05 || t2 < 0.05 {
+                    if t1.abs() < 0.05 || t2.abs() < 0.05 {
                         continue;
                     }
                     // Emit as an Intersection, not an Extension: the crossing is
@@ -3018,6 +3190,10 @@ impl Snapper {
             }
         }
 
+        // Only an observed, valid discrete candidate may be held across
+        // frames; never keep a previous location absent from this frame.
+        best = keep_stable_snap(best, retained.get(), cursor_screen);
+
         // If an Extension snap or an extended intersection won, re-find the
         // endpoint(s) whose ray(s) it lies on so the overlay can draw the dashed
         // guide line(s) back to them. An Extension yields one base; an extended
@@ -3108,6 +3284,65 @@ pub(crate) fn snap_tier(t: SnapType) -> u8 {
         SnapType::FacePerpendicular => 9,
         SnapType::NearestFace => 13,
         other => snap_priority(other),
+    }
+}
+
+/// World-coordinate precision for identifying the same physical point.
+/// Never use the view's grid spacing: at a coarse zoom it can treat two
+/// distinct vertices several metres apart as a single OTRACK reference.
+fn tracking_point_tolerance(p: DVec3) -> f64 {
+    1e-8_f64.max(2e-12 * p.x.abs().max(p.y.abs()))
+}
+
+/// Rank only tracking rays which were calculated from acquired points in
+/// this exact frame. A small bias toward the same origin/axis prevents guide
+/// lines from swapping at nearly identical cursor distances.
+fn otrack_ray_score(
+    previous: Option<(DVec3, DVec3)>,
+    base: DVec3,
+    dir: DVec3,
+    distance_px: f32,
+) -> f32 {
+    let retained = previous.is_some_and(|(old_base, old_dir)| {
+        (old_base - base).length_squared() < 1e-12
+            && old_dir.dot(dir).abs() > 0.9999
+    });
+    distance_px - if retained { 4.0 } else { 0.0 }
+}
+
+/// Maximum distance advantage (screen pixels) a competing point may have
+/// while the user's currently acquired, still-valid point remains selected.
+/// This is *not* an additional capture radius and introduces no dwell delay.
+const SNAP_HOLD_MARGIN_PX: f32 = 5.0;
+
+/// The old point must be rediscovered from this frame's actual geometry.
+/// In particular, a Nearest/Extension (cursor-dependent) point cannot be held.
+fn same_discrete_snap(old: SnapResult, world: DVec3, kind: SnapType) -> bool {
+    snap_tier(kind) == 0
+        && !kind.is_3d()
+        && old.snap_type == kind
+        && (old.world - world).length_squared() <= 1e-12
+}
+
+fn keep_stable_snap(
+    best: Option<SnapResult>,
+    retained: Option<(SnapResult, f32)>,
+    cursor: Point,
+) -> Option<SnapResult> {
+    let (Some(challenger), Some((incumbent, distance2))) = (best, retained) else {
+        return best;
+    };
+    // Higher-priority modes (e.g. any discrete point over Nearest) always
+    // win immediately. A prior point must remain within the normal aperture;
+    // it is never artificially extended by the hold margin.
+    if snap_tier(challenger.snap_type) != snap_tier(incumbent.snap_type) {
+        return Some(challenger);
+    }
+    let challenger_d2 = dist2(challenger.screen, cursor);
+    if distance2.sqrt() <= challenger_d2.sqrt() + SNAP_HOLD_MARGIN_PX {
+        Some(incumbent)
+    } else {
+        Some(challenger)
     }
 }
 
@@ -4006,9 +4241,9 @@ fn extension_snap(
         return None;
     }
     let t = ((cursor_world.x - origin.x) * dir.x + (cursor_world.y - origin.y) * dir.y) / len2;
-    if t < 0.05 {
+    if t.abs() < 0.05 {
         return None;
-    } // only beyond the endpoint
+    } // Skip only the immediate endpoint itself; allow both directions
     let world_pt = glam::DVec3::new(origin.x + t * dir.x, origin.y + t * dir.y, origin.z);
     let screen_pt = world_to_screen(world_pt, view_rot, eye, bounds);
     let cursor_screen = world_to_screen(cursor_world, view_rot, eye, bounds);
@@ -4018,7 +4253,7 @@ fn extension_snap(
     Some(world_pt)
 }
 
-/// Find acquired endpoint(s) whose outward ray contains `snapped`, returning
+/// Find acquired endpoint(s) whose full support line contains `snapped`, returning
 /// their screen positions for Extension guides. The captured ray set persists
 /// after its source geometry leaves the cursor-local spatial query.
 fn extension_bases_screen(
@@ -4045,7 +4280,7 @@ fn extension_bases_screen(
                 continue;
             }
             let t = ((snapped.x - origin.x) * dir.x + (snapped.y - origin.y) * dir.y) / len2;
-            if t < 0.05 {
+            if t.abs() < 0.05 {
                 continue;
             }
             let on = glam::DVec3::new(origin.x + t * dir.x, origin.y + t * dir.y, origin.z);
@@ -4418,6 +4653,43 @@ mod ext_tests {
     }
 
     #[test]
+    fn otrack_ray_hysteresis_keeps_a_same_origin_axis_only_within_four_pixels() {
+        let prev = Some((DVec3::ZERO, DVec3::X));
+        assert_eq!(otrack_ray_score(prev, DVec3::ZERO, DVec3::X, 8.0), 4.0);
+        assert_eq!(otrack_ray_score(prev, DVec3::ZERO, -DVec3::X, 8.0), 4.0);
+        assert_eq!(otrack_ray_score(prev, DVec3::Y, DVec3::X, 8.0), 8.0);
+        assert_eq!(otrack_ray_score(prev, DVec3::ZERO, DVec3::Y, 8.0), 8.0);
+    }
+
+    #[test]
+    fn snap_hysteresis_retains_only_verified_discrete_features() {
+        let make = |x: f64, kind| SnapResult {
+            world: DVec3::new(x, 0.0, 0.0),
+            screen: Point::new(x as f32, 0.0),
+            snap_type: kind, tangent_obj: None,
+            extension_base: None, extension_base2: None,
+            extension_origin: None, extension_dir: None,
+            viewport: None, source: None, secondary_source: None,
+            model_point: None,
+        };
+        let previous = make(8.0, SnapType::Endpoint);
+        assert!(same_discrete_snap(previous, previous.world, SnapType::Endpoint));
+        assert!(!same_discrete_snap(previous, previous.world + DVec3::X, SnapType::Endpoint));
+        assert!(!same_discrete_snap(previous, previous.world, SnapType::Midpoint));
+        assert!(!same_discrete_snap(make(8.0, SnapType::Nearest), previous.world, SnapType::Nearest));
+
+        let challenger = make(10.0, SnapType::Midpoint);
+        let held = keep_stable_snap(Some(challenger), Some((previous, 8.0 * 8.0)), Point::new(0.0, 0.0));
+        assert_eq!(held.unwrap().snap_type, SnapType::Endpoint);
+        let released = keep_stable_snap(Some(challenger), Some((previous, 20.0 * 20.0)), Point::new(0.0, 0.0));
+        assert_eq!(released.unwrap().snap_type, SnapType::Midpoint);
+        assert_eq!(
+            keep_stable_snap(Some(challenger), None, Point::new(0.0, 0.0)).unwrap().snap_type,
+            SnapType::Midpoint,
+        );
+    }
+
+    #[test]
     fn tracking_active_covers_otrack_and_extension() {
         let mut s = Snapper::default();
         // OTRACK off, Extension not enabled → no acquisition.
@@ -4434,6 +4706,72 @@ mod ext_tests {
         s.enabled.remove(&SnapType::Extension);
         s.otrack_enabled = true;
         assert!(s.tracking_active());
+    }
+
+    #[test]
+    fn hovering_an_acquired_point_twice_never_discards_its_tracking_source() {
+        let mut snapper = Snapper::default();
+        snapper.otrack_enabled = true;
+        // The view/grid spacing must not merge two real vertices 10m apart.
+        snapper.grid_spacing = 1000.0;
+        let wire = WireModel {
+            points: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            ..Default::default()
+        };
+        let wires = [wire];
+        let view = Mat4::from_scale(Vec3::splat(0.01));
+        let bounds = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let make_hit = |x: f64| SnapResult {
+            world: DVec3::new(x, 0.0, 0.0),
+            screen: world_to_screen(DVec3::new(x, 0.0, 0.0), view, DVec3::ZERO, bounds),
+            snap_type: SnapType::Endpoint,
+            tangent_obj: None, extension_base: None, extension_base2: None,
+            extension_origin: None, extension_dir: None, viewport: None,
+            source: None, secondary_source: None, model_point: None,
+        };
+        let start = Instant::now();
+        let dt = |millis| start + std::time::Duration::from_millis(millis);
+        snapper.update_otrack_dwell(Some(make_hit(0.0)), &wires, view, DVec3::ZERO, bounds, dt(0));
+        snapper.update_otrack_dwell(Some(make_hit(0.0)), &wires, view, DVec3::ZERO, bounds, dt(300));
+        assert_eq!(snapper.tracking_points.len(), 1);
+        snapper.update_otrack_dwell(Some(make_hit(0.0)), &wires, view, DVec3::ZERO, bounds, dt(650));
+        assert_eq!(snapper.tracking_points.len(), 1, "repeated dwell must not toggle off a source");
+        snapper.update_otrack_dwell(Some(make_hit(10.0)), &wires, view, DVec3::ZERO, bounds, dt(700));
+        snapper.update_otrack_dwell(Some(make_hit(10.0)), &wires, view, DVec3::ZERO, bounds, dt(1000));
+        assert_eq!(snapper.tracking_points.len(), 2, "both crossing origins remain acquired");
+        assert!(snapper.has_tracking_point(DVec3::new(0.0, 0.0, 0.0)));
+        assert!(snapper.has_tracking_point(DVec3::new(10.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn extension_allows_inward_and_outward_from_an_acquired_endpoint() {
+        let view = Mat4::from_scale(Vec3::splat(0.01));
+        let bounds = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let origin = DVec3::ZERO;
+        let outward = -DVec3::X;
+        let inward = DVec3::new(4.0, 0.0, 0.0);
+        let beyond = DVec3::new(-4.0, 0.0, 0.0);
+        assert_eq!(extension_snap(inward, origin, outward, view, DVec3::ZERO, bounds, 25.0), Some(inward));
+        assert_eq!(extension_snap(beyond, origin, outward, view, DVec3::ZERO, bounds, 25.0), Some(beyond));
+        assert!(extension_snap(origin, origin, outward, view, DVec3::ZERO, bounds, 25.0).is_none());
+    }
+
+    #[test]
+    fn two_acquired_support_lines_can_cross_inside_a_segment() {
+        let mut snapper = Snapper::default();
+        snapper.otrack_enabled = true;
+        snapper.osnap_radius_px = 25.0;
+        snapper.tracking_points = vec![DVec3::ZERO, DVec3::new(5.0, 5.0, 0.0)];
+        snapper.tracking_dirs = vec![vec![-DVec3::X], vec![DVec3::Y]];
+        let view = Mat4::from_scale(Vec3::splat(0.01));
+        let bounds = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+        let cursor = DVec3::new(5.01, 0.02, 0.0);
+        let hit = snapper.otrack_snap(
+            cursor, view, DVec3::ZERO, bounds, None, None, None,
+            false, DVec3::X, DVec3::Y,
+        ).expect("acquired lines must intersect even behind the stored outward directions");
+        assert!(hit.cross.is_some());
+        assert!((hit.aligned - DVec3::new(5.0, 0.0, 0.0)).length() < 1e-7);
     }
 
     #[test]

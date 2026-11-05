@@ -33,9 +33,33 @@ pub(super) fn geometry(
                     .collect::<std::collections::BTreeSet<_>>(),
             );
         }
-        if !grips.as_ref().unwrap().contains(handle) {
+        if kind == Kind::Move && chains::frame_target(doc, definition, parameter_id, *handle).is_some() {
+            continue;
+        }
+        if grips.as_ref().unwrap().contains(handle) {
+            continue;
+        }
+        // Flip-linked parameters need frame transport; silently treating them
+        // as bookkeeping would leave later grips and edits in the old frame.
+        if kind == Kind::Flip {
             return Err("This action targets another parameter or an unsupported native object.");
         }
+        let all_params = all_parameters(doc, definition);
+        let is_block_param_or_grip = all_params.iter().any(|p| {
+            // Linear grip aliases are not yet transport targets. The driving
+            // parameter's own grips and supported whole-parameter links were
+            // handled above; accepting another Linear grip would drop its move.
+            !(kind == Kind::Move && p.linear)
+                && (p.handle == *handle
+                    || p.grip == *handle
+                    || super::super::block_grips::config::locations(doc, definition, p.handle)
+                        .map(|locs| locs.iter().any(|g| g.handle == *handle))
+                        .unwrap_or(false))
+        });
+        if is_block_param_or_grip {
+            continue;
+        }
+        return Err("This action targets another parameter or an unsupported native object.");
         // The current per-reference parameter frame already determines its own
         // grips. Keep the native link without transforming definition objects.
     }

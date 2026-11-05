@@ -6,8 +6,9 @@
 //! tweak lands everywhere.
 
 use crate::app::Message;
+use crate::ui::dropdown_list::pick_list;
 use crate::ui::style::common::muted_style;
-use iced::widget::{button, container, pick_list, radio, row, text, text_input, Space};
+use iced::widget::{button, container, radio, row, text, text_input, Space};
 use iced::{Background, Border, Element, Length, Theme};
 use std::borrow::Cow;
 
@@ -69,6 +70,16 @@ where
 
 /// Width of the label column in a `label : control` row.
 pub const LABEL_WIDTH: f32 = 92.0;
+
+/// [`button_style`] as a plain function, for the main action.
+pub fn accent_button(theme: &Theme, status: button::Status) -> button::Style {
+    button_style(true)(theme, status)
+}
+
+/// [`button_style`] as a plain function, for every other action.
+pub fn neutral_button(theme: &Theme, status: button::Status) -> button::Style {
+    button_style(false)(theme, status)
+}
 
 /// Dialog button: accent (primary action) or neutral.
 pub fn button_style(accent: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
@@ -229,7 +240,7 @@ pub fn labeled_field<'a>(
     label: Cow<'static, str>,
     value: &'a str,
     on_input: impl Fn(String) -> Message + 'a,
-    width: f32,
+    width: impl Into<Length>,
 ) -> Element<'a, Message> {
     row![
         row_label(label),

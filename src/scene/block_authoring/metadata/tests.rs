@@ -51,6 +51,20 @@ fn fixture() -> (Document, Handle, Vec<Handle>) {
     handles.push(block_visibility::create(doc, definition, Vector3::ZERO).unwrap());
     (scene.document, definition, handles)
 }
+fn chain(doc: &Document, handle: Handle) -> Option<bool> {
+    let Some(ObjectType::DynamicBlock(object)) = doc.objects.get(&handle) else {
+        return None;
+    };
+    match &object.data {
+        Data::PointParameter(p) => Some(p.parameter.parameter.chain_actions),
+        Data::LinearParameter(p) => Some(p.parameter.parameter.chain_actions),
+        Data::PolarParameter(p) => Some(p.parameter.parameter.chain_actions),
+        Data::XYParameter(p) => Some(p.parameter.parameter.chain_actions),
+        Data::RotationParameter(p) => Some(p.parameter.parameter.chain_actions),
+        Data::FlipParameter(p) => Some(p.parameter.parameter.chain_actions),
+        _ => None,
+    }
+}
 fn values(doc: &Document, def: Handle, handle: Handle) -> Vec<(Field, String)> {
     read(doc, def, handle)
         .unwrap()
@@ -91,6 +105,10 @@ fn block_parameter_metadata_all_native_fields_persist_without_graph_changes() {
             assert_eq!(set_visible(&mut doc, def, handle, false), Ok(true));
             assert_eq!(set_visible(&mut doc, def, handle, false), Ok(false));
         }
+        if chain(&doc, handle).is_some() {
+            assert_eq!(set_chain(&mut doc, def, handle, true), Ok(true));
+            assert_eq!(set_chain(&mut doc, def, handle, true), Ok(false));
+        }
     }
     for (handle, object) in &before.objects {
         if !handles.contains(handle) {
@@ -115,6 +133,7 @@ fn block_parameter_metadata_all_native_fields_persist_without_graph_changes() {
                 read(&loaded, def, handle).unwrap().visible,
                 read(&doc, def, handle).unwrap().visible
             );
+            assert_eq!(chain(&loaded, handle), chain(&doc, handle), "{extension}");
         }
         assert_eq!(
             block_visibility::parameter(&loaded, def)
@@ -154,6 +173,10 @@ fn block_parameter_metadata_rejects_collisions_foreign_objects_and_invalid_field
     }
     assert!(set_text(&mut doc, def, handles[5], Field::Description, "unsupported").is_err());
     assert!(set_visible(&mut doc, def, handles[5], false).is_err());
+    for unsupported in [handles[5], handles[7], handles[8], handles[9]] {
+        assert!(set_chain(&mut doc, def, unsupported, true).is_err());
+    }
+    assert!(set_chain(&mut doc, def, Handle::from(0xFFFFFFu64), true).is_err());
     assert!(set_text(
         &mut doc,
         Handle::from(0xFFFFFFu64),
@@ -164,6 +187,7 @@ fn block_parameter_metadata_rejects_collisions_foreign_objects_and_invalid_field
     .is_err());
     let graph = crate::scene::block_authoring::graph(&doc, def).unwrap().unwrap();
     assert!(set_text(&mut doc, def, graph, Field::Name, "Graph").is_err());
+    assert!(set_chain(&mut doc, def, graph, true).is_err());
     assert_eq!(doc, before);
     if let Some(ObjectType::DynamicBlock(p)) = doc.objects.get_mut(&xy) {
         p.owner = Handle::from(0xFFFFFFu64);
@@ -175,4 +199,114 @@ fn block_parameter_metadata_rejects_collisions_foreign_objects_and_invalid_field
         set_text(&mut doc, def, handles[0], Field::Description, ""),
         Ok(false)
     );
+}
+
+fn name_of(doc: &Document, handle: Handle) -> String {
+    element_name(doc.objects.get(&handle).unwrap())
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_parameter_name_leaves_the_first_of_its_type_unnumbered() {
+    let (mut doc, def, handles) = fixture();
+    let polar = handles[2];
+    assert_eq!(name_of(&doc, polar), "Polar");
+    assert_eq!(
+        next_parameter_name(&doc, def, "Polar"),
+        Ok("Polar1".to_owned())
+    );
+    assert_eq!(set_parameter_name(&mut doc, def, polar, "P9"), Ok(true));
+    assert_eq!(
+        next_parameter_name(&doc, def, "Polar"),
+        Ok("Polar1".to_owned())
+    );
+}
+
+#[test]
+fn a_taken_offered_name_falls_back_to_the_first_free_number() {
+    let (mut doc, def, handles) = fixture();
+    assert_eq!(
+        set_parameter_name(&mut doc, def, handles[1], "Polar1"),
+        Ok(true)
+    );
+    assert_eq!(
+        next_parameter_name(&doc, def, "Polar"),
+        Ok("Polar2".to_owned()),
+        "the offered Polar1 is taken, so the next free number follows"
+    );
+}
+
+#[test]
+fn a_parameter_name_starts_bare_without_an_authoring_graph() {
+    let mut scene = Scene::new();
+    scene.define_block_raw("PLAIN", Vector3::ZERO, vec![]);
+    let definition = scene.document.block_records.get("PLAIN").unwrap().handle;
+    assert_eq!(
+        next_parameter_name(&scene.document, definition, "Polar"),
+        Ok("Polar".to_owned())
+    );
+}
+
+#[test]
+fn a_parameter_name_is_trimmed_and_must_be_new() {
+    let (mut doc, def, handles) = fixture();
+    let polar = handles[2];
+    assert_eq!(set_parameter_name(&mut doc, def, polar, "  P9  "), Ok(true));
+    assert_eq!(name_of(&doc, polar), "P9");
+    assert_eq!(set_parameter_name(&mut doc, def, polar, "P9"), Ok(false));
+    assert_eq!(
+        set_parameter_name(&mut doc, def, polar, "   "),
+        Err("Parameter name cannot be empty.")
+    );
+    assert_eq!(
+        set_parameter_name(&mut doc, def, polar, "a\0b"),
+        Err("Parameter text cannot contain a null character.")
+    );
+    let linear_name = name_of(&doc, handles[1]);
+    assert_eq!(linear_name, "Linear");
+    assert_eq!(
+        set_parameter_name(&mut doc, def, polar, &linear_name.to_ascii_uppercase()),
+        Err("Parameter names must be unique.")
+    );
+    assert_eq!(
+        set_parameter_name(&mut doc, def, Handle::new(999_999), "P9"),
+        Err("The block parameter is unavailable.")
+    );
+}
+
+#[test]
+fn block_parameter_metadata_preserves_literal_backslashes_and_dwg_line_breaks() {
+    let (mut doc, def, handles) = fixture();
+    let inputs = [
+        "plain literal \\P and \\\\P",
+        "line one\nline two",
+        "line one\r\nline two",
+        "line one\rline two",
+    ];
+    for input in inputs {
+        for &handle in &handles {
+            for (field, _) in values(&doc, def, handle) {
+                if matches!(field, Field::Description | Field::SecondaryDescription) {
+                    set_text(&mut doc, def, handle, field, input).unwrap();
+                }
+            }
+        }
+        for extension in if input.contains(['\r', '\n']) {
+            &["dwg"][..]
+        } else {
+            &["dwg", "dxf"][..]
+        } {
+            let bytes = crate::io::save_to_bytes(&doc, extension, doc.version).unwrap();
+            let loaded =
+                crate::io::load_bytes(&format!("metadata-lines.{extension}"), bytes).unwrap();
+            for &handle in &handles {
+                assert_eq!(
+                    values(&loaded, def, handle),
+                    values(&doc, def, handle),
+                    "{extension}: {handle}, input={input:?}"
+                );
+            }
+        }
+    }
 }

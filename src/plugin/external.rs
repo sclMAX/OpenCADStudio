@@ -505,7 +505,13 @@ mod loader {
             let mut host = crate::app::plugin_host::HostSession::new(app, 0);
             match manager.load(&path, &mut host) {
                 Ok(id) => out.push((id, Ok(()))),
-                Err(e) => out.push((d.id.clone(), Err(e.to_string()))),
+                Err(e) => {
+                    // Also on stderr: a headless or automation session never
+                    // sees the command-line error, and a failed load would
+                    // otherwise look like a plugin that never answered.
+                    eprintln!("[plugin] {} FAILED to load: {e}", d.id);
+                    out.push((d.id.clone(), Err(e.to_string())));
+                }
             }
         }
         MANAGER.with(|m| *m.borrow_mut() = Some(manager));

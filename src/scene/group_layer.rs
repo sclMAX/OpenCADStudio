@@ -221,8 +221,12 @@ impl Scene {
     /// Return `handles` plus every member of a selectable group containing one
     /// of them. Selection and rollover highlighting share this expansion so the
     /// preview matches what a click will select.
+    /// With PICKSTYLE group selection off a pick takes the object alone.
     pub fn handles_expanded_for_selectable_groups(&self, handles: &[Handle]) -> HashSet<Handle> {
         let mut expanded: HashSet<Handle> = handles.iter().copied().collect();
+        if self.document.header.pick_style & 1 == 0 {
+            return expanded;
+        }
         let wanted: HashSet<Handle> = handles.iter().copied().collect();
         for obj in self.document.objects.values() {
             if let ObjectType::Group(g) = obj {
@@ -232,6 +236,43 @@ impl Scene {
             }
         }
         expanded
+    }
+
+    /// How many selectable groups have a member among `handles`, under
+    /// PICKSTYLE group selection (0 when it is off).
+    pub fn selectable_groups_touching(&self, handles: &[Handle]) -> usize {
+        if self.document.header.pick_style & 1 == 0 {
+            return 0;
+        }
+        let wanted: HashSet<Handle> = handles.iter().copied().collect();
+        self.groups()
+            .filter(|group| group.selectable && group.entities.iter().any(|e| wanted.contains(e)))
+            .count()
+    }
+
+    /// Selectable groups picked whole (PICKSTYLE picks groups and every
+    /// member is selected), each with the extents of its members.
+    pub fn selected_whole_groups(&self) -> Vec<(Vec<Handle>, glam::DVec3, glam::DVec3)> {
+        if self.document.header.pick_style & 1 == 0 {
+            return Vec::new();
+        }
+        self.groups()
+            .filter(|group| {
+                group.selectable
+                    && !group.entities.is_empty()
+                    && group.entities.iter().all(|h| self.selected.contains(h))
+            })
+            .filter_map(|group| {
+                let mut min = glam::DVec3::splat(f64::INFINITY);
+                let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
+                for entity in group.entities.iter().filter_map(|h| self.document.get_entity(*h)) {
+                    let (a, b) = crate::scene::convert::tess::entity_bounds_in(&self.document, entity);
+                    min = min.min(glam::DVec3::from_array(a));
+                    max = max.max(glam::DVec3::from_array(b));
+                }
+                (min.is_finite() && max.is_finite()).then(|| (group.entities.clone(), min, max))
+            })
+            .collect()
     }
 
     /// If any handle belongs to a selectable group, also select every member.

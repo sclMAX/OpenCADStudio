@@ -161,6 +161,12 @@ impl V4Connection {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // Always logged: the process may still run after the
+                // connection is marked dead, and this is the only record.
+                eprintln!(
+                    "[plugin] V4 call deadline expired: request={kind} timeout={timeout:?} \
+                     (marking the connection dead)"
+                );
                 self.shared.alive.store(false, Ordering::SeqCst);
                 return Err(PluginError::CallTimeout {
                     request: kind,
@@ -207,6 +213,10 @@ impl V4Connection {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "[plugin] V4 call recv timed out: request={kind} timeout={timeout:?} \
+                         (marking the connection dead)"
+                    );
                     self.shared.alive.store(false, Ordering::SeqCst);
                     return Err(PluginError::CallTimeout {
                         request: kind,
@@ -214,6 +224,10 @@ impl V4Connection {
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!(
+                        "[plugin] V4 reader thread disconnected: request={kind} \
+                         (marking the connection dead)"
+                    );
                     self.shared.alive.store(false, Ordering::SeqCst);
                     return Err(PluginError::Runner("V4 reader thread disconnected".into()));
                 }

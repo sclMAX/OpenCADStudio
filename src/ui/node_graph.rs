@@ -57,9 +57,19 @@ pub enum ObjectKind {
     Leader,
     Tolerance,
     Wipeout,
+    Hatch,
+    MLine,
+    MultiLeader,
+    Helix,
+    AttributeDefinition,
+    Table,
+    Polyline2D,
+    Mesh,
+    PolygonMesh,
+    PolyfaceMesh,
 }
 
-const OBJECTS: &[ObjectKind] = &[
+pub(crate) const OBJECTS: &[ObjectKind] = &[
     ObjectKind::Object,
     ObjectKind::Line,
     ObjectKind::Circle,
@@ -78,6 +88,16 @@ const OBJECTS: &[ObjectKind] = &[
     ObjectKind::Leader,
     ObjectKind::Tolerance,
     ObjectKind::Wipeout,
+    ObjectKind::Hatch,
+    ObjectKind::MLine,
+    ObjectKind::MultiLeader,
+    ObjectKind::Helix,
+    ObjectKind::AttributeDefinition,
+    ObjectKind::Table,
+    ObjectKind::Polyline2D,
+    ObjectKind::Mesh,
+    ObjectKind::PolygonMesh,
+    ObjectKind::PolyfaceMesh,
 ];
 
 /// Every object node type, in palette order.
@@ -107,6 +127,16 @@ impl ObjectKind {
             ObjectKind::Leader => "Leader",
             ObjectKind::Tolerance => "Tolerance",
             ObjectKind::Wipeout => "Wipeout",
+            ObjectKind::Hatch => "Hatch",
+            ObjectKind::MLine => "Multiline",
+            ObjectKind::MultiLeader => "Multileader",
+            ObjectKind::Helix => "Helix",
+            ObjectKind::AttributeDefinition => "Attribute Definition",
+            ObjectKind::Table => "Table",
+            ObjectKind::Polyline2D => "2D Polyline",
+            ObjectKind::Mesh => "Mesh",
+            ObjectKind::PolygonMesh => "Polygon Mesh",
+            ObjectKind::PolyfaceMesh => "Polyface Mesh",
         }
     }
 
@@ -136,6 +166,16 @@ impl ObjectKind {
                 | (ObjectKind::Leader, EntityType::Leader(_))
                 | (ObjectKind::Tolerance, EntityType::Tolerance(_))
                 | (ObjectKind::Wipeout, EntityType::Wipeout(_))
+                | (ObjectKind::Hatch, EntityType::Hatch(_))
+                | (ObjectKind::MLine, EntityType::MLine(_))
+                | (ObjectKind::MultiLeader, EntityType::MultiLeader(_))
+                | (ObjectKind::Helix, EntityType::Helix(_))
+                | (ObjectKind::AttributeDefinition, EntityType::AttributeDefinition(_))
+                | (ObjectKind::Table, EntityType::Table(_))
+                | (ObjectKind::Polyline2D, EntityType::Polyline2D(_))
+                | (ObjectKind::Mesh, EntityType::Mesh(_))
+                | (ObjectKind::PolygonMesh, EntityType::PolygonMesh(_))
+                | (ObjectKind::PolyfaceMesh, EntityType::PolyfaceMesh(_))
         )
     }
 
@@ -159,6 +199,16 @@ impl ObjectKind {
             ObjectKind::Leader => "LEADER",
             ObjectKind::Tolerance => "TOLERANCE",
             ObjectKind::Wipeout => "WIPEOUT",
+            ObjectKind::Hatch => "HATCH",
+            ObjectKind::MLine => "MLINE",
+            ObjectKind::MultiLeader => "MLEADER",
+            ObjectKind::Helix => "HELIX",
+            ObjectKind::AttributeDefinition => "ATTDEF",
+            ObjectKind::Table => "TABLE",
+            ObjectKind::Polyline2D => "PLINE",
+            ObjectKind::Mesh => "MESH",
+            ObjectKind::PolygonMesh => "3DMESH",
+            ObjectKind::PolyfaceMesh => "PFACE",
         }
     }
 
@@ -167,8 +217,9 @@ impl ObjectKind {
         self != ObjectKind::Object
     }
 
-    /// The entity a new node starts from; `None` for `Object`.
-    pub fn entity(self) -> Option<EntityType> {
+    /// The entity a new node starts from; `None` for `Object`. Styles and
+    /// patterns come from `document`, as the commands take them.
+    pub fn entity(self, document: &codec::Document) -> Option<EntityType> {
         use codec::entities as e;
         use codec::types::{Vector2, Vector3};
         let origin = Vector3::new(0.0, 0.0, 0.0);
@@ -234,9 +285,138 @@ impl ObjectKind {
                 EntityType::Tolerance(e::Tolerance::with_text(origin, "{\\Fgdt;j}%%v0.1"))
             }
             ObjectKind::Wipeout => EntityType::Wipeout(e::Wipeout::rectangular(origin, 10.0, 5.0)),
+            // A solid fill over a rectangle; pattern, scale and angle are rows.
+            ObjectKind::Hatch => crate::entity_creation::build_entity(
+                &serde_json::json!({
+                    "type": "HATCH",
+                    "boundary": [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]],
+                    "solid": true,
+                }),
+                Some(document),
+            )
+            .ok()?,
+            // Two vertices in the current multiline style, scale and justification.
+            ObjectKind::MLine => {
+                let header = &document.header;
+                let (handle, style) = document
+                    .objects
+                    .iter()
+                    .find_map(|(handle, object)| match object {
+                        codec::objects::ObjectType::MLineStyle(style)
+                            if style.name.eq_ignore_ascii_case(&header.multiline_style) =>
+                        {
+                            Some((Some(*handle), style.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| (None, codec::objects::MLineStyle::standard()));
+                crate::modules::draw::draw::mline::build_mline(
+                    &[glam::DVec3::ZERO, glam::DVec3::new(10.0, 0.0, 0.0)],
+                    header.multiline_scale,
+                    codec::entities::MLineJustification::from(header.multiline_justification),
+                    false,
+                    &style,
+                    handle,
+                )
+            }
+            // One leader with MText content, in the current multileader style.
+            ObjectKind::MultiLeader => {
+                let name = &document.header.current_mleader_style_name;
+                let style = document.objects.iter().find_map(|(handle, object)| match object {
+                    codec::objects::ObjectType::MultiLeaderStyle(style)
+                        if style.name.eq_ignore_ascii_case(name) =>
+                    {
+                        let mut style = style.clone();
+                        style.handle = *handle;
+                        Some(style)
+                    }
+                    _ => None,
+                });
+                EntityType::MultiLeader(Box::new(
+                    crate::modules::annotate::mleader_cmd::build_mleader(
+                        "MText",
+                        &[glam::DVec3::ZERO, glam::DVec3::new(10.0, 5.0, 0.0)],
+                        None,
+                        glam::Mat4::IDENTITY,
+                        style.as_ref(),
+                        1.0,
+                    ),
+                ))
+            }
+            // The HELIX defaults (radius, turns, direction) about the Z axis.
+            ObjectKind::Helix => crate::modules::draw::draw::helix::HelixCommand::new()
+                .build(10.0, glam::DVec3::Z)?,
+            ObjectKind::AttributeDefinition => EntityType::AttributeDefinition(
+                e::AttributeDefinition::new("TAG".into(), "Value".into(), String::new()),
+            ),
+            // Four rows by three columns in the current table style.
+            ObjectKind::Table => {
+                let mut table = e::TableBuilder::new(4, 3).at(origin).build();
+                let name = &document.header.current_table_style_name;
+                table.table_style_handle = document.objects.iter().find_map(|(handle, object)| {
+                    matches!(object, codec::objects::ObjectType::TableStyle(style)
+                        if style.name.eq_ignore_ascii_case(name))
+                    .then_some(*handle)
+                });
+                EntityType::Table(Box::new(table))
+            }
+            ObjectKind::Polyline2D => {
+                let mut polyline = e::Polyline2D::new();
+                for (x, y) in [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)] {
+                    polyline.add_vertex(e::Vertex2D::new(point(x, y)));
+                }
+                EntityType::Polyline2D(polyline)
+            }
+            // A 10-unit cube.
+            ObjectKind::Mesh => EntityType::Mesh(
+                e::MeshBuilder::new()
+                    .vertices(&CUBE.map(|[x, y, z]| Vector3::new(x * 10.0, y * 10.0, z * 10.0)))
+                    .face(vec![0, 3, 2, 1])
+                    .face(vec![4, 5, 6, 7])
+                    .face(vec![0, 1, 5, 4])
+                    .face(vec![1, 2, 6, 5])
+                    .face(vec![2, 3, 7, 6])
+                    .face(vec![3, 0, 4, 7])
+                    .compute_edges()
+                    .build(),
+            ),
+            // A 3 x 3 grid over 10 x 10.
+            ObjectKind::PolygonMesh => {
+                let mut mesh = e::PolygonMeshEntity::new();
+                mesh.m_vertex_count = 3;
+                mesh.n_vertex_count = 3;
+                mesh.vertices = (0..9)
+                    .map(|i| e::PolygonMeshVertex::at(point(5.0 * (i / 3) as f64, 5.0 * (i % 3) as f64)))
+                    .collect();
+                EntityType::PolygonMesh(mesh)
+            }
+            // The faces of a 10-unit cube.
+            ObjectKind::PolyfaceMesh => {
+                let mut mesh = e::PolyfaceMesh::new();
+                let v: Vec<i16> = CUBE
+                    .iter()
+                    .map(|[x, y, z]| mesh.add_vertex_xyz(x * 10.0, y * 10.0, z * 10.0))
+                    .collect();
+                for [a, b, c, d] in [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]] {
+                    mesh.add_quad(v[a], v[b], v[c], v[d]);
+                }
+                EntityType::PolyfaceMesh(mesh)
+            }
         })
     }
 }
+
+/// A unit cube's corners: bottom face, then top face.
+const CUBE: [[f64; 3]; 8] = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 1.0, 1.0],
+];
 
 /// What a palette entry adds.
 #[derive(Clone, Copy, Debug)]
@@ -316,6 +496,9 @@ pub struct Graph {
     /// Objects the last evaluation edited in place, with their prior state,
     /// in edit order. The next evaluation restores them first.
     pub applied: Vec<(Handle, EntityType)>,
+    /// History records (solid construction history) the last evaluation's
+    /// operations changed, with their prior state; restored with `applied`.
+    pub applied_records: Vec<(Handle, codec::objects::ObjectType)>,
     /// Objects the last evaluation's operations created; the next one
     /// erases them first.
     pub created: Vec<Handle>,

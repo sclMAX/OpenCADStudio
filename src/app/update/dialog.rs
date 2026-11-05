@@ -45,7 +45,7 @@ impl OpenCADStudio {
             .and_then(|path| path.extension())
             .and_then(|ext| ocs_save::external_format(&ext.to_string_lossy()));
         self.save_dialog_format = if let Some(converter) = converter {
-            converter.name().to_string()
+            ocs_save::external_format_label(converter).to_string()
         } else if let Some(path) = &self.tabs[tab_idx].current_path {
             let document = &self.tabs[tab_idx].scene.document;
             let is_dxf = crate::io::source_is_dxf(Some(path), document);
@@ -84,7 +84,7 @@ impl OpenCADStudio {
 
     pub(in crate::app) fn close_save_dialog_window(&mut self) -> Task<Message> {
         self.aec_drop_acknowledged = false;
-        if self.active_modal == Some(crate::app::ModalKind::SaveDialog) {
+        if self.focus_dialog(crate::app::ModalKind::SaveDialog) {
             self.active_modal = None;
             self.reset_modal_geometry();
         }
@@ -112,7 +112,7 @@ impl OpenCADStudio {
     }
 
     pub(in crate::app) fn close_unsaved_dialog_window(&mut self) -> Task<Message> {
-        if self.active_modal == Some(crate::app::ModalKind::Unsaved) {
+        if self.focus_dialog(crate::app::ModalKind::Unsaved) {
             self.active_modal = None;
             self.reset_modal_geometry();
         }
@@ -132,10 +132,8 @@ impl OpenCADStudio {
                 .push_info(crate::t!("No drawing open — use New or Open first.").as_ref());
             return Task::none();
         }
-        // Dismiss any open dropdown / collapsed-panel flyout on tool use,
-        // and remember this tool as its panel's last-used one.
+        // Dismiss any open dropdown / collapsed-panel flyout on tool use.
         self.ribbon.close_dropdown();
-        self.ribbon.note_panel_tool(&tool_id);
         self.ribbon.activate_tool(&tool_id);
         match event {
             // `dispatch_command` turns a one-shot tool's highlight off
@@ -246,6 +244,10 @@ impl OpenCADStudio {
                         self.active_tab = self.tabs.len() - 1;
                     }
                 }
+                // Discarded for good: the positions this drawing had placed
+                // go with it, so a later drawing cannot inherit them.
+                crate::modules::draw::draw::attdef::session().forget_place_of(tab_id);
+                crate::modules::annotate::text::forget_place_of(tab_id);
                 // The active tab is now a fresh blank or a
                 // different existing tab; sync ribbon chips so
                 // they don't keep showing the discarded tab's
@@ -745,6 +747,14 @@ impl OpenCADStudio {
         self.tabs[i].scene.populate_meshes_from_document();
         self.refresh_layer_panel();
         self.tabs[i].dirty = true;
+        if i == self.active_tab {
+            // The selection often survives these edits — a transform, an
+            // attribute change, an erase of other handles — so both surfaces
+            // built from it describe geometry the document no longer has
+            // unless they are rebuilt here. The panel rebuild carries the
+            // grip refresh.
+            self.refresh_properties();
+        }
     }
 
     /// Execute a toolbar [`XrefPaletteOp`] on the palette's actionable

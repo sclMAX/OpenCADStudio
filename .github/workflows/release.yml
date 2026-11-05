@@ -41,7 +41,17 @@ jobs:
   build-appimage:
     # `macos` rebuilds only the dmg of an existing release.
     if: inputs.target != 'macos'
-    runs-on: ubuntu-22.04
+    # x86_64 and ARM64 each build natively; the x86_64 payload also feeds
+    # the snap.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
 
@@ -68,7 +78,7 @@ jobs:
           sudo apt-get install -y \
             libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxkbcommon-dev libwayland-dev libfontconfig1-dev libfreetype6-dev \
-            librsvg2-bin fuse libfuse2
+            librsvg2-bin fuse libfuse2 zsync
 
       - name: Build
         env:
@@ -88,9 +98,11 @@ jobs:
             -o AppDir/usr/share/icons/hicolor/256x256/apps/io.github.HakanSeven12.OpenCadStudio.png
 
       - name: Pack shared Linux payload
+        if: matrix.arch == 'x86_64'
         run: tar -C AppDir -czf linux-payload.tar.gz usr
 
       - name: Upload shared Linux payload
+        if: matrix.arch == 'x86_64'
         uses: actions/upload-artifact@v4
         with:
           name: linux-payload
@@ -100,28 +112,38 @@ jobs:
 
       - name: Download linuxdeploy
         run: |
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+          chmod +x linuxdeploy-${{ matrix.arch }}.AppImage
 
+      # The AppImage carries update information so AppImageUpdate and
+      # similar tools can delta-update it from the matching .zsync file.
+      # The .zsync records the AppImage's file name, so it is built under
+      # the name it is uploaded as.
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
+          ASSET: OpenCADStudio-${{ env.RELEASE_TAG || 'dev' }}-linux-${{ matrix.arch }}.AppImage
+          UPDATE_INFO: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|OpenCADStudio-*-linux-${{ matrix.arch }}.AppImage.zsync
         run: |
-          ./linuxdeploy-x86_64.AppImage \
+          export OUTPUT="$ASSET" LDAI_OUTPUT="$ASSET"
+          export UPDATE_INFORMATION="$UPDATE_INFO" LDAI_UPDATE_INFORMATION="$UPDATE_INFO"
+          ./linuxdeploy-${{ matrix.arch }}.AppImage \
             --appdir AppDir \
             --desktop-file AppDir/usr/share/applications/io.github.HakanSeven12.OpenCadStudio.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/io.github.HakanSeven12.OpenCadStudio.png \
             --output appimage
-          mv Open*CAD*Studio*.AppImage OpenCADStudio.AppImage
+          test -f "$ASSET"
+          test -f "$ASSET.zsync" || echo "::warning::no $ASSET.zsync produced"
 
       - name: Upload AppImage to release
         if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ASSET=OpenCADStudio-${{ env.RELEASE_TAG }}-linux-x86_64.AppImage
-          mv OpenCADStudio.AppImage "$ASSET"
-          gh release upload ${{ env.RELEASE_TAG }} "$ASSET" --clobber --repo ${{ github.repository }}
+          ASSET=OpenCADStudio-${{ env.RELEASE_TAG }}-linux-${{ matrix.arch }}.AppImage
+          FILES=("$ASSET")
+          [ -f "$ASSET.zsync" ] && FILES+=("$ASSET.zsync")
+          gh release upload ${{ env.RELEASE_TAG }} "${FILES[@]}" --clobber --repo ${{ github.repository }}
 
   build-snap:
     needs: build-appimage
@@ -202,6 +224,18 @@ jobs:
 
   build-windows:
     if: (github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all') && inputs.target != 'macos'
+    # ARM64 is cross-built on the x64 runner, which carries the MSVC ARM64
+    # tools, clang and WiX.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            wix_arch: x64
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            wix_arch: arm64
     runs-on: windows-latest
     permissions:
       contents: write
@@ -227,6 +261,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Convert SVG icon to ICO
         shell: pwsh
@@ -254,8 +290,12 @@ jobs:
           OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         shell: bash
         run: |
-          cargo build --locked --release
-          cargo build --locked --release -p dwg-thumbnailer-win
+          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }} -p dwg-thumbnailer-win
+          # Later steps read the build from the host layout.
+          mkdir -p target/release
+          cp target/${{ matrix.target }}/release/OpenCADStudio.exe target/release/
+          cp target/${{ matrix.target }}/release/dwg_thumbnailer_win.dll target/release/
 
       # Forks do not inherit repository secrets, so every signing step is
       # gated on its credentials being present and the pipeline falls through:
@@ -309,6 +349,10 @@ jobs:
       - name: Build MSI installer
         shell: pwsh
         run: |
+          # The package template comes from this workflow's commit, so an
+          # older tag rebuilt here gets the ARM64-capable one.
+          git fetch --no-tags --depth=1 origin ${{ github.workflow_sha }}
+          git show FETCH_HEAD:packaging/windows/main.wxs | Set-Content -Encoding utf8 packaging/windows/main.wxs
           $version = "${{ steps.version.outputs.msi }}"
           $candle = Join-Path $env:WIX "bin\candle.exe"
           $light  = Join-Path $env:WIX "bin\light.exe"
@@ -319,14 +363,16 @@ jobs:
           # main.wxs holds the package/feature; ui.wxs holds the installer UI
           # and finish-screen launch checkbox. Both compile together.
           $mainWxs  = (Resolve-Path packaging\windows\main.wxs).Path
+          $dllPath  = (Resolve-Path target\release\dwg_thumbnailer_win.dll).Path
           $uiWxs     = (Resolve-Path packaging\windows\ui.wxs).Path
           # candle writes one .wixobj per source into this directory (the
           # trailing slash tells it -out is a folder, not a single file).
           $objDir   = Join-Path $PWD "packaging\windows\"
           $msiPath  = Join-Path $PWD "OpenCADStudio.msi"
-          & $candle -arch x64 `
+          & $candle -arch ${{ matrix.wix_arch }} `
             "-dVersion=$version" `
             "-dSource=$exePath" `
+            "-dThumbDll=$dllPath" `
             "-dIcon=$iconPath" `
             "-dLicense=$licensePath" `
             $mainWxs $uiWxs `
@@ -382,8 +428,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ env.RELEASE_TAG }}"
-          $exe = "OpenCADStudio-$tag-windows-x86_64-portable.exe"
-          $msi = "OpenCADStudio-$tag-windows-x86_64-installer.msi"
+          $exe = "OpenCADStudio-$tag-windows-${{ matrix.arch }}-portable.exe"
+          $msi = "OpenCADStudio-$tag-windows-${{ matrix.arch }}-installer.msi"
           Move-Item target\release\OpenCADStudio.exe $exe
           Move-Item OpenCADStudio.msi $msi
           gh release upload $tag `
@@ -392,7 +438,19 @@ jobs:
 
   build-macos:
     if: github.event_name == 'release' || inputs.tag != '' || inputs.target == 'all' || inputs.target == 'macos'
-    runs-on: macos-14    # Apple Silicon (arm64) only
+    # Both builds run on the Apple Silicon runner; Intel is cross-built and
+    # checked under Rosetta.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            swift: arm64-apple-macos11
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            swift: x86_64-apple-macos11
+    runs-on: macos-15
     permissions:
       contents: write
 
@@ -413,7 +471,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Install librsvg (for rsvg-convert)
         env:
@@ -424,11 +482,11 @@ jobs:
         env:
           OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
         run: |
-          cargo build --locked --release --target aarch64-apple-darwin
-          cargo build --locked --release --target aarch64-apple-darwin -p dwg-thumbnailer
+          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }} -p dwg-thumbnailer
           # The launcher shim is the .app's actual CFBundleExecutable (#1039)
           # — see src/bin/ocs_launcher.rs for why.
-          cargo build --locked --release --target aarch64-apple-darwin --bin ocs_launcher
+          cargo build --locked --release --target ${{ matrix.target }} --bin ocs_launcher
 
       - name: Build .icns from SVG
         run: |
@@ -469,12 +527,12 @@ jobs:
           rm -rf "$EXT"; mkdir -p "$EXT/Contents/MacOS"
           swiftc \
             -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
-            -target arm64-apple-macos11 \
+            -target ${{ matrix.swift }} \
             -O -parse-as-library -application-extension \
             -module-name DWGThumbnail \
             -import-objc-header crates/dwg-thumbnailer/macos/dwg_thumbnailer.h \
             crates/dwg-thumbnailer/macos/ThumbnailProvider.swift \
-            -L target/aarch64-apple-darwin/release -ldwg_thumbnailer \
+            -L target/${{ matrix.target }}/release -ldwg_thumbnailer \
             -framework QuickLookThumbnailing -framework CoreGraphics \
             -framework ImageIO -framework Foundation -framework Security \
             -framework SystemConfiguration -liconv \
@@ -488,8 +546,8 @@ jobs:
           rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/PlugIns"
           # Finder opens the launcher, which relays files to the sibling GUI.
-          cp target/aarch64-apple-darwin/release/ocs_launcher "$APP/Contents/MacOS/OpenCADStudio"
-          cp target/aarch64-apple-darwin/release/OpenCADStudio "$APP/Contents/MacOS/OpenCADStudio-App"
+          cp target/${{ matrix.target }}/release/ocs_launcher "$APP/Contents/MacOS/OpenCADStudio"
+          cp target/${{ matrix.target }}/release/OpenCADStudio "$APP/Contents/MacOS/OpenCADStudio-App"
           chmod +x "$APP/Contents/MacOS/OpenCADStudio" "$APP/Contents/MacOS/OpenCADStudio-App"
           cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
           cp DWG.icns DXF.icns "$APP/Contents/Resources/"
@@ -507,7 +565,7 @@ jobs:
             > plugins/opencad-python/tools/stage-bundled.sh
           bash plugins/opencad-python/tools/stage-bundled.sh \
             "$APP/Contents/Resources/plugins/opencad.python" \
-            --target aarch64-apple-darwin
+            --target ${{ matrix.target }}
           # QuickLook thumbnail extension.
           cp -R DWGThumbnail.appex "$APP/Contents/PlugIns/"
           # Substitute version into Info.plist.
@@ -527,11 +585,27 @@ jobs:
           codesign -d --entitlements - --xml OpenCADStudio.app/Contents/PlugIns/DWGThumbnail.appex \
             | python3 -c 'import io, plistlib, sys; ent = plistlib.load(io.BytesIO(sys.stdin.buffer.read())); print("entitlements:", ent); assert ent.get("com.apple.security.app-sandbox") is True'
 
+      # The check script comes from the workflow's own commit, so rebuilding
+      # an older tag runs today's check rather than the one it shipped with.
+      - name: Checkout check scripts
+        uses: actions/checkout@v4
+        with:
+          path: ci-scripts
+          sparse-checkout: docs/automation
+
       # Exercise CFBundleExecutable, not just the inner application: the
       # Finder launcher must preserve --mcp and the client's stdio pipes.
+      - name: Install Rosetta for the Intel build's checks
+        if: matrix.arch == 'x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
       - name: Verify packaged MCP handshake
-        timeout-minutes: 2
-        run: python3 docs/automation/mcp_handshake.py OpenCADStudio.app/Contents/MacOS/OpenCADStudio
+        timeout-minutes: 5
+        env:
+          # Rosetta translates the Intel build on its first start, which
+          # takes far longer than a native start.
+          OCS_HANDSHAKE_TIMEOUT: ${{ matrix.arch == 'x86_64' && '180' || '10' }}
+        run: python3 ci-scripts/docs/automation/mcp_handshake.py OpenCADStudio.app/Contents/MacOS/OpenCADStudio
 
       # Stage the app beside an /Applications symlink so the mounted image
       # offers drag-to-install (#769), matching packaging/build_macos_signed.sh.
@@ -571,7 +645,7 @@ jobs:
         if: env.RELEASE_TAG == ''
         uses: actions/upload-artifact@v4
         with:
-          name: OpenCADStudio-macos-arm64-dmg
+          name: OpenCADStudio-macos-${{ matrix.arch }}-dmg
           path: OpenCADStudio.dmg
           if-no-files-found: error
 
@@ -580,7 +654,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ASSET=OpenCADStudio-${{ env.RELEASE_TAG }}-macos-arm64.dmg
+          ASSET=OpenCADStudio-${{ env.RELEASE_TAG }}-macos-${{ matrix.arch }}.dmg
           mv OpenCADStudio.dmg "$ASSET"
           gh release upload ${{ env.RELEASE_TAG }} "$ASSET" --clobber --repo ${{ github.repository }}
 
@@ -589,9 +663,9 @@ jobs:
         run: |
           VERSION="${{ env.RELEASE_TAG }}"
           VERSION="${VERSION#v}"
-          SHA=$(shasum -a 256 OpenCADStudio-${{ env.RELEASE_TAG }}-macos-arm64.dmg | awk '{print $1}')
+          SHA=$(shasum -a 256 OpenCADStudio-${{ env.RELEASE_TAG }}-macos-${{ matrix.arch }}.dmg | awk '{print $1}')
           {
-            echo "## Homebrew cask bump"
+            echo "## Homebrew cask bump (${{ matrix.arch }})"
             echo "Update \`packaging/homebrew/open-cad-studio.rb\`:"
             echo '```ruby'
             echo "  version \"$VERSION\""

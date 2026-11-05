@@ -372,10 +372,13 @@ pub fn whole_text_field(document: &Document, host: Handle) -> Option<(String, Ve
         .values()
         .filter(|field| field.owner == container.handle);
     let child = children.next()?;
-    children
-        .next()
-        .is_none()
-        .then(|| (child.code.clone(), child.objects.clone()))
+    if children.next().is_some() {
+        return None;
+    }
+    // Operands the field holds as fields of their own come back written in
+    // its code.
+    codec::fields::inline_code(document, child.handle)
+        .or_else(|| Some((child.code.clone(), child.objects.clone())))
 }
 
 /// Attach `field` (its code and referenced objects) to `host`, showing
@@ -396,6 +399,24 @@ pub fn set_text_field(
             document.remove_text_field(host);
         }
     }
+}
+
+/// The regional currency symbol (the default a Currency table cell
+/// format starts with); `$` where the system does not tell.
+pub(crate) fn os_currency_symbol() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Globalization::GetLocaleInfoEx;
+        let mut buffer = [0u16; 16];
+        // LOCALE_SCURRENCY of the user's default locale.
+        let len = unsafe {
+            GetLocaleInfoEx(std::ptr::null(), 0x14, buffer.as_mut_ptr(), buffer.len() as i32)
+        };
+        if len > 1 {
+            return String::from_utf16_lossy(&buffer[..len as usize - 1]);
+        }
+    }
+    "$".to_string()
 }
 
 /// Month and day names and the regional date / time pictures, as date

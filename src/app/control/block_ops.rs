@@ -283,6 +283,62 @@ pub(crate) fn resolve_effective_block(
     (raw_name.clone(), evaluated_handle, evaluated_handle)
 }
 
+/// Drop the evaluated-copy link an INSERT carries, so it resolves through the
+/// block record its name points at again. Both readers rebuild the link from
+/// the representation-data objects reachable through the insert's extension
+/// dictionary, so the link has to leave the drawing as well as the in-memory
+/// resolution map; the insert's own copy of the reference tag goes too. The
+/// rest of the extension data is left alone.
+pub(crate) fn detach_representation(doc: &mut Document, insert: Handle) {
+    let app = doc
+        .app_ids
+        .get(REPRESENTATION_TAG)
+        .map(|app| app.handle.value());
+    if let Some(EntityType::Insert(reference)) = doc.get_entity_mut(insert) {
+        reference
+            .common
+            .extended_data
+            .remove_record(REPRESENTATION_TAG);
+        if let Some(app) = app {
+            reference
+                .common
+                .extended_data
+                .raw_dwg_eed
+                .retain(|(owner, _)| *owner != app);
+        }
+    }
+    let Some(holder) = doc.extension_dictionary_handle(insert) else {
+        return;
+    };
+    let link = match doc.objects.get(&holder) {
+        Some(ObjectType::Dictionary(dictionary)) => dictionary
+            .entries
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("AcDbBlockRepresentation"))
+            .map(|(_, handle)| *handle),
+        _ => None,
+    };
+    if let Some(link) = link {
+        let owned: Vec<Handle> = doc
+            .objects
+            .keys()
+            .copied()
+            .filter(|handle| *handle != link && doc.owner_chain_reaches(*handle, link))
+            .collect();
+        for handle in owned {
+            doc.block_representations.remove(&handle);
+            doc.objects.remove(&handle);
+        }
+        doc.block_representations.remove(&link);
+        doc.objects.remove(&link);
+        if let Some(ObjectType::Dictionary(dictionary)) = doc.objects.get_mut(&holder) {
+            dictionary
+                .entries
+                .retain(|(key, _)| !key.eq_ignore_ascii_case("AcDbBlockRepresentation"));
+        }
+    }
+}
+
 /// Case-insensitive wildcard glob matcher supporting `*` and `?`.
 pub(crate) fn glob_match_ci(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
@@ -735,9 +791,14 @@ impl OpenCADStudio {
                 PropValue::BlockChoice {
                     selected, options, ..
                 } => {
-                    if let Some(opt) = options.get(selected) {
-                        dyn_props.insert(prop.label, json!(opt));
-                    }
+                    // A row that matches nothing stays in the panel as a
+                    // choice without a current option, so it stays here too:
+                    // `null` means present and unmatched, a missing key means
+                    // the definition has no such property.
+                    dyn_props.insert(
+                        prop.label,
+                        options.get(selected).map_or(Value::Null, |opt| json!(opt)),
+                    );
                 }
                 PropValue::Choice { selected, .. } | PropValue::ChoiceWithTooltip { selected, .. } => {
                     dyn_props.insert(prop.label, json!(selected));
@@ -830,10 +891,16 @@ impl OpenCADStudio {
             .iter()
             .any(|p| p.starts_with('*') && p.len() > 1 && p.chars().nth(1) != Some('*'));
 
-        let scope = req
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("active_space");
+        // A block-editing session makes the definition the active space, so
+        // the default scope would report only the inserts nested inside it.
+        // An unscoped read during a session answers for the whole document.
+        let scope = req.get("scope").and_then(Value::as_str).unwrap_or(
+            if tab.active_block_edit.is_some() {
+                "all"
+            } else {
+                "active_space"
+            },
+        );
         let layer_filter = req.get("layer").and_then(Value::as_str);
 
         let handles_filter: Option<FxHashSet<Handle>> = if let Some(h) = req["handle"].as_str() {

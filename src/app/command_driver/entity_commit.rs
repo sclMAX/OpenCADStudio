@@ -473,10 +473,7 @@ impl OpenCADStudio {
             .as_ref()
             .is_some_and(|command| command.name() == "DIM");
         if let (true, Some(handle)) = (continue_command && in_dim, committed) {
-            let overlapped = super::dim_edit::overlapping_dimensions(
-                &self.tabs[i].scene,
-                handle,
-            );
+            let overlapped = super::dim_edit::overlapping_dimensions(&self.tabs[i].scene, handle);
             if !overlapped.is_empty() {
                 let asked = self.tabs[i]
                     .active_cmd
@@ -964,6 +961,25 @@ impl OpenCADStudio {
         }
     }
 
+    /// Commit a drawn HATCH boundary; the command stays at its prompt.
+    pub(super) fn handle_commit_hatch_continue(
+        &mut self,
+        hatch: crate::scene::HatchModel,
+        entity_style: Option<(codec::types::Color, codec::types::Transparency)>,
+        message: String,
+    ) {
+        let i = self.active_tab;
+        let label = self.history_label_from_active_cmd(i, "HATCH");
+        let pending = self.begin_undo(i, label, 1, true);
+        let layer = self.tabs[i].active_layer.clone();
+        self.tabs[i].scene.add_hatch(hatch, Some(&layer), entity_style);
+        self.tabs[i].dirty = true;
+        if let Some(pd) = pending {
+            self.commit_undo_delta(i, pd);
+        }
+        self.handle_report_measurement(message);
+    }
+
     pub(super) fn handle_commit_hatches(
         &mut self,
         hatches: Vec<crate::scene::HatchModel>,
@@ -1022,6 +1038,18 @@ impl OpenCADStudio {
         let label = self.history_label_from_active_cmd(i, "EDIT");
         self.push_undo_snapshot(i, label);
         let is_dimension = matches!(entity, codec::EntityType::Dimension(_));
+        // The updated object's xdata applications must be registered, as
+        // for a new object.
+        let apps: Vec<String> = entity
+            .common()
+            .extended_data
+            .records()
+            .iter()
+            .map(|record| record.application_name.clone())
+            .collect();
+        for app in &apps {
+            self.tabs[i].scene.ensure_app_id(app);
+        }
         if let Some(current) = self.tabs[i].scene.document.get_entity_mut(handle) {
             *current = entity;
             if is_dimension {
@@ -1081,7 +1109,10 @@ impl OpenCADStudio {
             return Some(Task::none());
         }
         self.push_undo_snapshot(i, "CENTERREASSOCIATE");
-        if self.tabs[i].scene.reassociate_centerline(target, first, second) {
+        if self.tabs[i]
+            .scene
+            .reassociate_centerline(target, first, second)
+        {
             self.tabs[i].dirty = true;
         } else {
             self.command_line
@@ -1201,6 +1232,22 @@ impl OpenCADStudio {
             if let Some(cmd) = self.tabs[i].active_cmd.as_mut() {
                 cmd.attreq_set_block_base(block_base);
             }
+            // A control client answers the attribute prompts itself; a form
+            // would sit over the command it feeds.
+            let asks = self.tabs[i].scene.document.header.attribute_dialog
+                && !self.control_owns_command(i)
+                && attdefs
+                    .iter()
+                    .any(|ad| !ad.flags.constant && !ad.flags.preset);
+            let askable: Vec<codec::entities::AttributeDefinition> = if asks {
+                attdefs
+                    .iter()
+                    .filter(|ad| !ad.flags.constant && !ad.flags.preset)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let completed = self.tabs[i]
                 .active_cmd
                 .as_mut()
@@ -1219,6 +1266,10 @@ impl OpenCADStudio {
                 } else {
                     CmdResult::CommitAndExit(entity)
                 }));
+            }
+            if asks {
+                self.open_insert_attr_dialog(&block_name, &askable);
+                return None;
             }
             let prompt = self.tabs[i].active_cmd.as_ref().map(|c| c.prompt());
             if let Some(p) = prompt {

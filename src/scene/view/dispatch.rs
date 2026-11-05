@@ -70,6 +70,16 @@ pub fn properties_sectioned(
     entity: &EntityType,
     text_style_names: &[String],
 ) -> Vec<PropSection> {
+    // Picked table cells: General keeps only Transparency, then the cells.
+    if matches!(entity, EntityType::Table(_))
+        && crate::entities::table::prop_cell_range().is_some()
+    {
+        let mut general = properties::general_section(entity);
+        general.props.retain(|property| property.field == "transparency");
+        let mut sections = vec![general];
+        sections.extend(entity.geometry_properties(text_style_names));
+        return sections;
+    }
     let mut sections = vec![properties::general_section(entity)];
     if let Some(viz) = properties::visualization_section(entity) {
         sections.push(viz);
@@ -89,12 +99,13 @@ pub fn properties_sectioned(
                     || property.field == "sl_thickness"
                     || property.label == crate::t!("Thickness").as_ref()
             });
+        // The reference lists an object's thickness as the last General row.
         if !already_present {
-            if let Some(geometry) = sections
+            if let Some(general) = sections
                 .iter_mut()
-                .find(|section| section.title == crate::t!("Geometry").as_ref())
+                .find(|section| section.title == crate::t!("General").as_ref())
             {
-                geometry.props.push(crate::entities::common::edit_prop(
+                general.props.push(crate::entities::common::edit_prop(
                     crate::t!("Thickness").as_ref(),
                     "thickness",
                     thickness,
@@ -421,24 +432,19 @@ mod tests {
     use codec::types::Vector3;
 
     #[test]
-    fn line_thickness_follows_the_entity_geometry_rows() {
+    fn line_thickness_is_the_last_general_row() {
         let mut line = codec::entities::Line::from_points(Vector3::ZERO, Vector3::UNIT_X);
         line.thickness = 2.5;
         let sections = properties_sectioned(Handle::NULL, &EntityType::Line(line), &[]);
 
-        assert!(!sections[0]
-            .props
-            .iter()
-            .any(|property| property.field == "thickness"));
-        let geometry = sections
-            .iter()
-            .find(|section| {
-                section
-                    .props
-                    .iter()
-                    .any(|property| property.field == "start_x")
-            })
-            .unwrap();
-        assert_eq!(geometry.props.last().unwrap().field, "thickness");
+        assert_eq!(sections[0].props.last().unwrap().field, "thickness");
+        assert_eq!(
+            sections
+                .iter()
+                .flat_map(|section| &section.props)
+                .filter(|property| property.field == "thickness")
+                .count(),
+            1
+        );
     }
 }

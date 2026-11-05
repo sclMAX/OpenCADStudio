@@ -55,6 +55,29 @@ fn object(
 ) -> Result<&ObjectType, &'static str> {
     let graph =
         super::graph(document, definition)?.ok_or("The block authoring graph is unavailable.")?;
+    belonging(document, graph, handle)
+}
+
+/// The proof a list needs: the links between the definition, its dictionary and
+/// its graph, and the node that names the parameter. The checks that decide
+/// whether a graph can be edited are not needed to say a parameter belongs to a
+/// definition, and a parameter that belongs has to be listed even when no edit
+/// can be addressed through it.
+fn listed_object(
+    document: &Document,
+    definition: Handle,
+    handle: Handle,
+) -> Result<&ObjectType, &'static str> {
+    let graph = super::listed_graph(document, definition)
+        .ok_or("The block authoring graph is unavailable.")?;
+    belonging(document, graph, handle)
+}
+
+fn belonging(
+    document: &Document,
+    graph: Handle,
+    handle: Handle,
+) -> Result<&ObjectType, &'static str> {
     let Some(ObjectType::DynamicBlock(graph_object)) = document.objects.get(&graph) else {
         return Err("The block authoring graph is unavailable.");
     };
@@ -242,6 +265,178 @@ pub(crate) fn read(
 ) -> Result<Metadata<'_>, &'static str> {
     describe(object(document, definition, handle)?)
 }
+
+/// The metadata of a parameter a definition holds, for a reader that only lists:
+/// the same text, resolved through the links rather than through the checks that
+/// decide whether the graph can be edited.
+pub(crate) fn listed_read(
+    document: &Document,
+    definition: Handle,
+    handle: Handle,
+) -> Result<Metadata<'_>, &'static str> {
+    describe(listed_object(document, definition, handle)?)
+}
+/// The authoring name a named parameter object stores on its own element.
+fn element_name(object: &ObjectType) -> Option<&String> {
+    match object {
+        ObjectType::BlockVisibilityParameter(p) => Some(&p.name),
+        ObjectType::DynamicBlock(object) => match &object.data {
+            Data::LinearParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::PolarParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::XYParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::RotationParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::FlipParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::AlignmentParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::BasePointParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::LookupParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::PointParameter(p) => Some(&p.parameter.parameter.element.name),
+            Data::UserParameter(p) => Some(&p.parameter.parameter.element.name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+fn owned_by(object: &ObjectType, graph: Handle) -> bool {
+    match object {
+        ObjectType::DynamicBlock(object) => object.owner == graph,
+        ObjectType::BlockVisibilityParameter(object) => object.owner == graph,
+        _ => false,
+    }
+}
+fn graph_nodes<'a>(
+    document: &'a Document,
+    definition: Handle,
+) -> Result<Option<(Handle, &'a [codec::objects::BlockEvaluationNode])>, &'static str> {
+    let Some(graph) = super::graph(document, definition)? else {
+        return Ok(None);
+    };
+    let Some(ObjectType::DynamicBlock(graph_object)) = document.objects.get(&graph) else {
+        return Err("The block authoring graph is unavailable.");
+    };
+    let Data::EvaluationGraph(nodes) = &graph_object.data else {
+        return Err("The block authoring graph is unavailable.");
+    };
+    Ok(Some((graph, &nodes.nodes)))
+}
+fn owned_parameter_names(
+    document: &Document,
+    definition: Handle,
+) -> Result<Vec<&String>, &'static str> {
+    let Some((graph, nodes)) = graph_nodes(document, definition)? else {
+        return Ok(Vec::new());
+    };
+    Ok(nodes
+        .iter()
+        .filter_map(|node| document.objects.get(&node.expression))
+        .filter(|object| owned_by(object, graph))
+        .filter_map(element_name)
+        .collect())
+}
+/// Whether an authoring object is a parameter of the type the placement
+/// prompts name with `prefix`.
+fn is_parameter_of_type(object: &ObjectType, prefix: &str) -> bool {
+    let ObjectType::DynamicBlock(object) = object else {
+        return false;
+    };
+    matches!(
+        (&object.data, prefix),
+        (Data::LinearParameter(_), "Linear")
+            | (Data::PolarParameter(_), "Polar")
+            | (Data::XYParameter(_), "XY")
+            | (Data::RotationParameter(_), "Rotation")
+    )
+}
+fn parameter_type_count(
+    document: &Document,
+    definition: Handle,
+    prefix: &str,
+) -> Result<usize, &'static str> {
+    let Some((graph, nodes)) = graph_nodes(document, definition)? else {
+        return Ok(0);
+    };
+    Ok(nodes
+        .iter()
+        .filter_map(|node| document.objects.get(&node.expression))
+        .filter(|object| owned_by(object, graph))
+        .filter(|object| is_parameter_of_type(object, prefix))
+        .count())
+}
+/// The name a placement prompt offers for the next parameter of a type: the
+/// type name alone for the first one, then the type name with the number of
+/// parameters of that type already placed (`Polar1` once a Polar exists).
+pub(crate) fn next_parameter_name(
+    document: &Document,
+    definition: Handle,
+    prefix: &str,
+) -> Result<String, &'static str> {
+    let names = owned_parameter_names(document, definition)?;
+    let count = parameter_type_count(document, definition, prefix)?;
+    let taken = |name: &str| names.iter().any(|old| old.eq_ignore_ascii_case(name));
+    let offered = if count == 0 {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}{count}")
+    };
+    if !taken(&offered) {
+        return Ok(offered);
+    }
+    Ok((1..)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|name| !taken(name))
+        .unwrap())
+}
+/// Rename a parameter's own element, refusing a name another parameter
+/// already uses.
+pub(crate) fn set_parameter_name(
+    document: &mut Document,
+    definition: Handle,
+    handle: Handle,
+    input: &str,
+) -> Result<bool, &'static str> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Err("Parameter name cannot be empty.");
+    }
+    if value.contains('\0') {
+        return Err("Parameter text cannot contain a null character.");
+    }
+    let old = element_name(object(document, definition, handle)?)
+        .ok_or("This authoring object has no parameter name.")?;
+    if old == value {
+        return Ok(false);
+    }
+    let Some((graph, nodes)) = graph_nodes(document, definition)? else {
+        return Err("The block authoring graph is unavailable.");
+    };
+    let taken = nodes
+        .iter()
+        .filter(|node| node.expression != handle)
+        .filter_map(|node| document.objects.get(&node.expression))
+        .filter(|object| owned_by(object, graph))
+        .filter_map(element_name)
+        .any(|name| name.eq_ignore_ascii_case(value));
+    if taken {
+        return Err("Parameter names must be unique.");
+    }
+    let Some(ObjectType::DynamicBlock(object)) = document.objects.get_mut(&handle) else {
+        return Err("The block parameter is unavailable.");
+    };
+    let name = match &mut object.data {
+        Data::LinearParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::PolarParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::XYParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::RotationParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::FlipParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::AlignmentParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::BasePointParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::LookupParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::PointParameter(p) => &mut p.parameter.parameter.element.name,
+        Data::UserParameter(p) => &mut p.parameter.parameter.element.name,
+        _ => return Err("This authoring object has no parameter name."),
+    };
+    *name = value.to_owned();
+    Ok(true)
+}
 fn text_mut(object: &mut ObjectType, field: Field) -> Option<&mut String> {
     use Field::*;
     match object {
@@ -342,6 +537,29 @@ pub(crate) fn set_text(
     }
     sync_visibility(document, handle);
     Ok(true)
+}
+pub(crate) fn set_chain(
+    document: &mut Document,
+    definition: Handle,
+    handle: Handle,
+    value: bool,
+) -> Result<bool, &'static str> {
+    object(document, definition, handle)?;
+    let Some(ObjectType::DynamicBlock(object)) = document.objects.get_mut(&handle) else {
+        return Err("This parameter has no chained-actions setting.");
+    };
+    let flag = match &mut object.data {
+        Data::PointParameter(p) => &mut p.parameter.parameter.chain_actions,
+        Data::LinearParameter(p) => &mut p.parameter.parameter.chain_actions,
+        Data::PolarParameter(p) => &mut p.parameter.parameter.chain_actions,
+        Data::XYParameter(p) => &mut p.parameter.parameter.chain_actions,
+        Data::RotationParameter(p) => &mut p.parameter.parameter.chain_actions,
+        Data::FlipParameter(p) => &mut p.parameter.parameter.chain_actions,
+        _ => return Err("This parameter has no chained-actions setting."),
+    };
+    let old = *flag;
+    *flag = value;
+    Ok(old != value)
 }
 pub(crate) fn set_visible(
     document: &mut Document,

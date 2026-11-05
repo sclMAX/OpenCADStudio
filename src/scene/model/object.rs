@@ -182,6 +182,8 @@ pub enum GripShape {
     Rectangle,
     Triangle,
     Circle,
+    /// Diamond (a table cell range's fill handle).
+    Diamond,
     /// Screen-offset menu selector.
     Dropdown,
     /// Menu selector placed immediately beside its anchor grip.
@@ -259,6 +261,8 @@ pub enum GripMenuAction {
     AddLeader,
     RemoveLeader,
     ReverseArrows,
+    /// Turn the arrowhead at this end to the other side of its line.
+    FlipArrow,
     MoveWithDimLine,
     MoveWithLeader,
     MoveIndependent,

@@ -9,7 +9,7 @@
 //     Polyline3D  → Lines
 //     Polyline    → Lines
 //     Insert      → constituent entities (via opencadcodec explode_from_document)
-//     MLine       → Lines (spine + offset lines per miter direction)
+//     MLine       → Lines (one run per style element, as drawn)
 //     Dimension   → Lines (extension + dimension + arrows) + Text
 //     MText       → Text lines
 //     Region      → Lines, Arcs, Circles, Ellipses, Splines (from ACIS B-Rep loops or wires)
@@ -139,7 +139,7 @@ fn explode_entity_in_context(
             .filter(|entity| !crate::scene::block_construction::is_construction(entity.common()))
             .map(normalize_insert_entity)
             .collect(),
-        EntityType::MLine(ml) => explode_mline(ml),
+        EntityType::MLine(ml) => explode_mline(ml, document),
         EntityType::Dimension(dim) => explode_dimension(dim, document),
         EntityType::Leader(leader) => explode_leader(leader, document),
         EntityType::MultiLeader(leader) => {
@@ -290,11 +290,46 @@ fn explode_multileader(
         .first()
         .map(|model| explode_leader_wire(model, common.clone()))
         .unwrap_or_default();
+    // The arrowheads: the leader drawn again with them and without its
+    // landing, less the runs the first pass already drew. A leader of type
+    // None draws neither, so only its content explodes.
     geometry.context.arrowhead_size = ml.context.arrowhead_size;
-    geometry.path_type = codec::entities::MultiLeaderPathType::Invisible;
     geometry.enable_landing = false;
-    if let Some(model) = tessellate(&geometry).first() {
-        pieces.extend(explode_leader_wire(model, common));
+    let arrows = tessellate(&geometry).into_iter().next();
+    if let (Some(path), Some(mut model)) = (models.first(), arrows) {
+        type Run = Vec<([f32; 3], [f32; 3])>;
+        let runs = |points: &[[f32; 3]], low: &[[f32; 3]]| -> Vec<Run> {
+            let mut out: Vec<Vec<_>> = vec![Vec::new()];
+            for (i, p) in points.iter().enumerate() {
+                if p[0].is_nan() {
+                    out.push(Vec::new());
+                } else {
+                    let l = low.get(i).copied().unwrap_or([0.0; 3]);
+                    out.last_mut().unwrap().push((*p, l));
+                }
+            }
+            out.retain(|run| !run.is_empty());
+            out
+        };
+        let drawn = runs(&path.points, &path.points_low);
+        let nan = [f32::NAN; 3];
+        let (mut points, mut points_low) = (Vec::new(), Vec::new());
+        // Each kept run follows a NaN, so the splitter treats every one as an
+        // arrow and leaves the edges its SOLID owns to the SOLID.
+        for run in runs(&model.points, &model.points_low) {
+            if drawn.contains(&run) {
+                continue;
+            }
+            points.push(nan);
+            points_low.push([0.0; 3]);
+            for (p, l) in run {
+                points.push(p);
+                points_low.push(l);
+            }
+        }
+        model.points = points;
+        model.points_low = points_low;
+        pieces.extend(explode_leader_wire(&model, common));
     }
     let ctx = &ml.context;
     // Same stored-context correction and fallback scale as MultiLeaderTess.
@@ -455,6 +490,7 @@ fn text_frame_polyline(
     use codec::entities::{mtext::DrawingDirection, LineSpacingStyle, LwVertex};
     let style = resolve_text_style(&text.style, doc);
     let layout = layout_mtext(&MTextRenderOpts {
+        layer_color: None,
         columns: Default::default(),
         value: &text.value,
         insertion: [0.0, 0.0, 0.0],
@@ -469,6 +505,7 @@ fn text_frame_polyline(
         rectangle_height: 0.0,
         vertical_text: matches!(text.drawing_direction, DrawingDirection::TopToBottom),
         want_glyph_boxes: false,
+        break_long_words: false,
     });
     let lb = layout.local_bounds;
     if lb[0] > lb[2] || lb[1] > lb[3] {
@@ -758,59 +795,53 @@ fn bulge_to_arc(
     Some(EntityType::Arc(arc))
 }
 
-fn explode_mline(ml: &MLine) -> Vec<EntityType> {
-    let n = ml.vertices.len();
-    if n < 2 {
-        return vec![];
-    }
-    let closed = ml.flags.contains(codec::entities::MLineFlags::CLOSED);
-    let scale = ml.scale_factor;
-    let n_segs = if closed { n } else { n - 1 };
-    let mut result = Vec::with_capacity(n_segs * 3);
+/// Explode a multiline into the Lines it draws. The pieces come from the same
+/// `mline_lines` the renderer uses, so they keep the style's elements and
+/// offsets, the justification, MLEDIT breaks, joints and end caps (#2538).
+fn explode_mline(ml: &MLine, doc: &Document) -> Vec<EntityType> {
+    use codec::types::Color;
 
-    // Helper: build a Line from two Vector3 positions.
-    let make_line = |common: &codec::entities::EntityCommon,
-                     s: &codec::types::Vector3,
-                     e: &codec::types::Vector3|
-     -> EntityType {
-        let mut c = common.clone();
-        c.handle = Handle::NULL;
-        EntityType::Line(LineEnt {
-            common: c,
-            start: s.clone(),
-            end: e.clone(),
-            ..LineEnt::new()
-        })
-    };
-
-    // For each segment, emit the center-spine line and the two ±scale/2 offset lines.
-    for i in 0..n_segs {
-        let v0 = &ml.vertices[i];
-        let v1 = &ml.vertices[(i + 1) % n];
-
-        // Spine line
-        result.push(make_line(&ml.common, &v0.position, &v1.position));
-
-        if scale.abs() > 1e-9 {
-            let half = scale * 0.5;
-            for &sign in &[-1.0_f64, 1.0_f64] {
-                let off = half * sign;
-                // Use miter direction at each vertex to offset the endpoints.
-                let s = Vector3::new(
-                    v0.position.x + v0.miter.x * off,
-                    v0.position.y + v0.miter.y * off,
-                    v0.position.z + v0.miter.z * off,
-                );
-                let e = Vector3::new(
-                    v1.position.x + v1.miter.x * off,
-                    v1.position.y + v1.miter.y * off,
-                    v1.position.z + v1.miter.z * off,
-                );
-                result.push(make_line(&ml.common, &s, &e));
+    let mut result = Vec::new();
+    for element in crate::entities::mline::mline_lines(ml, doc) {
+        let mut common = ml.common.clone();
+        common.handle = Handle::NULL;
+        // ByLayer / ByBlock elements show in the multiline's own colour and
+        // linetype; an explicit element value carries over to its lines.
+        if !matches!(element.color, Color::ByLayer | Color::ByBlock) {
+            common.color = element.color;
+            common.color_name = None;
+            common.color_book_handle = None;
+        }
+        let linetype = element.linetype.as_str();
+        if !linetype.eq_ignore_ascii_case("ByLayer") && !linetype.eq_ignore_ascii_case("ByBlock") {
+            common.linetype = element.linetype.clone();
+            common.linetype_handle = doc
+                .line_types
+                .iter()
+                .find(|line_type| line_type.name.eq_ignore_ascii_case(linetype))
+                .map(|line_type| line_type.handle);
+        }
+        // A NaN point separates the drawn runs of one element (MLEDIT cuts).
+        for pair in element.points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a.iter().chain(&b).any(|v| v.is_nan()) {
+                continue;
             }
+            let (start, end) = (
+                Vector3::new(a[0], a[1], a[2]),
+                Vector3::new(b[0], b[1], b[2]),
+            );
+            if start.distance(&end) <= 1e-12 {
+                continue;
+            }
+            result.push(EntityType::Line(LineEnt {
+                common: common.clone(),
+                start,
+                end,
+                ..LineEnt::new()
+            }));
         }
     }
-
     result
 }
 
@@ -2025,26 +2056,28 @@ fn explode_dimension(dim: &Dimension, doc: &Document) -> Vec<EntityType> {
             }
             let gap = ((d2.x - d1.x).powi(2) + (d2.y - d1.y).powi(2)).sqrt();
             let outside = !ticks && met.dimasz > 1e-6 && gap < 2.0 * met.dimasz;
-            if outside {
-                // Arrow bodies extend outward (tips still at the origins).
-                result.extend(dim_terminator(d1, -ux, -uy, &met.arrow1, &dim_c));
-                result.extend(dim_terminator(d2, ux, uy, &met.arrow2, &dim_c));
-                if !met.dimsoxd {
-                    let stub = 2.0 * met.dimasz;
+            // Flip Arrow turns an arrowhead to the other side of its line.
+            let (out1, out2) = (outside != base.flip_arrow1, outside != base.flip_arrow2);
+            // Outside, arrow bodies extend outward (tips still at the origins).
+            let (s1, s2) = (if out1 { -1.0 } else { 1.0 }, if out2 { -1.0 } else { 1.0 });
+            result.extend(dim_terminator(d1, ux * s1, uy * s1, &met.arrow1, &dim_c));
+            result.extend(dim_terminator(d2, -ux * s2, -uy * s2, &met.arrow2, &dim_c));
+            if !met.dimsoxd {
+                let stub = 2.0 * met.dimasz;
+                if out1 {
                     result.push(make_seg(
                         &v3(d1.x - ux * stub, d1.y - uy * stub, d1.z),
                         &d1,
                         &dim_c,
                     ));
+                }
+                if out2 {
                     result.push(make_seg(
                         &d2,
                         &v3(d2.x + ux * stub, d2.y + uy * stub, d2.z),
                         &dim_c,
                     ));
                 }
-            } else {
-                result.extend(dim_terminator(d1, ux, uy, &met.arrow1, &dim_c));
-                result.extend(dim_terminator(d2, -ux, -uy, &met.arrow2, &dim_c));
             }
         };
 
@@ -2171,29 +2204,26 @@ fn explode_dimension(dim: &Dimension, doc: &Document) -> Vec<EntityType> {
                 result.push(make_seg(&center, &far_outer, &dim_c));
             }
             let outside = !ticks && met.dimasz > 1e-6 && len < 2.0 * met.dimasz;
-            if outside {
-                result.extend(dim_terminator(edge, ux, uy, &met.arrow1, &dim_c));
-                result.extend(dim_terminator(far, -ux, -uy, &met.arrow2, &dim_c));
-                if !met.dimsoxd {
-                    let stub = 2.0 * met.dimasz;
-                    if !met.dimsd1 {
-                        result.push(make_seg(
-                            &edge,
-                            &v3(edge.x + ux * stub, edge.y + uy * stub, edge.z),
-                            &dim_c,
-                        ));
-                    }
-                    if !met.dimsd2 {
-                        result.push(make_seg(
-                            &far,
-                            &v3(far.x - ux * stub, far.y - uy * stub, far.z),
-                            &dim_c,
-                        ));
-                    }
+            let (out1, out2) = (outside != base.flip_arrow1, outside != base.flip_arrow2);
+            let (s1, s2) = (if out1 { 1.0 } else { -1.0 }, if out2 { 1.0 } else { -1.0 });
+            result.extend(dim_terminator(edge, ux * s1, uy * s1, &met.arrow1, &dim_c));
+            result.extend(dim_terminator(far, -ux * s2, -uy * s2, &met.arrow2, &dim_c));
+            if !met.dimsoxd {
+                let stub = 2.0 * met.dimasz;
+                if out1 && !met.dimsd1 {
+                    result.push(make_seg(
+                        &edge,
+                        &v3(edge.x + ux * stub, edge.y + uy * stub, edge.z),
+                        &dim_c,
+                    ));
                 }
-            } else {
-                result.extend(dim_terminator(edge, -ux, -uy, &met.arrow1, &dim_c));
-                result.extend(dim_terminator(far, ux, uy, &met.arrow2, &dim_c));
+                if out2 && !met.dimsd2 {
+                    result.push(make_seg(
+                        &far,
+                        &v3(far.x - ux * stub, far.y - uy * stub, far.z),
+                        &dim_c,
+                    ));
+                }
             }
             let anchor = dim_text_anchor(base, center, edge);
             let distance_squared = |first: Vector3, second: Vector3| {
@@ -2515,19 +2545,13 @@ pub fn bake_dimension_blocks(doc: &mut Document) {
         }
 
         let name = next_dimension_block_name(doc, &mut next_block_number);
-        // Reserve three consecutive handles for the record / block / endblk.
-        // Adding the block + endblk (which carry explicit handles) advances the
-        // document's handle counter past them, so the NULL-handle sub-entities
-        // added afterwards get fresh handles without colliding.
         let next = doc.next_handle();
         let br_handle = Handle::new(next);
         let block_handle = Handle::new(next + 1);
-        let end_handle = Handle::new(next + 2);
 
         let mut br = BlockRecord::new(&name);
         br.handle = br_handle;
         br.block_entity_handle = block_handle;
-        br.block_end_handle = end_handle;
         br.flags.anonymous = true;
         if doc.block_records.add(br).is_err() {
             continue;
@@ -2538,15 +2562,21 @@ pub fn bake_dimension_blocks(doc: &mut Document) {
         block.common.owner_handle = br_handle;
         let _ = doc.add_entity(EntityType::Block(block));
 
-        let mut block_end = BlockEnd::new();
-        block_end.common.handle = end_handle;
-        block_end.common.owner_handle = br_handle;
-        let _ = doc.add_entity(EntityType::BlockEnd(block_end));
-
         for mut sub in subs {
             sub.common_mut().handle = Handle::NULL;
             sub.common_mut().owner_handle = br_handle;
             let _ = doc.add_entity(sub);
+        }
+
+        // The terminator is allocated after the body so handle order matches
+        // record order inside the definition.
+        let end_handle = doc.allocate_handle();
+        let mut block_end = BlockEnd::new();
+        block_end.common.handle = end_handle;
+        block_end.common.owner_handle = br_handle;
+        let _ = doc.add_entity(EntityType::BlockEnd(block_end));
+        if let Some(record) = doc.block_records.get_mut(&name) {
+            record.block_end_handle = end_handle;
         }
 
         if let Some(EntityType::Dimension(d)) = doc.get_entity_mut(handle) {
@@ -2760,16 +2790,38 @@ mod tests {
         );
     }
 
+    /// The flag, not an empty definition, decides: the same block with one
+    /// line inside explodes when `explodable` is set and stays whole when it
+    /// is cleared.
     #[test]
     fn unexplodable_block_is_not_exploded() {
-        let mut doc = Document::new();
-        let mut block = codec::tables::BlockRecord::new("NO_EXPLODE");
-        block.handle = doc.allocate_handle();
-        block.explodable = false;
-        doc.block_records.add(block).unwrap();
+        fn explode_once(explodable: bool) -> Vec<EntityType> {
+            let mut doc = Document::new();
+            let mut block = codec::tables::BlockRecord::new("NO_EXPLODE");
+            block.handle = doc.allocate_handle();
+            block.explodable = explodable;
+            let child = doc
+                .add_entity(EntityType::Line(codec::entities::Line::from_points(
+                    Vector3::new(0.0, 0.0, 0.0),
+                    Vector3::new(10.0, 0.0, 0.0),
+                )))
+                .unwrap();
+            block.entity_handles.push(child);
+            doc.block_records.add(block).unwrap();
 
-        let insert = codec::entities::Insert::new("NO_EXPLODE", Vector3::new(0.0, 0.0, 0.0));
-        assert!(explode_entity(&EntityType::Insert(insert), &doc).is_empty());
+            let insert = codec::entities::Insert::new("NO_EXPLODE", Vector3::new(0.0, 0.0, 0.0));
+            explode_entity(&EntityType::Insert(insert), &doc)
+        }
+
+        assert_eq!(
+            explode_once(true).len(),
+            1,
+            "the definition holds one line, so an explodable block has something to give"
+        );
+        assert!(
+            explode_once(false).is_empty(),
+            "clearing the flag is what stops the explosion"
+        );
     }
 
     /// A dimension created without a geometry block gets a real `*D` block on
@@ -2806,6 +2858,43 @@ mod tests {
             doc.block_records.len(),
             before,
             "a dimension that already owns a block must not be re-baked"
+        );
+    }
+
+    #[test]
+    fn a_baked_dimension_block_ends_after_its_body() {
+        let mut doc = Document::new();
+        let mut d = DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));
+        d.definition_point = Vector3::new(0.0, 5.0, 0.0);
+        d.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
+        let handle = doc
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(d))))
+            .unwrap();
+
+        bake_dimension_blocks(&mut doc);
+
+        let block_name = match doc.get_entity(handle) {
+            Some(EntityType::Dimension(d)) => d.base().block_name.clone(),
+            _ => panic!("dimension missing"),
+        };
+        let record = doc
+            .block_records
+            .get(&block_name)
+            .expect("the baked block exists");
+        let marker = record.block_entity_handle.value();
+        let end = record.block_end_handle.value();
+        let body: Vec<_> = record
+            .entity_handles
+            .iter()
+            .map(|handle| handle.value())
+            .collect();
+        assert!(
+            body.iter().all(|handle| *handle > marker),
+            "body handles follow the BLOCK marker: {body:?}"
+        );
+        assert!(
+            end > *body.iter().max().expect("the baked block has geometry"),
+            "the ENDBLK handle follows the body: marker {marker}, body {body:?}, end {end}"
         );
     }
 
@@ -3427,6 +3516,17 @@ mod tests {
     }
 
     #[test]
+    fn multileader_explode_leader_type_none_keeps_only_content() {
+        // A leader of type None draws only its content, so that is all it
+        // explodes into: no arrowhead and no landing.
+        let mut ml = explode_test_multileader();
+        ml.path_type = codec::entities::MultiLeaderPathType::Invisible;
+        let pieces = explode_entity(&EntityType::MultiLeader(Box::new(ml)), &Document::new());
+        assert_eq!(pieces.len(), 1, "{pieces:?}");
+        assert!(matches!(pieces[0], EntityType::MText(_)));
+    }
+
+    #[test]
     fn multileader_explode_mtext_keeps_path_landing_arrow_and_content() {
         use codec::entities::mtext::AttachmentPoint;
         let ml = explode_test_multileader();
@@ -3849,5 +3949,135 @@ mod tests {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mline_tests {
+    use super::*;
+    use codec::entities::{MLineJustification, MLineVertex};
+    use codec::objects::{MLineStyle, MLineStyleElement, ObjectType};
+    use codec::types::Color;
+
+    /// A multiline built the way the MLINE command builds one, with its style
+    /// registered in the document.
+    fn mline_in(
+        doc: &mut Document,
+        mut style: MLineStyle,
+        points: &[(f64, f64)],
+        justification: MLineJustification,
+    ) -> MLine {
+        style.handle = doc.allocate_handle();
+        let mut mline = MLine::new();
+        mline.scale_factor = 1.0;
+        mline.justification = justification;
+        mline.style_name = style.name.clone();
+        mline.style_handle = Some(style.handle);
+        mline.style_element_count = style.elements.len();
+        for &(x, y) in points {
+            let mut vertex = MLineVertex::new(Vector3::new(x, y, 0.0));
+            vertex.init_segments(style.elements.len());
+            mline.vertices.push(vertex);
+        }
+        crate::entities::mline::rebuild_mline_geometry(&mut mline);
+        crate::modules::draw::draw::mline::sync_mline_element_parameters(&mut mline, &style);
+        doc.objects
+            .insert(style.handle, ObjectType::MLineStyle(style));
+        mline
+    }
+
+    fn lines(out: &[EntityType]) -> Vec<(Vector3, Vector3)> {
+        out.iter()
+            .map(|entity| match entity {
+                EntityType::Line(line) => (line.start, line.end),
+                other => panic!("expected only Lines, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// #2538: a two-element, top-justified multiline round a corner explodes
+    /// into its two drawn elements, square to the path and meeting at the
+    /// corner. The old code added a centre spine and offset by ±scale/2.
+    #[test]
+    fn explode_mline_follows_style_elements_and_justification() {
+        let mut doc = Document::new();
+        let mut style = MLineStyle::standard();
+        style.name = "EXPLODE_TOP".into();
+        let mline = mline_in(
+            &mut doc,
+            style,
+            &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
+            MLineJustification::Top,
+        );
+
+        let out = explode_entity(&EntityType::MLine(mline), &doc);
+        let segments = lines(&out);
+        assert_eq!(
+            segments.len(),
+            4,
+            "two elements x two segments: {segments:?}"
+        );
+
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let horizontal: Vec<_> = segments.iter().filter(|(s, e)| near(s.y, e.y)).collect();
+        let vertical: Vec<_> = segments.iter().filter(|(s, e)| near(s.x, e.x)).collect();
+        assert_eq!(
+            horizontal.len(),
+            2,
+            "first leg stays horizontal: {segments:?}"
+        );
+        assert_eq!(vertical.len(), 2, "second leg stays vertical: {segments:?}");
+
+        // Top justification: one element on the path, the other one unit off it.
+        let mut ys: Vec<f64> = horizontal.iter().map(|(s, _)| s.y.abs()).collect();
+        ys.sort_by(f64::total_cmp);
+        assert!(
+            near(ys[0], 0.0) && near(ys[1], 1.0),
+            "element offsets {ys:?}"
+        );
+
+        // Each element's two legs meet at its mitred corner.
+        for (_, end) in &horizontal {
+            assert!(
+                vertical.iter().any(|(start, _)| start.distance(end) < 1e-9),
+                "horizontal leg ending at {end:?} meets no vertical leg"
+            );
+        }
+    }
+
+    /// An element with its own colour and linetype keeps them; a ByLayer
+    /// element takes the multiline's.
+    #[test]
+    fn explode_mline_carries_element_colour_and_linetype() {
+        let mut doc = Document::new();
+        let mut style = MLineStyle::new("EXPLODE_TWO_TONE");
+        let mut red = MLineStyleElement::new(0.5);
+        red.color = Color::from_index(1);
+        red.linetype = "DASHED".into();
+        style.add_element(red);
+        style.add_element(MLineStyleElement::new(-0.5));
+        let mut mline = mline_in(
+            &mut doc,
+            style,
+            &[(0.0, 0.0), (10.0, 0.0)],
+            MLineJustification::Zero,
+        );
+        mline.common.color = Color::from_index(3);
+        mline.common.linetype = "ByLayer".into();
+
+        let out = explode_entity(&EntityType::MLine(mline), &doc);
+        assert_eq!(out.len(), 2, "one Line per element: {out:?}");
+        let mut styles: Vec<(Color, String)> = out
+            .iter()
+            .map(|entity| (entity.common().color, entity.common().linetype.clone()))
+            .collect();
+        styles.sort_by_key(|(_, linetype)| linetype.clone());
+        assert_eq!(
+            styles,
+            vec![
+                (Color::from_index(3), "ByLayer".to_string()),
+                (Color::from_index(1), "DASHED".to_string()),
+            ]
+        );
     }
 }

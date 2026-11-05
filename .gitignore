@@ -51,3 +51,7 @@ __pycache__/
 # Local memory and ODD session tracking (not public source)
 /.engram/
 /odd/
+
+# Plugin template has its own Cargo project (not part of the workspace build);
+# its lock file is a locally generated build artifact
+docs/plugin-template-v2/Cargo.lock

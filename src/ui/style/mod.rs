@@ -1,4 +1,5 @@
 pub mod anno_object_scale;
+pub mod chrome;
 pub mod common;
 pub mod dimstyle;
 pub(crate) mod editor_table;
@@ -8,11 +9,13 @@ pub mod mleaderstyle;
 pub mod mlstyle;
 pub mod plotstyle;
 pub mod point_style;
+pub mod ribbon_metrics;
 pub mod row_button;
 pub mod scale_manager;
 pub mod style_list;
 pub mod style_manager;
 pub mod tablestyle;
+pub mod text_metrics;
 pub mod textstyle;
 
 #[cfg(test)]
@@ -36,6 +39,25 @@ mod common_tests {
         let a = crate::ui::style::common::muted_style(&Theme::Dark);
         let b = crate::ui::style::common::muted_text_style(&Theme::Dark);
         assert_eq!(a.color, b.color);
+    }
+
+    /// The green, orange and red the text style windows write in read as
+    /// body text on the light and the dark theme.
+    #[test]
+    fn a_readable_accent_reaches_body_text_contrast_in_both_themes() {
+        use crate::ui::style::common::{readable_accent, wcag_contrast};
+        for theme in [Theme::Light, Theme::Dark] {
+            let palette = theme.palette();
+            let bg = palette.background.base.color;
+            for accent in [
+                palette.success.base.color,
+                palette.warning.base.color,
+                palette.danger.base.color,
+            ] {
+                let color = readable_accent(accent, bg, palette.background.base.text);
+                assert!(wcag_contrast(color, bg) >= 4.5, "{theme}: {color:?}");
+            }
+        }
     }
 
     #[test]

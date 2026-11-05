@@ -533,6 +533,7 @@ impl OpenCADStudio {
         };
         match verb.as_str() {
             "SHEETSET" | "SSM" => {
+                self.pallet_as_window(crate::ui::dock::PanelId::SheetSetManager);
                 self.show_sheet_set_manager(true);
                 Some(Task::none())
             }
@@ -2278,9 +2279,7 @@ impl OpenCADStudio {
                 br.entity_handles
                     .iter()
                     .filter_map(|h| match doc.get_entity(*h) {
-                        Some(codec::EntityType::AttributeDefinition(d)) if !d.flags.constant => {
-                            Some(d.clone())
-                        }
+                        Some(codec::EntityType::AttributeDefinition(d)) => Some(d.clone()),
                         _ => None,
                     })
                     .collect()

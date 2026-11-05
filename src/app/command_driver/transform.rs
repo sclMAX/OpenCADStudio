@@ -19,6 +19,19 @@ impl OpenCADStudio {
                 .parametric_connected_handles(scope, &handles, false);
             handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
         }
+        // A fixed object stays where it is and the command says why, rather
+        // than moving the rest of the selection and letting the solve pull it
+        // back. The whole command is refused so a partial move is never
+        // reported as a failure.
+        if self.any_entity_is_fixed(i, &handles) {
+            self.command_line
+                .push_error(crate::app::properties::HELD_BY_FIXED);
+            self.tabs[i].active_cmd = None;
+            self.tabs[i].snap_result = None;
+            self.tabs[i].scene.clear_preview_wire();
+            self.restore_pre_cmd_tangent();
+            return Some(Task::none());
+        }
         let label = self.history_label_from_active_cmd(i, "MOVE");
         // A translation carries its complete connected constraint
         // component so each member keeps its own dimensions. Other
@@ -145,12 +158,34 @@ impl OpenCADStudio {
         }
     }
 
+    /// Drop an object taken out of STRETCH from the highlight and the temporary
+    /// grips, leaving the vertex filtering of the other objects as it is.
+    pub(in crate::app) fn remove_stretch_object_feedback(&mut self, i: usize, handle: Handle) {
+        let tab = &mut self.tabs[i];
+        tab.scene.deselect_entities(&[handle]);
+        let grips = std::mem::take(&mut tab.selected_grips);
+        let owners = std::mem::take(&mut tab.selected_grip_handles);
+        for (owner, grip) in owners.into_iter().zip(grips) {
+            if owner != handle {
+                tab.selected_grip_handles.push(owner);
+                tab.selected_grips.push(grip);
+            }
+        }
+        tab.hot_grips.retain(|(owner, _)| *owner != handle);
+        tab.scene
+            .selection
+            .borrow_mut()
+            .clear_left_selection_gesture();
+        self.grip_hover = None;
+    }
+
     pub(super) fn handle_stretch_window(
         &mut self,
         mut handles: Vec<Handle>,
         windows: Vec<(glam::DVec3, glam::DVec3)>,
         mut excluded_points: Vec<(Handle, glam::DVec3)>,
         subtract_window: Option<(glam::DVec3, glam::DVec3)>,
+        removed_handles: Vec<Handle>,
     ) {
         use crate::modules::draw::modify::stretch::is_excluded;
         let i = self.active_tab;
@@ -192,6 +227,7 @@ impl OpenCADStudio {
             }
         }
 
+        handles.retain(|handle| !removed_handles.contains(handle));
         handles.sort_unstable_by_key(|handle| handle.value());
         handles.dedup();
 
@@ -224,6 +260,15 @@ impl OpenCADStudio {
                     point_inside(point) && !is_excluded(&excluded_points, handle, point)
                 };
 
+                // A viewport has no key vertices: its corners are what stretches.
+                let viewport_hit = matches!(
+                    self.tabs[i].scene.document.get_entity(handle),
+                    Some(codec::EntityType::Viewport(vp))
+                        if crate::entities::viewport::stretch_corners(vp)
+                            .into_iter()
+                            .any(&active_point)
+                );
+
                 let affected = wires.iter().any(|wire| {
                     // LINE / LWPOLYLINE / other vertex-based entities.
                     let vertex_hit = wire
@@ -248,7 +293,7 @@ impl OpenCADStudio {
                     })
                 });
 
-                if affected {
+                if viewport_hit || affected {
                     visual_handles.push(handle);
                 }
             }
@@ -286,7 +331,8 @@ impl OpenCADStudio {
 
         let wires = self.tabs[i].scene.wire_models_for(&handles);
 
-        let cmd = StretchCommand::with_windows(handles, wires, windows, excluded_points);
+        let cmd = StretchCommand::with_windows(handles, wires, windows, excluded_points)
+            .with_removed(removed_handles);
 
         self.command_line.push_info(&CadCommand::prompt(&cmd));
         self.tabs[i].active_cmd = Some(Box::new(cmd));
@@ -303,6 +349,18 @@ impl OpenCADStudio {
         handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
         if handles.is_empty() {
             self.tabs[i].active_cmd = None;
+            return Some(Task::none());
+        }
+        // A stretch moves picked points, so a fixed object cannot take part.
+        // The whole command is refused rather than reporting a stretch that
+        // the solve then reverts.
+        if self.any_entity_is_fixed(i, &handles) {
+            self.command_line
+                .push_error(crate::app::properties::HELD_BY_FIXED);
+            self.tabs[i].active_cmd = None;
+            self.tabs[i].snap_result = None;
+            self.tabs[i].scene.clear_preview_wire();
+            self.restore_pre_cmd_tangent();
             return Some(Task::none());
         }
         let structural = handles.iter().any(|handle| {
@@ -417,6 +475,7 @@ impl OpenCADStudio {
         }
         self.tabs[i].dirty = true;
         self.tabs[i].active_cmd = None;
+        self.tabs[i].last_crossing_window = None;
         self.tabs[i].snap_result = None;
         self.tabs[i].scene.clear_preview_wire();
         self.restore_pre_cmd_tangent();
@@ -427,5 +486,71 @@ impl OpenCADStudio {
             self.commit_undo_delta(i, pending);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod stretch_window_feedback_tests {
+    use crate::app::OpenCADStudio;
+    use codec::{EntityType, Handle};
+    use glam::DVec3;
+
+    /// A 20x10 viewport centred on (10, 5).
+    fn app_with_viewport() -> (OpenCADStudio, usize, Handle) {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let mut viewport = codec::entities::Viewport::default();
+        viewport.center = codec::types::Vector3::new(10.0, 5.0, 0.0);
+        viewport.width = 20.0;
+        viewport.height = 10.0;
+        let handle = app.tabs[i]
+            .scene
+            .add_entity(EntityType::Viewport(Box::new(viewport)));
+        (app, i, handle)
+    }
+
+    const OVER_TOP_RIGHT: (DVec3, DVec3) =
+        (DVec3::new(19.0, 9.0, 0.0), DVec3::new(21.0, 11.0, 0.0));
+
+    #[test]
+    fn a_viewport_corner_in_the_window_highlights_the_viewport() {
+        let (mut app, i, handle) = app_with_viewport();
+        app.handle_stretch_window(
+            vec![handle],
+            vec![OVER_TOP_RIGHT],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert!(app.tabs[i].scene.selected.contains(&handle));
+    }
+
+    #[test]
+    fn a_window_missing_every_corner_leaves_the_viewport_plain() {
+        let (mut app, i, handle) = app_with_viewport();
+        let along_an_edge = (DVec3::new(5.0, 9.0, 0.0), DVec3::new(15.0, 11.0, 0.0));
+        app.handle_stretch_window(
+            vec![handle],
+            vec![along_an_edge],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert!(!app.tabs[i].scene.selected.contains(&handle));
+    }
+
+    #[test]
+    fn an_excluded_corner_does_not_highlight_the_viewport() {
+        let (mut app, i, handle) = app_with_viewport();
+        let corner = DVec3::new(20.0, 10.0, 0.0);
+        app.handle_stretch_window(
+            vec![handle],
+            vec![OVER_TOP_RIGHT],
+            vec![(handle, corner)],
+            None,
+            Vec::new(),
+        );
+        assert!(!app.tabs[i].scene.selected.contains(&handle));
     }
 }

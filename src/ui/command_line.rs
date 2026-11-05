@@ -103,6 +103,36 @@ fn strip_option_listing(s: &str, options: &[CmdOption]) -> String {
     out.replace(" :", ":").trim().to_string()
 }
 
+/// An option label split around the letters typed to pick it: the capitals
+/// (`T` in `Ttr`, `RE` in `REpeat`, `X` in `eXit`), or the whole label when
+/// it has no lower case (`3P`).
+fn option_shortcut(label: &str) -> (&str, &str, &str) {
+    if !label.chars().any(char::is_lowercase) {
+        return ("", label, "");
+    }
+    let Some(start) = label.find(|c: char| c.is_uppercase() || c.is_ascii_digit()) else {
+        return (label, "", "");
+    };
+    let len = label[start..]
+        .find(|c: char| c.is_lowercase() || c.is_whitespace())
+        .unwrap_or(label.len() - start);
+    (&label[..start], &label[start..start + len], &label[start + len..])
+}
+
+#[cfg(test)]
+mod option_shortcut_tests {
+    #[test]
+    fn the_capitals_are_the_shortcut() {
+        use super::option_shortcut as split;
+        assert_eq!(split("Ttr"), ("", "T", "tr"));
+        assert_eq!(split("REpeat"), ("", "RE", "peat"));
+        assert_eq!(split("eXit"), ("e", "X", "it"));
+        assert_eq!(split("3P"), ("", "3P", ""));
+        assert_eq!(split("2Point"), ("", "2P", "oint"));
+        assert_eq!(split("by line"), ("by line", "", ""));
+    }
+}
+
 // Font swaps must preserve U+276F, U+24D8, and U+2715.
 const COMMAND_PREFIX: &str = "❯ ";
 const INFO_PREFIX: &str = "ⓘ ";
@@ -199,6 +229,10 @@ pub struct CommandLine {
     /// COMMANDLINEOPACITY: how opaque the command line's panels are, in
     /// percent (20–100, default 80), so the drawing shows through.
     opacity_percent: u8,
+    /// The family and size the history, prompt and input are written in.
+    font_family: String,
+    font: iced::Font,
+    font_size: f32,
     /// Since when the pointer rests on the overlay history: lines still
     /// showing then stay until it leaves, and fade from that moment.
     hover_since: Option<Instant>,
@@ -230,6 +264,9 @@ impl Default for CommandLine {
             cliprompt_lines: 3,
             fade_ms: DEFAULT_COMMANDLINE_FADE_MS,
             opacity_percent: 80,
+            font_family: String::new(),
+            font: iced::Font::DEFAULT,
+            font_size: 11.0,
             hover_since: None,
         }
     }
@@ -425,6 +462,20 @@ impl CommandLine {
             format!("{COMMAND_PREFIX}{} {cmd}", t!("Command:")),
         );
     }
+    /// The latest command echo shows only `cmd`: a value typed on the same
+    /// line as a variable belongs to its prompt, not to the command line.
+    pub fn restate_last_command(&mut self, cmd: &str) {
+        if let Some(entry) = self.history.iter_mut().rev().find(|e| e.kind == EntryKind::Command) {
+            entry.text = format!("{COMMAND_PREFIX}{} {cmd}", t!("Command:"));
+        }
+    }
+    /// An answer given to the prompt just shown is written after it on the
+    /// same line (`Enter new value for X <1>: 0`), as the reference echoes it.
+    pub fn answer_last_prompt(&mut self, answer: &str) {
+        if let Some(entry) = self.history.last_mut().filter(|e| e.text.trim_end().ends_with(':')) {
+            entry.text = format!("{} {answer}", entry.text.trim_end());
+        }
+    }
     pub fn push_output(&mut self, msg: &str) {
         self.push(EntryKind::Output, msg.to_string());
     }
@@ -549,6 +600,28 @@ impl CommandLine {
 
     pub fn opacity_percent(&self) -> u8 {
         self.opacity_percent
+    }
+
+    /// The command line font: a family name (empty for the interface font)
+    /// and a size in pixels, clamped to 8–24.
+    pub fn set_font(&mut self, family: &str, size: u16) {
+        if family != self.font_family {
+            self.font_family = family.to_owned();
+            self.font = if family.is_empty() {
+                iced::Font::DEFAULT
+            } else {
+                iced::Font::with_family(iced::font::Family::name(family))
+            };
+        }
+        self.font_size = f32::from(size.clamp(8, 24));
+    }
+
+    pub fn font_family(&self) -> &str {
+        &self.font_family
+    }
+
+    pub fn font_size(&self) -> u16 {
+        self.font_size as u16
     }
 
     fn fade_secs(&self) -> f32 {
@@ -761,6 +834,74 @@ impl CommandLine {
         )
     }
 
+    /// The Command History pallet: the whole log in one read-only editor
+    /// (select across lines, Ctrl+C), with Copy and Clear, filling the
+    /// pallet. It stays open beside the drawing or in a window of its own.
+    pub fn history_panel<'a>(
+        &'a self,
+        history_content: &'a text_editor::Content,
+        width: f32,
+        chrome: crate::ui::dock::Chrome,
+    ) -> Element<'a, Message> {
+        let title_bar = crate::ui::dock::title_bar(
+            crate::ui::dock::PanelId::CommandHistory,
+            t!("Command History").into_owned(),
+            chrome,
+        );
+        let log = text_editor(history_content)
+            .on_action(Message::CommandHistoryEdit)
+            .size(11)
+            .padding([2, 8])
+            .height(Length::Shrink)
+            .highlight_with::<HistoryHighlighter>(
+                self.history_highlight_settings(),
+                history_highlight_format,
+            )
+            .style(|theme: &Theme, _status| {
+                let palette = theme.palette();
+                text_editor::Style {
+                    background: Background::Color(palette.background.base.color),
+                    border: Border::default(),
+                    placeholder: palette.background.base.text.scale_alpha(0.72),
+                    value: palette.background.base.text,
+                    selection: palette.primary.base.color.scale_alpha(0.5),
+                }
+            });
+        let log = scrollable(log)
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new().width(8).scroller_width(6),
+            ))
+            .anchor_bottom();
+        let tool = |icon: Element<'a, Message>, label: String, msg: Message| {
+            button(row![icon, text(label).size(11)].spacing(4).align_y(iced::Center))
+                .on_press(msg)
+                .style(header_btn_style)
+                .padding([2, 6])
+        };
+        let header = container(
+            row![
+                Space::new().width(Length::Fill),
+                tool(
+                    crate::ui::icons::themed_success(crate::ui::icons::COPY, 11.0),
+                    t!("Copy").into_owned(),
+                    Message::CommandHistoryCopy,
+                ),
+                tool(
+                    crate::ui::icons::themed_warning(crate::ui::icons::TRASH, 11.0),
+                    t!("Clear").into_owned(),
+                    Message::CommandHistoryClear,
+                ),
+            ]
+            .spacing(6)
+            .align_y(iced::Center),
+        )
+        .width(Length::Fill)
+        .padding([2, 8]);
+        let body = container(column![header, log]).height(Length::Fill);
+        crate::ui::dock::frame(title_bar, body, width)
+    }
+
     pub fn view<'a>(
         &'a self,
         show_autocomplete: bool,
@@ -800,14 +941,17 @@ impl CommandLine {
                 let kind = entry.kind.clone();
                 let is_error = kind == EntryKind::Error;
                 let entry_text = |value: String| {
-                    let mut txt = text(value).size(11).style({
+                    let mut txt = text(value).size(self.font_size).font(self.font).style({
                         let kind = kind.clone();
                         move |theme: &Theme| iced::widget::text::Style {
                             color: Some(history_color(theme, &kind)),
                         }
                     });
                     if is_error {
-                        txt = txt.font(iced::Font::DEFAULT.weight(iced::font::Weight::Bold));
+                        txt = txt.font(iced::Font {
+                            weight: iced::font::Weight::Bold,
+                            ..self.font
+                        });
                     }
                     txt
                 };
@@ -821,9 +965,30 @@ impl CommandLine {
                     let shown = strip_option_listing(&entry.text, &self.step_options);
                     let mut r = row![entry_text(shown)].spacing(6).align_y(iced::Center);
                     for opt in &self.step_options {
-                        let label = text(opt.label.to_uppercase())
-                            .size(11)
-                            .wrapping(iced::widget::text::Wrapping::None);
+                        // The letters to type are drawn in the accent colour,
+                        // so the short form of each option can be seen.
+                        let (before, short, after) = option_shortcut(&opt.label);
+                        let part = |s: &str| {
+                            text(s.to_string())
+                                .size(11)
+                                .wrapping(iced::widget::text::Wrapping::None)
+                        };
+                        let accent = |theme: &Theme| iced::widget::text::Style {
+                            color: Some(theme.palette().primary.base.color),
+                        };
+                        // A translated label whose capitals are not what is
+                        // typed shows the keyword itself instead.
+                        let keyword = opt.keyword.to_uppercase();
+                        let short_upper = short.to_uppercase();
+                        let label = if keyword.is_empty()
+                            || (!short.is_empty()
+                                && (keyword.starts_with(&short_upper)
+                                    || short_upper.starts_with(&keyword)))
+                        {
+                            row![part(before), part(short).style(accent), part(after)]
+                        } else {
+                            row![part(&opt.label), part(&format!(" ({keyword})")).style(accent)]
+                        };
                         let btn = button(label)
                             .on_press(Message::CommandOptionPick(opt.keyword.clone()))
                             .padding([1, 6])
@@ -859,7 +1024,7 @@ impl CommandLine {
                     col.push(container(entry_text(entry.text.clone())).padding([1, 8]))
                 }
             });
-        let prompt = container(text(crate::tr!("command-line", "label")).size(11).style(
+        let prompt = container(text(crate::tr!("command-line", "label")).size(self.font_size).font(self.font).style(
             |theme: &Theme| {
                 let p = theme.palette();
                 let color = accessible_accent_threshold(
@@ -916,7 +1081,8 @@ impl CommandLine {
                 .on_submit(Message::CommandSubmit);
         }
         let input = input
-            .size(11)
+            .size(self.font_size)
+            .font(self.font)
             .padding(Padding {
                 top: 4.0,
                 right: 30.0,
@@ -986,12 +1152,20 @@ impl CommandLine {
                             label = label.push(swatch);
                         }
                     } else {
-                        // Normal command autocomplete keeps its existing command icon.
-                        let icon: Element<'_, Message> =
-                            match crate::modules::registry::command_icon(cmd) {
-                                Some(bytes) => crate::ui::icons::semantic(bytes, 14.0),
-                                None => Space::new().width(14.0).into(),
-                            };
+                        // Normal command autocomplete keeps its existing command icon,
+                        // falling back to the target command's icon for aliases.
+                        let icon_bytes =
+                            crate::modules::registry::command_icon(cmd).or_else(|| {
+                                self.command_aliases
+                                    .get(cmd.as_str())
+                                    .and_then(|target| {
+                                        crate::modules::registry::command_icon(target)
+                                    })
+                            });
+                        let icon: Element<'_, Message> = match icon_bytes {
+                            Some(bytes) => crate::ui::icons::semantic(bytes, 14.0),
+                            None => Space::new().width(14.0).into(),
+                        };
 
                         label = label.push(icon);
                     }
@@ -1090,7 +1264,24 @@ impl CommandLine {
             .padding([3, 6])
             .style(container::bordered_box);
         let graph_btn = tooltip(graph_btn, graph_tip, tooltip::Position::Top).gap(4);
-        let input_row = row![prompt, literal_btn, input_with_history, graph_btn, mcp_btn]
+        // Enter without a keyboard (touch screens): the same as the context
+        // menu's Enter.
+        let enter_btn = button(crate::ui::icons::themed(crate::ui::icons::CHECK, 13.0))
+            .on_press(Message::CommandFinalize)
+            .style(button::subtle)
+            .padding([2, 6]);
+        let enter_tip = container(text(t!("Enter")).size(11))
+            .padding([3, 6])
+            .style(container::bordered_box);
+        let enter_btn = tooltip(enter_btn, enter_tip, tooltip::Position::Top).gap(4);
+        let input_row = row![
+            prompt,
+            literal_btn,
+            input_with_history,
+            enter_btn,
+            graph_btn,
+            mcp_btn
+        ]
             .spacing(4)
             .align_y(iced::Center);
 
@@ -1717,4 +1908,22 @@ mod tests {
         assert!(last.pinned);
         assert_eq!(last.text, "ⓘ Specify first point:");
     }
+}
+
+/// `Enter new value for NAME <current>:`, the one prompt every variable asks
+/// its value with, through one catalog entry so it is translated everywhere.
+pub fn value_prompt(name: &str, current: &dyn std::fmt::Display) -> String {
+    let current = current.to_string();
+    crate::tf!("Enter new value for {name} <{current}>:").into_owned()
+}
+
+/// [`value_prompt`] for a name-valued variable that `.` clears.
+pub fn value_prompt_or_none(name: &str, current: &dyn std::fmt::Display) -> String {
+    let current = current.to_string();
+    crate::tf!("Enter new value for {name}, or . for none <\"{current}\">:").into_owned()
+}
+
+/// [`value_prompt`] for a variable with no value to offer.
+pub fn value_prompt_bare(name: &str) -> String {
+    crate::tf!("Enter new value for {name}:").into_owned()
 }

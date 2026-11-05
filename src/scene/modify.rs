@@ -687,6 +687,14 @@ impl Scene {
             EntityType::Insert(ins) => {
                 for att in ins.attributes.iter_mut() {
                     att.common.handle = doc.allocate_handle();
+                    // The text of a multiline attribute is an object of its
+                    // own inside the reference, so the copy needs a fresh
+                    // handle for it and its new attribute as owner.
+                    let owner = att.common.handle;
+                    if let Some(model) = &mut att.embedded_mtext {
+                        model.common.handle = doc.allocate_handle();
+                        model.common.owner_handle = owner;
+                    }
                 }
                 if ins.seqend_handle.is_some() {
                     ins.seqend_handle = Some(doc.allocate_handle());
@@ -1121,11 +1129,9 @@ impl Scene {
         let next = self.document.next_handle();
         let br_handle = Handle::new(next);
         let block_handle = Handle::new(next + 1);
-        let end_handle = Handle::new(next + 2);
         let mut br = codec::tables::BlockRecord::new(&new_name);
         br.handle = br_handle;
         br.block_entity_handle = block_handle;
-        br.block_end_handle = end_handle;
         // The DWG writer takes the anonymous bit from the flag alone; without
         // it AutoCAD's audit reports `Invalid anonymous block "*D<n>"`.
         br.flags.anonymous = true;
@@ -1134,12 +1140,6 @@ impl Scene {
         block.common.handle = block_handle;
         block.common.owner_handle = br_handle;
         self.document.add_entity(EntityType::Block(block)).ok()?;
-        let mut block_end = BlockEnd::new();
-        block_end.common.handle = end_handle;
-        block_end.common.owner_handle = br_handle;
-        self.document
-            .add_entity(EntityType::BlockEnd(block_end))
-            .ok()?;
         for sub in subs {
             let mut sub = sub.clone();
             transform_dimension_part(&mut sub, t);
@@ -1152,6 +1152,18 @@ impl Scene {
             sub.common_mut().xdictionary_handle = None;
             self.ensure_image_definition(&mut sub);
             let _ = self.document.add_entity(sub);
+        }
+        // The terminator is allocated after the body so handle order matches
+        // record order inside the definition.
+        let end_handle = self.document.allocate_handle();
+        let mut block_end = BlockEnd::new();
+        block_end.common.handle = end_handle;
+        block_end.common.owner_handle = br_handle;
+        self.document
+            .add_entity(EntityType::BlockEnd(block_end))
+            .ok()?;
+        if let Some(record) = self.document.block_records.get_mut(&new_name) {
+            record.block_end_handle = end_handle;
         }
         Some(new_name)
     }
@@ -1272,6 +1284,7 @@ impl Scene {
             self.ensure_image_definition(&mut entity);
             let h = self.document.add_entity(entity).unwrap_or(Handle::NULL);
             if !h.is_null() {
+                Self::adopt_attributes(&mut self.document, h);
                 // Deep-clone the extension-dictionary tree so edits on the
                 // copy never touch the source. A dangling or missing root
                 // leaves the copy without one — never shared.
@@ -1368,7 +1381,8 @@ impl Scene {
                 }
                 let rebuilt_history =
                     self.copy_solid_history(src_handle, h) && self.transform_solid_history(h, t);
-                if !rebuilt_history
+                // A moved history only moves a mesh the copy does not have yet.
+                if (!rebuilt_history || !self.meshes.contains_key(&h))
                     && self.document.get_entity(h).is_some_and(|entity| {
                         matches!(
                             entity,
@@ -1423,6 +1437,26 @@ impl Scene {
         self.copy_complete_groups(&handle_map);
         self.copy_dimension_associations(&handle_map);
         self.copy_hatch_associations(&handle_map);
+        // A copied associative array gets its own blocks and action, so
+        // editing one array leaves the other alone.
+        let arrays: Vec<(Handle, Handle)> = handle_map
+            .iter()
+            .filter(|(source, _)| {
+                self.document.get_entity(**source).is_some_and(|entity| {
+                    matches!(entity, EntityType::Insert(_))
+                        && entity.common().reactors.iter().any(|reactor| {
+                            matches!(
+                                self.document.objects.get(reactor),
+                                Some(codec::objects::ObjectType::Associative(_))
+                            )
+                        })
+                })
+            })
+            .map(|(&source, &copy)| (source, copy))
+            .collect();
+        for (source, copy) in arrays {
+            super::assoc_array::clone_array_for_copy(self, source, copy, &handle_map);
+        }
         // The copies are new handles (natural memo misses, tessellated fresh)
         // and reference only already-cached blocks — no block defn changes.
         // Report them as additions so derived caches patch in exactly the copies.
@@ -2753,6 +2787,12 @@ impl Scene {
     pub fn apply_grip(&mut self, handle: Handle, grip_id: usize, apply: GripApply) {
         // Objects on a locked layer can't be grip-edited.
         if self.is_layer_locked(handle) {
+            return;
+        }
+        if grip_id == GROUP_GRIP_ID {
+            if let GripApply::Translate(delta) = apply {
+                self.transform_entities(&[handle], &crate::command::EntityTransform::Translate(delta));
+            }
             return;
         }
         // An attribute grip sits on the displayed (annotation-scaled)

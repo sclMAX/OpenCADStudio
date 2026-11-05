@@ -446,7 +446,7 @@ pub(crate) fn is_dynamic_dimension_layer(layer: &str) -> bool {
 /// 1 = value, 2 = name=value, the value with its trailing zeros dropped
 /// (`d9=80`, `d1=111.8034`). A parameter defined by a formula shows the
 /// formula behind `fx:` (`fx: len=d1*2`); a reference (driven) constraint's
-/// text sits in parentheses; an annotational one keeps dimension precision.
+/// text sits in parentheses; an annotational one prints its value with four decimals.
 pub(crate) fn dynamic_dimension_text(
     name: &str,
     value: f64,
@@ -466,8 +466,7 @@ pub(crate) fn dynamic_dimension_text(
             let decimals = angle_decimals.unwrap_or(0);
             format!("{:.decimals$}", normalize_angle_display(value))
         }
-        // An annotational dimension shows the value at dimension precision
-        // (`d1=100.0000`), as the reference does.
+        // An annotational dimension keeps four decimals (`d1=100.0000`).
         None if annotational => format!("{value:.4}"),
         None => {
             let text = format!("{value:.4}");
@@ -1227,14 +1226,16 @@ pub struct ParametricConstraintSet {
     /// persisted; a `ConflictResolverPanel` reads this rather than calling
     /// `kernel_constraints::diagnosis::classify_redundant` itself.
     pub conflicts: Vec<(ConstraintId, kernel_constraints::diagnosis::RedundancyKind)>,
-    /// Lazy reverse index for [`Self::constraints_touching`]: entity handle →
-    /// positions into `constraints`. `None` means "not built yet" and is
-    /// rebuilt unconditionally on the next query; a built index is rebuilt
-    /// whenever `constraints.len()` differs from the recorded length (the
-    /// `constraints` field is `pub`, so external pushes/removes are covered
-    /// by the length check; `enabled` is filtered at query time, so in-place
-    /// enable toggles never stale the recorded positions). The only known
-    /// in-place mutation of `refs` (and hence of the handle keys) is the
+    /// Lazy reverse index for [`Self::constraints_referencing`] and
+    /// [`Self::constraints_touching`]: entity handle → positions into
+    /// `constraints`, one entry per constraint however many of its refs name
+    /// the entity. `None` means "not built yet" and is rebuilt
+    /// unconditionally on the next query; a built index is rebuilt whenever
+    /// `constraints.len()` differs from the recorded length (the `constraints`
+    /// field is `pub`, so external pushes/removes are covered by the length
+    /// check; `constraints_touching` filters `enabled` at query time, so
+    /// in-place enable toggles never stale the recorded positions). The only
+    /// known in-place mutation of `refs` (and hence of the handle keys) is the
     /// Save Block As path in `app/block_editor.rs`, which rewrites
     /// `refs[].entity` on *clones* of live sets and then installs them; the
     /// manual `Clone` impl resets this field to `None` so a clone always
@@ -1412,6 +1413,16 @@ impl ParametricConstraintSet {
         &self,
         entity: Handle,
     ) -> impl Iterator<Item = &ParametricConstraint> {
+        self.constraints_referencing(entity)
+            .filter(|constraint| constraint.enabled)
+    }
+
+    /// Every constraint referencing `entity`, enabled or not — a read model
+    /// has to report a kept-but-suppressed constraint as well as a live one.
+    pub fn constraints_referencing(
+        &self,
+        entity: Handle,
+    ) -> impl Iterator<Item = &ParametricConstraint> {
         {
             let mut index = self.touch_index.borrow_mut();
             let stale = index
@@ -1422,10 +1433,13 @@ impl ParametricConstraintSet {
                     std::collections::HashMap::new();
                 for (position, constraint) in self.constraints.iter().enumerate() {
                     for reference in &constraint.refs {
-                        built
-                            .entry(reference.entity)
-                            .or_default()
-                            .push(position as u32);
+                        let positions = built.entry(reference.entity).or_default();
+                        // A constraint may name the same entity more than
+                        // once, adjacent or not; it is still one constraint
+                        // on that entity.
+                        if !positions.contains(&(position as u32)) {
+                            positions.push(position as u32);
+                        }
                     }
                 }
                 *index = Some((self.constraints.len(), built));
@@ -1441,18 +1455,27 @@ impl ParametricConstraintSet {
         positions
             .into_iter()
             .filter_map(move |position| self.constraints.get(position as usize))
-            .filter(|constraint| constraint.enabled)
     }
 
     /// Drops every constraint that references `entity` and returns the
     /// removed constraint ids.
+    ///
+    /// The dimension each removed constraint drew goes out of the map with it:
+    /// a stale handle here would make a later block save reject a dimension
+    /// that no longer exists.
     pub fn remove_all_touching(&mut self, entity: Handle) -> Vec<ConstraintId> {
         let (removed, kept): (Vec<_>, Vec<_>) = self
             .constraints
             .drain(..)
             .partition(|c| c.refs.iter().any(|r| r.entity == entity));
         self.constraints = kept;
-        removed.into_iter().map(|c| c.id).collect()
+        removed
+            .into_iter()
+            .map(|c| {
+                self.dimensions.remove(&c.id);
+                c.id
+            })
+            .collect()
     }
 
     /// Expand through enabled constraints from `seeds`. Whole-object
@@ -2656,6 +2679,88 @@ impl super::Scene {
             .is_some_and(|entity| !is_dynamic_dimension_layer(&entity.common().layer))
     }
 
+    /// The form a dimensional constraint's dimension uses, or `None` when the
+    /// dimension no longer resolves.
+    pub(crate) fn dimension_form(&self, handle: Handle) -> Option<&'static str> {
+        self.document.get_entity(handle)?;
+        Some(if self.dimension_is_annotational(handle) {
+            "Annotational"
+        } else {
+            "Dynamic"
+        })
+    }
+
+    /// The dimensions of the selected dimensional constraints. A constraint
+    /// is selected through the dimension entity that draws it.
+    pub(crate) fn selected_dimensional_constraint_dimensions(&self) -> Vec<Handle> {
+        let selected = self.selected_handles_in_order();
+        let mut handles: Vec<Handle> = Vec::new();
+        for set in &self.parametric_constraints {
+            for dimension in set.dimensions.values() {
+                if selected.contains(dimension) && !handles.contains(dimension) {
+                    handles.push(*dimension);
+                }
+            }
+        }
+        handles.sort_by_key(|handle| handle.value());
+        handles
+    }
+
+    /// Switches a dimensional constraint's dimension between the dynamic and
+    /// annotational forms, placing an annotational one on `annotational_layer`.
+    /// Returns false when `handle` is not a dimensional constraint's dimension
+    /// or already uses the requested form.
+    pub(crate) fn set_dimensional_constraint_form(
+        &mut self,
+        handle: Handle,
+        annotational: bool,
+        annotational_layer: &str,
+    ) -> bool {
+        use crate::entities::dim_override as ov;
+        let is_dimensional = self
+            .parametric_constraints
+            .iter()
+            .any(|set| set.dimensions.values().any(|dimension| *dimension == handle));
+        if !is_dimensional || self.dimension_is_annotational(handle) == annotational {
+            return false;
+        }
+        let Some(mut entity) = self.document.get_entity(handle).cloned() else {
+            return false;
+        };
+        if !matches!(entity, codec::EntityType::Dimension(_)) {
+            return false;
+        }
+        if annotational {
+            entity.as_entity_mut().set_layer(annotational_layer.to_string());
+            entity.common_mut().color = codec::types::Color::ByLayer;
+            // The screen-size overrides belong to the dynamic form; an
+            // annotational dimension draws at its style's size.
+            for code in [
+                ov::DIMSCALE,
+                ov::DIMGAP,
+                ov::DIMEXO,
+                ov::DIMEXE,
+                ov::DIMASZ,
+                ov::DIMTAD,
+                ov::DIMTIH,
+                ov::DIMTOH,
+            ] {
+                ov::set_on_entity(&mut entity, code, None);
+            }
+        } else {
+            self.ensure_dynamic_dimension_layer();
+            entity
+                .as_entity_mut()
+                .set_layer(DYNAMIC_DIMENSION_LAYER.to_string());
+            entity.common_mut().color = codec::types::Color::Rgb {
+                r: 103,
+                g: 109,
+                b: 118,
+            };
+        }
+        self.update_entity(entity)
+    }
+
     /// The document as written to a file: a dynamic dimension's screen-size
     /// overrides are a display matter and stay out of the file, and so does
     /// what resolving an external reference merged in (its geometry, nested
@@ -2686,6 +2791,25 @@ impl super::Scene {
         // Centre marks and centre lines go out in their stored form.
         crate::scene::center_native::export(&mut document);
         crate::entities::field::stamp_save_dates(&mut document);
+        // Each table keeps where its cell contents sit (a DXF file writes
+        // them beside the table).
+        let tables: Vec<_> = document
+            .entities()
+            .filter_map(|entity| match entity {
+                codec::EntityType::Table(table) => Some(table.common.handle),
+                _ => None,
+            })
+            .collect();
+        for handle in tables {
+            let Some(codec::EntityType::Table(table)) = document.get_entity(handle) else {
+                continue;
+            };
+            let mut table = (**table).clone();
+            crate::entities::table::store_cell_geometry(&mut table, &document, self.table_modified_since_save(handle));
+            if let Some(codec::EntityType::Table(stored)) = document.get_entity_mut(handle) {
+                **stored = table;
+            }
+        }
         for name in &self.unopened_layouts {
             crate::scene::write_layout_unopened(&mut document, name);
         }
@@ -3442,6 +3566,15 @@ impl super::Scene {
         bar_mode: i16,
         p: iced::Point,
     ) -> Option<ConstraintId> {
+        // On unconstrained drawings there are no glyphs. Skip computing the
+        // cache key: its visibility signature walks all selected and hidden
+        // handles and otherwise repeats on every idle pointer movement.
+        if self
+            .parametric_constraint_set(scope)
+            .is_none_or(|set| set.constraints.is_empty())
+        {
+            return None;
+        }
         let entries =
             self.cached_glyph_placements(scope, vp_size, show_values, display_mode, bar_mode);
         let index = glyph_hit_test_entries(&entries, p)?;
@@ -3710,6 +3843,153 @@ mod tests {
         Handle::new(v)
     }
 
+    /// The label a dynamic constraint shows is this function's output, and
+    /// nothing else in the suite reads it: pin every form the name-format
+    /// variable and the constraint's own state can select.
+    #[test]
+    fn the_dynamic_label_shows_the_name_and_value_the_format_variable_selects() {
+        // Name and value, with the value's trailing zeros dropped.
+        assert_eq!(
+            dynamic_dimension_text("d9", 80.0, 2, false, None, false, None),
+            "d9=80"
+        );
+        assert_eq!(
+            dynamic_dimension_text("d1", 111.80339887498948, 2, false, None, false, None),
+            "d1=111.8034"
+        );
+        // A whole hundred keeps its digits: trimming zeros stops at the point.
+        assert_eq!(
+            dynamic_dimension_text("d1", 100.0, 2, false, None, false, None),
+            "d1=100"
+        );
+        // A zero span shows a zero.
+        assert_eq!(
+            dynamic_dimension_text("d1", 0.0, 2, false, None, false, None),
+            "d1=0"
+        );
+        // An angle shows at angular precision, within one turn.
+        assert_eq!(
+            dynamic_dimension_text("ang1", 370.0, 2, false, None, false, Some(0)),
+            "ang1=10"
+        );
+        // The name alone, and the value alone.
+        assert_eq!(
+            dynamic_dimension_text("d1", 40.0, 0, false, None, false, None),
+            "d1"
+        );
+        assert_eq!(
+            dynamic_dimension_text("d1", 40.0, 1, false, None, false, None),
+            "40"
+        );
+    }
+
+    /// A reference constraint, a formula and an annotational dimension each
+    /// wear their own form of the same label.
+    #[test]
+    fn the_dynamic_label_marks_a_reference_a_formula_and_an_annotational_dimension() {
+        // A reference (driven) constraint's label sits in parentheses.
+        assert_eq!(
+            dynamic_dimension_text("d1", 40.0, 2, true, None, false, None),
+            "(d1=40)"
+        );
+        // A parameter defined by a formula shows the formula.
+        assert_eq!(
+            dynamic_dimension_text("len", 200.0, 2, false, Some("d1*2"), false, None),
+            "fx: len=d1*2"
+        );
+        // A number typed as the expression is a value, not a formula.
+        assert_eq!(
+            dynamic_dimension_text("d1", 40.0, 2, false, Some("40.5"), false, None),
+            "d1=40"
+        );
+        // An annotational dimension keeps four decimals.
+        assert_eq!(
+            dynamic_dimension_text("d1", 100.0, 2, false, None, true, None),
+            "d1=100.0000"
+        );
+    }
+
+    /// A reference constraint's label is the span its geometry has now, and
+    /// the post-edit path rebuilds it from the constraint's own references
+    /// rather than from the dimension entity's stored points.
+    #[test]
+    fn a_reference_label_shows_the_span_the_geometry_now_has() {
+        let mut scene = super::super::Scene::new();
+        scene.constraint_name_format = 2;
+        // Off-axis, so the span after the move reads 100 only vertically;
+        // across X it is 60.
+        let mut line = codec::entities::Line::from_points(
+            Vector3::new(700.0, 200.0, 0.0),
+            Vector3::new(740.0, 240.0, 0.0),
+        );
+        line.common.handle = h(1);
+        scene
+            .document
+            .add_entity(codec::EntityType::Line(line))
+            .unwrap();
+        let dimension = crate::modules::annotate::linear_dim::linear_dimension_entity(
+            glam::DVec3::new(700.0, 200.0, 0.0),
+            glam::DVec3::new(740.0, 240.0, 0.0),
+            glam::DVec3::new(740.0, 260.0, 0.0),
+            glam::DVec3::Y,
+            None,
+        );
+        let mut dimension = match dimension {
+            codec::EntityType::Dimension(dimension) => dimension,
+            _ => panic!("the builder must return a dimension"),
+        };
+        dimension.base_mut().common.handle = h(2);
+        // The layer the editor puts a dynamic dimension on; anywhere else it
+        // reads as annotational and prints four decimals.
+        dimension.base_mut().common.layer = DYNAMIC_DIMENSION_LAYER.to_string();
+        scene
+            .document
+            .add_entity(codec::EntityType::Dimension(dimension))
+            .unwrap();
+        let set = scene.parametric_constraint_set_mut(ParametricScope::ModelSpace);
+        let id = set.add(
+            ConstraintKind::DistanceY,
+            vec![ParametricRef::point(h(1), 0), ParametricRef::point(h(1), 1)],
+            Some(DrivingValue::Named("d1".to_string())),
+        );
+        // A reference (driven) constraint follows the geometry it measures.
+        set.constraints
+            .iter_mut()
+            .find(|constraint| constraint.id == id)
+            .expect("the constraint was just added")
+            .enabled = false;
+        set.dimensions.insert(id, h(2));
+
+        scene.refresh_dynamic_dimension_texts();
+        let label = |scene: &super::super::Scene| {
+            scene
+                .document
+                .get_entity(h(2))
+                .and_then(crate::entities::dimension::as_dimension)
+                .expect("the dimension is still there")
+                .base()
+                .user_text
+                .clone()
+                .expect("the routine writes the label")
+        };
+        let before = label(&scene);
+        assert_eq!(before, "(d1=40)");
+
+        let mut moved = scene
+            .document
+            .get_entity(h(1))
+            .cloned()
+            .expect("the line is there");
+        match &mut moved {
+            codec::EntityType::Line(line) => line.end = Vector3::new(760.0, 300.0, 0.0),
+            other => panic!("the entity under the drag must be the line, found {other:?}"),
+        }
+        // The edit path itself rewrites the label; no second call needed.
+        scene.update_entity(moved);
+        let after = label(&scene);
+        assert_eq!(after, "(d1=100)");
+    }
+
     #[test]
     fn glyph_placement_points_away_from_its_geometry() {
         let mut document = codec::Document::new();
@@ -3942,6 +4222,43 @@ mod tests {
             .unwrap()
             .enabled = false;
         assert_eq!(set.constraints_touching(h(1)).count(), 0);
+    }
+
+    #[test]
+    fn constraints_referencing_counts_disabled_and_each_constraint_once() {
+        let mut set = ParametricConstraintSet::new(ParametricScope::ModelSpace);
+        let id = set.add(
+            ConstraintKind::Coincident,
+            vec![ParametricRef::whole(h(1)), ParametricRef::whole(h(1))],
+            None,
+        );
+        set.constraints
+            .iter_mut()
+            .find(|c| c.id == id)
+            .unwrap()
+            .enabled = false;
+        // One constraint may name an entity on both sides of a third ref.
+        set.add(
+            ConstraintKind::DistanceDirected,
+            vec![
+                ParametricRef::whole(h(1)),
+                ParametricRef::whole(h(2)),
+                ParametricRef::whole(h(1)),
+            ],
+            None,
+        );
+        let kinds: Vec<_> = set
+            .constraints_referencing(h(1))
+            .map(|constraint| constraint.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ConstraintKind::Coincident,
+                ConstraintKind::DistanceDirected
+            ]
+        );
+        assert_eq!(set.constraints_touching(h(1)).count(), 1);
     }
 
     #[test]

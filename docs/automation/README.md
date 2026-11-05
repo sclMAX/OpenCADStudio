@@ -364,6 +364,8 @@ maps onto these three steps rather than a native op.
 
 `query` entities of type `TEXT`/`MTEXT` return the raw stored string in `value` plus a formatting-free rendering in `text` (MTEXT inline codes such as `\A1;` or `\P` are resolved; `%%d`-style TEXT codes become their glyphs). With `detail:"full"`, degenerate-width text bounds are widened with a documented estimate (height × 0.8 × character count) so `bounds`-based region filters stay usable.
 
+Every entity above `summary` detail also carries `constraints` — the constraints referencing it, as `{kind, participants, enabled, conflict, form}` entries, where `conflict` names a constraint the solver flagged (`Redundant` or `Conflicting`) and is `null` otherwise, and `form` is `Dynamic`/`Annotational` for a dimensional constraint's dimension (`null` for a geometric constraint) (see the API spec for the exact shape).
+
 ### Text operations — search, audit and replace
 
 Three dedicated text operations go beyond `query` for bulk text work:
@@ -685,7 +687,7 @@ undo step; missing `layer`s are created and reported in `layers_created`.
 | `Point` | `location` |
 | `Text` | `value`, `position`, optional `height` (default 2.5), `rotation_deg`, `style` |
 | `MText` | `value`, `position`, optional `height`, `width`, `rotation_deg`, `style` |
-| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg` |
+| `Insert` | `block` (must exist), `position`, optional `scale` (number or `[x,y,z]`, nonzero), `rotation_deg`, `attributes` (`{"TAG":"value"}`; tags are case-insensitive, the ones left out keep their default; unknown or constant tags are refused) |
 | `Solid` | `corners` (3 or 4 `[x,y,z]`) |
 | `Hatch` | `boundary` (≥ 3 points, closed), `solid`, or `pattern` (catalog name, default `ANSI31`), `pattern_scale`, `pattern_angle_deg` |
 
@@ -828,6 +830,7 @@ active-document guard — they may address any open document.
 | `osmode` | object-snap bitmask (integer) | ✓ |
 | `pdmode` / `pdsize` | point display mode / size | ✓ |
 | `extmin` / `extmax` | model-space extents `[x,y,z]` | read-only |
+| `constraintstatus` | active space's constraint state: `{scope, constraint_count, enabled_count, dof}` | read-only |
 
 ### `layout_create` / `page_setup_set` — layouts and page setups
 
@@ -875,7 +878,12 @@ template's tables/styles instead of the source drawing's.
 Copies the entities from the active document into the open document
 addressed by `document_id`. Every handle must exist in the source
 (`entity_absent` otherwise); the target must be open (`document_closed`).
-Referenced (missing) layer definitions travel along. `result.created` lists
+The dependencies the interactive copy carries travel along: layer, linetype
+and style records the copy needs, and the block definition the source holds
+for a copied reference — transitively, with its object graph. A reference
+whose definition the source itself does not hold stays a dangling reference,
+as it does when the drawing is loaded, and the audit reports it.
+`result.created` lists
 the new handles in the target, `result.count` their number. Combined with
 an empty `POST /documents` (REST) this is the multi-document assembly
 workflow.

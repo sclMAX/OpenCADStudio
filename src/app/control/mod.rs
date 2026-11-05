@@ -137,6 +137,11 @@ pub(super) struct State {
     /// it hold the control slot forever.
     #[cfg(target_arch = "wasm32")]
     pub(super) capture_deadline: Option<iced::time::Instant>,
+    /// The final entity changes of a history step that restored a
+    /// document-level snapshot. Such a step bumps geometry as a whole, so the
+    /// journal cannot name what moved; the step's own delta can, and the
+    /// response of the request that ran it reports these instead of `null`.
+    history_changes: Option<Vec<(codec::Handle, crate::scene::ChangeKind)>>,
 }
 
 /// The pending half of an interactive `user_select` operation (`interactive`
@@ -169,6 +174,31 @@ impl State {
             ..Self::default()
         }
     }
+
+    /// Offer a history step's entity changes to the response of the request
+    /// that is running it. The `routing` flag is set only while a request is
+    /// executing synchronously, so an undo someone triggers at the screen
+    /// (or while an interactive request is parked) records nothing.
+    pub(super) fn note_history_changes(
+        &mut self,
+        changes: Vec<(codec::Handle, crate::scene::ChangeKind)>,
+    ) {
+        if self.routing {
+            self.history_changes = Some(changes);
+        }
+    }
+
+    pub(super) fn take_history_changes(
+        &mut self,
+    ) -> Option<Vec<(codec::Handle, crate::scene::ChangeKind)>> {
+        self.history_changes.take()
+    }
+
+    /// Drop a step's account when no response consumed it, so a later
+    /// request cannot inherit changes it did not make.
+    pub(super) fn clear_history_changes(&mut self) {
+        self.history_changes = None;
+    }
 }
 struct Operation {
     id: String,
@@ -185,6 +215,15 @@ struct Operation {
 }
 fn failure(code: &str, error: impl ToString) -> Value {
     json!({"ok":false,"status":"failed","code":code,"error":error.to_string()})
+}
+/// A save that needs `allow_lossy`, with what it would lose.
+fn lossy_refusal(losses: &super::automation::SaveLosses) -> Value {
+    let mut error = losses.refusal();
+    error[..1].make_ascii_uppercase();
+    let mut reply = failure("lossy_conversion_not_acknowledged", error);
+    reply["dropped_on_save"] = json!(losses.dropped);
+    reply["mtext_losses"] = losses.mtext_json();
+    reply
 }
 /// `{"op":"open","name":"plan.dwg","data_base64":"…"}`: the web build has no
 /// filesystem path to open, so the caller sends the file itself. `name` is
@@ -349,7 +388,10 @@ fn command_category(name: &str) -> &'static str {
         "GEOMCONSTRAINT",
         "GCCOINCIDENT",
         "GCCOLLINEAR",
+        "GCPARALLEL",
         "GCPERPENDICULAR",
+        "GCTANGENT",
+        "GCSYMMETRIC",
         "QCONSTRAINT",
         "PCONSTRAINT",
         "GCHORIZONTAL",
@@ -452,6 +494,9 @@ pub(super) fn active_command_metadata(command: &dyn crate::command::CadCommand) 
             accepts.push("point");
         }
         accepts.push(kind);
+        if command.point_step_accepts_keywords() && !accepts.contains(&"token") {
+            accepts.push("token");
+        }
     }
     if options.iter().any(|option| !option.keyword.is_empty()) && !accepts.contains(&"token") {
         accepts.push("token");
@@ -573,7 +618,11 @@ impl OpenCADStudio {
             "selection":tab.scene.selected_handles_in_order().iter().map(|h|format!("{:X}",h.value())).collect::<Vec<_>>(),
             "selection_revision":self.control.selection_revision,
             "command":command,"modal":self.active_modal.as_ref().map(|m|format!("{m:?}")),
+            "tool_windows":self.tool_windows.iter().map(|t|format!("{:?}",t.kind)).collect::<Vec<_>>(),
             "layout":tab.scene.current_layout,
+            "block_editor":tab.active_block_edit
+                .and_then(|index| tab.block_edits.get(index))
+                .map(|session|json!({"name":session.block_name,"handle":format!("{:X}",session.br_handle.value())})),
             "ucs":tab.active_ucs.as_ref().map(|u|json!({"name":u.name,"origin":[u.origin.x,u.origin.y,u.origin.z],"x_axis":[u.x_axis.x,u.x_axis.y,u.x_axis.z],"y_axis":[u.y_axis.x,u.y_axis.y,u.y_axis.z],"elevation":u.elevation})),
             "cursor":{"world":tab.last_cursor_world.to_array(),"screen":[tab.last_cursor_screen.x,tab.last_cursor_screen.y]},
             "viewport_size":({let s=tab.scene.selection.borrow();[s.view.vp_size.0,s.view.vp_size.1]}),
@@ -593,7 +642,7 @@ impl OpenCADStudio {
         // may be reading it; clients close it with `close_modal`.
         if !self.control.automation_seen && self.control.enabled {
             self.control.automation_seen = true;
-            if self.active_modal != Some(super::ModalKind::DonationPrompt) {
+            if !self.dialog_open(super::ModalKind::DonationPrompt) {
                 self.pending_startup_modals
                     .retain(|kind| kind != &super::ModalKind::DonationPrompt);
             }
@@ -1001,6 +1050,17 @@ impl OpenCADStudio {
             return (response, Task::none());
         }
         let client = req["client_id"].as_str().unwrap_or("default").to_owned();
+        // The attribute form an attributed insertion raises is modal, and the
+        // command it parked waits for those answers, so they reach it through
+        // the action surface while that command is still the active one. The
+        // form covers the whole app, so any client may answer it, as any client
+        // may answer the dialogs the same guard has always let through.
+        let answers_attribute_form = op == "action"
+            && self.dialog_open(crate::app::ModalKind::InsertAttributes)
+            && matches!(
+                req["name"].as_str(),
+                Some("dialog_answer") | Some("dialog_ok") | Some("dialog_cancel") | Some("close_modal")
+            );
         if tab.active_cmd.is_some()
             && (self.control.owner.as_ref() != Some(&(tab.id, client.clone()))
                 || matches!(
@@ -1008,11 +1068,20 @@ impl OpenCADStudio {
                     "run" | "start" | "new" | "open" | "activate" | "switch_document"
                 ))
             && op != "cancel"
+            && !answers_attribute_form
         {
-            return (
-                failure("command_busy", "An interactive command is already active"),
-                Task::none(),
-            );
+            // Say who holds the command: the client that started it, or the
+            // user (no client) when it was started or taken over in the window.
+            let mut busy = failure("command_busy", "An interactive command is already active");
+            busy["command"] = json!(tab.active_cmd.as_ref().map(|command| command.name()));
+            busy["document_id"] = json!(tab.id);
+            busy["owner_client_id"] = json!(self
+                .control
+                .owner
+                .as_ref()
+                .filter(|(owner_tab, _)| *owner_tab == tab.id)
+                .map(|(_, owner)| owner.clone()));
+            return (busy, Task::none());
         }
         if matches!(op, "run" | "start" | "input") && tab.is_start {
             return (
@@ -1042,6 +1111,7 @@ impl OpenCADStudio {
         } else {
             Some(tab.id)
         };
+        self.control.clear_history_changes();
         self.control.pending = Some(Operation {
             id: id.clone(),
             request: req.clone(),
@@ -1366,20 +1436,20 @@ impl OpenCADStudio {
                     Some(&path),
                 )
                 .map_err(|error| failure("invalid_target", error))?;
-                let dropped =
-                    crate::io::dropped_on_save_count(&self.tabs[i].scene.document, version, is_dxf);
-                if dropped > 0 && req["allow_lossy"].as_bool() != Some(true) {
-                    return Err(failure(
-                        "lossy_conversion_not_acknowledged",
-                        format!(
-                            "Conversion would drop {dropped} unsupported record(s); set allow_lossy=true to acknowledge"
-                        ),
-                    ));
+                let losses = super::automation::SaveLosses::of(
+                    &self.tabs[i].scene.document,
+                    version,
+                    is_dxf,
+                );
+                let dropped = losses.dropped;
+                if !losses.lossless() && req["allow_lossy"].as_bool() != Some(true) {
+                    return Err(lossy_refusal(&losses));
                 }
                 self.set_control_result(json!({
                     "saved":path,
                     "target_format":super::automation::source_format(Some(&path), is_dxf),
                     "target_version":format!("{version:?}"),"dropped_on_save":dropped,
+                    "mtext_losses":losses.mtext_json(),
                 }));
                 if self.main_window.is_none() {
                     self.save_tab_synchronously_protected_as(i, path, version, true)
@@ -1425,15 +1495,14 @@ impl OpenCADStudio {
                     None,
                 )
                 .map_err(|error| failure("invalid_target", error))?;
-                let dropped =
-                    crate::io::dropped_on_save_count(&self.tabs[i].scene.document, version, is_dxf);
-                if dropped > 0 && req["allow_lossy"].as_bool() != Some(true) {
-                    return Err(failure(
-                        "lossy_conversion_not_acknowledged",
-                        format!(
-                            "Conversion would drop {dropped} unsupported record(s); set allow_lossy=true to acknowledge"
-                        ),
-                    ));
+                let losses = super::automation::SaveLosses::of(
+                    &self.tabs[i].scene.document,
+                    version,
+                    is_dxf,
+                );
+                let dropped = losses.dropped;
+                if !losses.lossless() && req["allow_lossy"].as_bool() != Some(true) {
+                    return Err(lossy_refusal(&losses));
                 }
                 let ext = if is_dxf { "dxf" } else { "dwg" };
                 self.sync_view_state_for_save(i);
@@ -1451,6 +1520,7 @@ impl OpenCADStudio {
                     "target_format": ext,
                     "target_version": format!("{version:?}"),
                     "dropped_on_save": dropped,
+                    "mtext_losses": losses.mtext_json(),
                     "bytes": bytes.len(),
                     "data_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
                 }));
@@ -1621,6 +1691,14 @@ impl OpenCADStudio {
         }
         self.control_settle();
     }
+    /// Whether a control client drives the command running in tab `i`.
+    pub(in crate::app) fn control_owns_command(&self, i: usize) -> bool {
+        self.control
+            .owner
+            .as_ref()
+            .is_some_and(|(tab, _)| self.tabs.get(i).is_some_and(|t| t.id == *tab))
+    }
+
     pub(super) fn control_observe_user_message(&mut self, message: &Message) {
         if self.control.routing || self.control.owner.is_none() {
             return;
@@ -1687,8 +1765,26 @@ impl OpenCADStudio {
         } else {
             "completed"
         };
-        let changes = self.tabs[self.active_tab].scene.replay_since(p.geometry_revision)
-            .map(|values| values.into_iter().take(1000).map(|(handle,kind)|json!({"handle":format!("{:X}",handle.value()),"kind":format!("{kind:?}")})).collect::<Vec<_>>());
+        // A step that restored a whole document snapshot bumps geometry as a
+        // whole, and the journal answers `None` for anything spanning it. The
+        // step's own delta named what it added and removed, so report that
+        // rather than claiming nothing can be said.
+        let changes = match self.tabs[self.active_tab]
+            .scene
+            .replay_since(p.geometry_revision)
+        {
+            Some(values) => Some(values),
+            None => self.control.take_history_changes(),
+        }
+        .map(|values| {
+            values
+                .into_iter()
+                .take(1000)
+                .map(|(handle, kind)| {
+                    json!({"handle":format!("{:X}",handle.value()),"kind":format!("{kind:?}")})
+                })
+                .collect::<Vec<_>>()
+        });
         let response = json!({"ok":!failed,"status":status,"request_id":p.id,"error":if failed{self.command_line.last_error.clone()}else{None},"result":p.result,"changes":changes,"state":self.control_state()});
         self.control.serial += 1;
         self.control.events.push_back(json!({"sequence":self.control.serial,"request_id":p.id,"status":status,"document_id":self.tabs[self.active_tab].id,"revision":self.tabs[self.active_tab].edit_revision}));
@@ -1723,8 +1819,6 @@ impl OpenCADStudio {
             let Some(entity) = tab.scene.document.get_entity(handle) else {
                 continue;
             };
-            let (min, max) =
-                crate::scene::convert::tess::entity_bounds_in(&tab.scene.document, entity);
             let metrics = tab
                 .scene
                 .meshes
@@ -1741,13 +1835,53 @@ impl OpenCADStudio {
                         crate::entities::solid3d::clamp_header_isolines(h.isolines),
                     )
                 });
+            let valid_bounds = |(min, max): &([f64; 3], [f64; 3])| {
+                (0..3).all(|axis| {
+                    min[axis].is_finite() && max[axis].is_finite() && min[axis] <= max[axis]
+                })
+            };
+            let solid_bounds = if let codec::EntityType::Solid3D(solid) = entity {
+                crate::scene::convert::solid3d_tess::kernel_body(solid)
+                    .and_then(|body| kernel::brep::body_bounds(&body))
+                    .map(|bounds| (bounds.min, bounds.max))
+                    .filter(valid_bounds)
+                    .or_else(|| {
+                        let mesh = metrics
+                            .as_ref()?
+                            .lods
+                            .iter()
+                            .find(|mesh| !mesh.verts.is_empty())?;
+                        let mut min = [f64::INFINITY; 3];
+                        let mut max = [f64::NEG_INFINITY; 3];
+                        // Reconstruct world coordinates; the f32 culling box loses
+                        // small dimensions at large drawing offsets.
+                        for (index, high) in mesh.verts.iter().enumerate() {
+                            let low = mesh.verts_low.get(index).copied().unwrap_or([0.0; 3]);
+                            let point = std::array::from_fn::<_, 3, _>(|axis| {
+                                high[axis] as f64 + low[axis] as f64
+                            });
+                            if point.iter().all(|value| value.is_finite()) {
+                                for axis in 0..3 {
+                                    min[axis] = min[axis].min(point[axis]);
+                                    max[axis] = max[axis].max(point[axis]);
+                                }
+                            }
+                        }
+                        Some((min, max)).filter(valid_bounds)
+                    })
+            } else {
+                None
+            };
+            let (min, max) = solid_bounds.unwrap_or_else(|| {
+                crate::scene::convert::tess::entity_bounds_in(&tab.scene.document, entity)
+            });
             let curve = crate::entities::curve::entity_curve(entity).map(|planar| {
                 let length = planar.curve.length();
                 json!({
                     "bounded":length.is_finite(),
                     "closed":planar.curve.is_closed(),
                     "length":length.is_finite().then_some(length),
-                    "area":planar.curve.is_closed().then(|| planar.curve.enclosed_area().abs())
+                    "area":planar.curve.is_closed().then(|| planar.curve.chord_closed_area().unwrap_or(0.0).abs())
                 })
             });
             out.push(json!({"handle":format!("{:X}",handle.value()),"type":crate::entities::names::ui_name(entity),"bounds":{"min":min,"max":max},"curve":curve,"mesh":metrics.map(|m|json!({"vertices":m.metrics.vertices,"triangles":m.metrics.triangles,"surface_area":m.metrics.surface_area,"volume":m.metrics.volume,"centroid":m.metrics.centroid,"moment_of_inertia":m.metrics.moment_of_inertia,"principal_directions":m.metrics.principal_directions,"principal_moments":m.metrics.principal_moments,"product_of_inertia":m.metrics.product_of_inertia,"radii_of_gyration":m.metrics.radii_of_gyration}))}));
@@ -2009,21 +2143,30 @@ impl OpenCADStudio {
         {
             self.control.capture_frame_pending = false;
             self.control.capture_after_redraw = redrew;
-            let Some(window) = self.main_window else {
+            // `os_window` names a window of its own (by title, or by what it
+            // shows, e.g. "Options" or "CommandHistory") to capture instead.
+            let named = self
+                .control
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.request["os_window"].as_str())
+                .and_then(|name| {
+                    self.os_windows
+                        .iter()
+                        .find(|window| {
+                            format!("{:?}", window.content).contains(name)
+                                || self
+                                    .os_window_title(window.id)
+                                    .is_some_and(|title| title.contains(name))
+                        })
+                        .map(|window| window.id)
+                });
+            let Some(window) = named.or(self.main_window) else {
                 return Task::done(Message::ControlScreenshot(path, None));
             };
-            // A minimized window has a 0x0 surface and the renderer panics
-            // reading it back, so report instead of capturing.
-            iced::window::size(window).then(move |size| {
-                let path = path.clone();
-                if size.width <= 0.0 || size.height <= 0.0 {
-                    Task::done(Message::ControlScreenshot(path, None))
-                } else {
-                    iced::window::screenshot(window).map(move |screenshot| {
-                        Message::ControlScreenshot(path.clone(), Some(screenshot))
-                    })
-                }
-            })
+            // A minimized window reports a failed capture instead.
+            crate::app::screenshot_if_drawn(window)
+                .map(move |screenshot| Message::ControlScreenshot(path.clone(), screenshot))
         }
     }
 }
@@ -2248,7 +2391,7 @@ mod tests {
             &mut app,
             json!({"op":"save","path":path,"overwrite":true,"allow_lossy":true}),
         );
-        let asked = app.active_modal == Some(crate::app::ModalKind::ConversionLoss);
+        let asked = app.active_modal == Some(crate::app::ModalKind::IfccadAlphaWarning);
         let _ = std::fs::remove_file(&path);
         assert!(asked, "converter target must still ask");
     }
@@ -3083,6 +3226,864 @@ mod tests {
         );
     }
 
+    /// A pickfirst selection is the selection `GCHIDE`/`GCSHOW` must act on;
+    /// completing without touching it reports success for doing nothing.
+    #[test]
+    fn pickfirst_hide_and_show_apply_to_the_selected_constraint() {
+        use crate::scene::parametric_constraints::ParametricScope;
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        let handle = request(&mut app, json!({"op":"query","type":"Line"}))["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        request(&mut app, json!({"op":"select","handles":[&handle]}));
+        request(&mut app, json!({"op":"run","cmd":"GCHORIZONTAL"}));
+        let id = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .and_then(|set| set.constraints.last())
+            .map(|constraint| constraint.id)
+            .expect("the horizontal constraint was created");
+        assert!(app.tabs[app.active_tab]
+            .scene
+            .is_parametric_constraint_visible(ParametricScope::ModelSpace, id));
+
+        let hidden = request(&mut app, json!({"op":"run","cmd":"GCHIDE"}));
+        assert_eq!(hidden["ok"], true, "{hidden}");
+        assert!(
+            !app.tabs[app.active_tab]
+                .scene
+                .is_parametric_constraint_visible(ParametricScope::ModelSpace, id),
+            "pickfirst GCHIDE hides the constraint on the selection: {hidden}"
+        );
+
+        let shown = request(&mut app, json!({"op":"run","cmd":"GCSHOW"}));
+        assert_eq!(shown["ok"], true, "{shown}");
+        assert!(
+            app.tabs[app.active_tab]
+                .scene
+                .is_parametric_constraint_visible(ParametricScope::ModelSpace, id),
+            "pickfirst GCSHOW shows it again: {shown}"
+        );
+    }
+
+    /// The same pickfirst rule inside the definition editor, where the
+    /// constraint lives in the definition's own scope.
+    #[test]
+    fn pickfirst_hide_applies_inside_the_definition_editor() {
+        use crate::scene::parametric_constraints::ParametricScope;
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let i = app.active_tab;
+        app.tabs[i].scene.define_block_raw(
+            "HIDE_ME",
+            codec::types::Vector3::ZERO,
+            vec![codec::EntityType::Line(codec::entities::Line::from_points(
+                codec::types::Vector3::ZERO,
+                codec::types::Vector3::UNIT_X,
+            ))],
+        );
+        let definition = app.tabs[i].scene.document.block_records.get("HIDE_ME").unwrap().handle;
+        let reference = app.tabs[i]
+            .scene
+            .document
+            .add_entity(codec::EntityType::Insert(codec::entities::Insert::new(
+                "HIDE_ME",
+                codec::types::Vector3::ZERO,
+            )))
+            .unwrap();
+        let _ = app.dispatch_command(&format!("BEDIT_BEGIN:{}", reference.value()));
+        assert!(app.tabs[i].active_block_edit.is_some());
+        let line = app.tabs[i]
+            .scene
+            .document
+            .block_records
+            .get("HIDE_ME")
+            .unwrap()
+            .entity_handles[0];
+        request(&mut app, json!({"op":"select","handles":[format!("{:X}", line.value())]}));
+        request(&mut app, json!({"op":"run","cmd":"GCHORIZONTAL"}));
+        let id = app.tabs[i]
+            .scene
+            .parametric_constraint_set(ParametricScope::Block(definition))
+            .and_then(|set| set.constraints.last())
+            .map(|constraint| constraint.id)
+            .expect("the horizontal constraint was created in the definition");
+        assert!(app.tabs[i]
+            .scene
+            .is_parametric_constraint_visible(ParametricScope::Block(definition), id));
+
+        let hidden = request(&mut app, json!({"op":"start","cmd":"GCHIDE"}));
+        assert_eq!(hidden["ok"], true, "{hidden}");
+        assert!(
+            !app.tabs[i]
+                .scene
+                .is_parametric_constraint_visible(ParametricScope::Block(definition), id),
+            "pickfirst GCHIDE inside the editor hides the definition constraint: {hidden}"
+        );
+    }
+
+    /// `GCRESET` resets the constraint display of what it was given, not the
+    /// whole space: another line's hidden indicator stays hidden. With nothing
+    /// selected there is nothing to reset, so it refuses instead of quietly
+    /// restoring the whole drawing.
+    #[test]
+    fn gcreset_resets_only_the_selected_constraint_display() {
+        use crate::scene::parametric_constraints::ParametricScope;
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,5 10,5"}));
+        let handles: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))
+            ["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+        for handle in &handles {
+            request(&mut app, json!({"op":"select","handles":[handle]}));
+            request(&mut app, json!({"op":"run","cmd":"GCHORIZONTAL"}));
+        }
+        let ids: Vec<_> = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .unwrap()
+            .constraints
+            .iter()
+            .map(|constraint| constraint.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        for handle in &handles {
+            request(&mut app, json!({"op":"select","handles":[handle]}));
+            request(&mut app, json!({"op":"run","cmd":"GCHIDE"}));
+        }
+        assert!(ids.iter().all(|id| !app.tabs[app.active_tab]
+            .scene
+            .is_parametric_constraint_visible(ParametricScope::ModelSpace, *id)));
+
+        request(&mut app, json!({"op":"select","handles":[&handles[0]]}));
+        request(&mut app, json!({"op":"run","cmd":"GCRESET"}));
+        let scene = &app.tabs[app.active_tab].scene;
+        assert!(
+            scene.is_parametric_constraint_visible(ParametricScope::ModelSpace, ids[0]),
+            "the selected constraint is shown again"
+        );
+        assert!(
+            !scene.is_parametric_constraint_visible(ParametricScope::ModelSpace, ids[1]),
+            "the unselected constraint stays hidden"
+        );
+
+        request(&mut app, json!({"op":"select","clear":true}));
+        request(&mut app, json!({"op":"run","cmd":"GCRESET"}));
+        assert!(
+            !app.tabs[app.active_tab]
+                .scene
+                .is_parametric_constraint_visible(ParametricScope::ModelSpace, ids[1]),
+            "no selection means no reset, so the remaining hidden indicator stays hidden"
+        );
+        let history = request(&mut app, json!({"op":"history"}));
+        assert!(
+            history["entries"].as_array().is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry["text"]
+                    .as_str()
+                    .is_some_and(|text| text.ends_with("No objects selected.")))),
+            "the refusal says why nothing was reset: {history}"
+        );
+
+        request(&mut app, json!({"op":"run","cmd":"LINE 20,20 30,20"}));
+        let bare = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .find(|handle| !handles.contains(handle))
+            .unwrap();
+        request(&mut app, json!({"op":"select","handles":[&bare]}));
+        request(&mut app, json!({"op":"run","cmd":"GCRESET"}));
+        let history = request(&mut app, json!({"op":"history"}));
+        assert!(
+            history["entries"].as_array().is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry["text"] == "No constraint indicators on the selection.")),
+            "a selection with no constraints is not reported as a reset: {history}"
+        );
+    }
+
+    /// A short constraint alias either applies what its prompt names or
+    /// refuses with a reason; it may not answer success while changing
+    /// nothing. A refused pick-first selection also leaves no command behind.
+    #[test]
+    fn constraint_aliases_act_on_the_selection_or_refuse() {
+        use crate::scene::parametric_constraints::{ConstraintKind, ParametricScope};
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,5 10,5"}));
+        request(&mut app, json!({"op":"run","cmd":"CIRCLE 0,20 5"}));
+        let lines: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+        let circle = request(&mut app, json!({"op":"query","type":"Circle"}))["entities"][0]
+            ["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let constraints = |app: &OpenCADStudio| {
+            app.tabs[app.active_tab]
+                .scene
+                .parametric_constraint_set(ParametricScope::ModelSpace)
+                .map(|set| {
+                    set.constraints
+                        .iter()
+                        .map(|constraint| constraint.kind)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        // Two lines form a collinear pair, so the alias applies it.
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        let colinear = request(&mut app, json!({"op":"run","cmd":"LCONSTRAINT"}));
+        assert_eq!(colinear["ok"], true, "{colinear}");
+        assert!(
+            constraints(&app).contains(&ConstraintKind::Colinear),
+            "LCONSTRAINT constrains the two picked lines: {colinear}"
+        );
+
+        // One line has no normal partner to relate to: refuse.
+        request(&mut app, json!({"op":"select","handles":[&lines[0]]}));
+        let short_normal = request(&mut app, json!({"op":"run","cmd":"NRCONSTRAINT"}));
+        assert_eq!(
+            short_normal["ok"], false,
+            "NRCONSTRAINT must refuse rather than report success with no change: {short_normal}"
+        );
+        assert!(
+            app.tabs[app.active_tab].active_cmd.is_none(),
+            "a refused pick-first selection leaves no command waiting"
+        );
+
+        // A line and a circle are a normal pair, so the alias applies it.
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &circle]}));
+        let normal = request(&mut app, json!({"op":"run","cmd":"NRCONSTRAINT"}));
+        assert_eq!(normal["ok"], true, "{normal}");
+        assert!(
+            constraints(&app).contains(&ConstraintKind::Normal),
+            "NRCONSTRAINT constrains the picked line and circle: {normal}"
+        );
+
+        // A single entity is all the midpoint alias needs to ask for its
+        // point, and asking is not a silent completion.
+        request(&mut app, json!({"op":"select","handles":[&lines[1]]}));
+        let midpoint = request(&mut app, json!({"op":"run","cmd":"MPCONSTRAINT"}));
+        assert_eq!(midpoint["status"], "waiting_input", "{midpoint}");
+        assert!(app.tabs[app.active_tab].active_cmd.is_some());
+        app.tabs[app.active_tab].active_cmd = None;
+
+        // Two objects are more than the point-on-curve alias can place a
+        // point against, so it refuses instead of answering success.
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &circle]}));
+        let on_curve = request(&mut app, json!({"op":"run","cmd":"OCCONSTRAINT"}));
+        assert_eq!(
+            on_curve["ok"], false,
+            "OCCONSTRAINT must refuse a two-object pick: {on_curve}"
+        );
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+
+        // The distance alias takes one object; two is a refusal.
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        let distance = request(&mut app, json!({"op":"run","cmd":"DCONSTRAINT"}));
+        assert_eq!(
+            distance["ok"], false,
+            "DCONSTRAINT must refuse two objects rather than report success: {distance}"
+        );
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+
+        // With nothing picked it asks for the objects instead.
+        request(&mut app, json!({"op":"select","clear":true}));
+        let distance_prompt = request(&mut app, json!({"op":"run","cmd":"DCONSTRAINT"}));
+        assert_eq!(distance_prompt["status"], "waiting_input", "{distance_prompt}");
+        app.tabs[app.active_tab].active_cmd = None;
+
+        // One object the distance alias cannot measure: refuse, and name the
+        // objects it does accept.
+        request(&mut app, json!({"op":"run","cmd":"POINT 5,5"}));
+        let point = request(&mut app, json!({"op":"query","type":"Point"}))["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        request(&mut app, json!({"op":"select","handles":[&point]}));
+        let unmeasurable = request(&mut app, json!({"op":"run","cmd":"DCONSTRAINT"}));
+        assert_eq!(
+            unmeasurable["ok"], false,
+            "DCONSTRAINT must refuse an object it cannot measure: {unmeasurable}"
+        );
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+
+        // The perpendicular and tangent aliases also refuse a wrong count
+        // instead of reporting success with nothing applied.
+        for cmd in ["QCONSTRAINT", "TCONSTRAINT"] {
+            request(&mut app, json!({"op":"select","handles":[&lines[0]]}));
+            let refused = request(&mut app, json!({"op":"run","cmd":cmd}));
+            assert_eq!(refused["ok"], false, "{cmd} must refuse one object: {refused}");
+            assert!(app.tabs[app.active_tab].active_cmd.is_none());
+        }
+
+        // A refusal must not leave the symmetric command mid-flight.
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        let symmetric = request(&mut app, json!({"op":"run","cmd":"SYCONSTRAINT"}));
+        assert_eq!(symmetric["ok"], false, "{symmetric}");
+        assert!(
+            app.tabs[app.active_tab].active_cmd.is_none(),
+            "a failed symmetric pick cancels the command instead of leaving it waiting: {symmetric}"
+        );
+
+        // A pair those two aliases cannot constrain at all: one line and one
+        // point. The count is right, the objects are not.
+        for cmd in ["QCONSTRAINT", "TCONSTRAINT"] {
+            request(
+                &mut app,
+                json!({"op":"select","handles":[&point, &lines[0]]}),
+            );
+            let refused = request(&mut app, json!({"op":"run","cmd":cmd}));
+            assert_eq!(
+                refused["ok"], false,
+                "{cmd} must refuse a pair it cannot constrain: {refused}"
+            );
+            assert!(
+                app.tabs[app.active_tab].active_cmd.is_none(),
+                "a failed {cmd} pick leaves no command waiting for another pick: {refused}"
+            );
+        }
+    }
+
+    /// `DCFORM` converts the selected dimensional constraint and the record
+    /// reads back the form it now uses; a selection without one is refused
+    /// rather than reported as a change.
+    #[test]
+    fn dcform_converts_the_selected_dimensional_constraint() {
+        use crate::command::CmdResult;
+        use crate::scene::parametric_constraints::{
+            ConstraintKind, ParametricRef, ParametricScope,
+        };
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 40,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,10 10,10"}));
+        let lines: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+        let line = codec::Handle::new(u64::from_str_radix(&lines[0], 16).unwrap());
+        let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
+            kind: ConstraintKind::DistanceX,
+            first: ParametricRef::point(line, 0),
+            second: ParametricRef::point(line, 1),
+            first_point: glam::DVec3::ZERO,
+            second_point: glam::DVec3::new(40.0, 0.0, 0.0),
+            location: glam::DVec3::new(20.0, -10.0, 0.0),
+            axis: glam::DVec3::X,
+            direction: None,
+            name: "d1".to_string(),
+            expression: "40".to_string(),
+            renamed: false,
+            label: "Linear constraint",
+        });
+        app.drive_headless_task(task).unwrap();
+        let dimension = *app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .and_then(|set| set.dimensions.values().next())
+            .expect("the dimensional constraint created its dimension");
+        assert!(
+            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            "a new dimensional constraint starts in the dynamic form"
+        );
+
+        let record = |app: &mut OpenCADStudio| {
+            request(app, json!({"op":"select","handles":[&lines[0]]}));
+            let read = request(app, json!({"op":"get_selection"}));
+            read["result"]["entities"][0]["constraints"].clone()
+        };
+        let dynamic = record(&mut app);
+        assert_eq!(dynamic[0]["kind"], "Horizontal distance", "{dynamic}");
+        assert_eq!(
+            dynamic[0]["form"], "Dynamic",
+            "the record names the form the dimension uses: {dynamic}"
+        );
+
+        let started = request(
+            &mut app,
+            json!({"op":"select","handles":[format!("{:X}", dimension.value())]}),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        let started = request(&mut app, json!({"op":"run","cmd":"DCFORM"}));
+        assert_eq!(started["status"], "waiting_input", "{started}");
+        let converted = request(
+            &mut app,
+            json!({"op":"input","kind":"token","text":"Annotational"}),
+        );
+        assert_eq!(converted["ok"], true, "{converted}");
+        assert!(
+            app.tabs[app.active_tab].active_cmd.is_none(),
+            "converting the selection finishes the command"
+        );
+        assert!(
+            app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            "the selected constraint now uses the annotational form: {converted}"
+        );
+        // The conversion is one undo step; redo re-applies it.
+        let undone = request(&mut app, json!({"op":"run","cmd":"UNDO"}));
+        assert_eq!(undone["ok"], true, "{undone}");
+        assert!(
+            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            "UNDO restores the dynamic form: {undone}"
+        );
+        let redone = request(&mut app, json!({"op":"run","cmd":"REDO"}));
+        assert_eq!(redone["ok"], true, "{redone}");
+        assert!(
+            app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            "REDO re-applies the annotational form: {redone}"
+        );
+        let annotational = record(&mut app);
+        assert_eq!(annotational[0]["form"], "Annotational", "{annotational}");
+
+        // Answering the same form again changes nothing and adds no history
+        // step, so the UNDO that follows still reverts the real conversion.
+        request(
+            &mut app,
+            json!({"op":"select","handles":[format!("{:X}", dimension.value())]}),
+        );
+        request(&mut app, json!({"op":"run","cmd":"DCFORM"}));
+        let same = request(
+            &mut app,
+            json!({"op":"input","kind":"token","text":"Annotational"}),
+        );
+        assert_eq!(same["ok"], true, "{same}");
+        let undone = request(&mut app, json!({"op":"run","cmd":"UNDO"}));
+        assert!(
+            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            "a repeated answer leaves no phantom undo step: {undone}"
+        );
+        request(&mut app, json!({"op":"run","cmd":"REDO"}));
+        assert!(app.tabs[app.active_tab].scene.dimension_is_annotational(dimension));
+
+        // And back, so the conversion works both ways.
+        request(
+            &mut app,
+            json!({"op":"select","handles":[format!("{:X}", dimension.value())]}),
+        );
+        request(&mut app, json!({"op":"run","cmd":"DCFORM"}));
+        let converted = request(&mut app, json!({"op":"input","kind":"token","text":"Dynamic"}));
+        assert_eq!(converted["ok"], true, "{converted}");
+        assert!(
+            !app.tabs[app.active_tab].scene.dimension_is_annotational(dimension),
+            "the selected constraint is dynamic again: {converted}"
+        );
+
+        // A selection that carries no dimensional constraint is refused.
+        request(&mut app, json!({"op":"select","handles":[&lines[1]]}));
+        let started = request(&mut app, json!({"op":"run","cmd":"DCFORM"}));
+        assert_eq!(started["status"], "waiting_input", "{started}");
+        let refused = request(
+            &mut app,
+            json!({"op":"input","kind":"token","text":"Annotational"}),
+        );
+        assert_eq!(
+            refused["ok"], false,
+            "DCFORM must refuse a selection with no dimensional constraint: {refused}"
+        );
+        assert!(app.tabs[app.active_tab].active_cmd.is_none());
+    }
+
+    /// A value other than the measured one is not just recorded: the same
+    /// command that creates the constraint moves the geometry it drives.
+    #[test]
+    fn a_typed_constraint_value_moves_the_geometry_it_drives() {
+        use crate::command::CmdResult;
+        use crate::scene::parametric_constraints::{
+            ConstraintKind, ParametricRef, ParametricScope,
+        };
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 40,0"}));
+        let lines = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let line = codec::Handle::new(
+            u64::from_str_radix(lines[0]["handle"].as_str().unwrap(), 16).unwrap(),
+        );
+        let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
+            kind: ConstraintKind::DistanceX,
+            first: ParametricRef::point(line, 0),
+            second: ParametricRef::point(line, 1),
+            first_point: glam::DVec3::ZERO,
+            second_point: glam::DVec3::new(40.0, 0.0, 0.0),
+            location: glam::DVec3::new(20.0, -10.0, 0.0),
+            axis: glam::DVec3::X,
+            direction: None,
+            name: "d1".to_string(),
+            expression: "100".to_string(),
+            renamed: false,
+            label: "Linear constraint",
+        });
+        app.drive_headless_task(task).unwrap();
+
+        let document = &app.tabs[app.active_tab].scene.document;
+        let codec::EntityType::Line(line_entity) = document.get_entity(line).unwrap() else {
+            panic!("the picked entity is the line");
+        };
+        assert!(
+            app.tabs[app.active_tab]
+                .scene
+                .parametric_constraint_set(ParametricScope::ModelSpace)
+                .is_some_and(|set| !set.dimensions.is_empty()),
+            "the constraint and its dimension were created"
+        );
+        assert!(
+            line_entity.start.x.abs() < 1e-6,
+            "the first point stays anchored: {}",
+            line_entity.start.x
+        );
+        assert!(
+            (line_entity.end.x - 100.0).abs() < 1e-6,
+            "the typed 100 replaces the measured 40 across X: {}",
+            line_entity.end.x
+        );
+        let dimension = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .and_then(|set| set.dimensions.values().next().copied())
+            .expect("the constraint drives a dimension");
+        let codec::EntityType::Dimension(printed) = app.tabs[app.active_tab]
+            .scene
+            .document
+            .get_entity(dimension)
+            .unwrap()
+        else {
+            panic!("the constraint's dimension is a dimension");
+        };
+        assert_eq!(
+            printed.base().user_text.as_deref(),
+            Some("d1=100"),
+            "the label carries the typed value, not the span that was drawn"
+        );
+    }
+
+    /// A dynamic dimension is placed automatically: its label point is the
+    /// zero sentinel and the dimension line's definition point holds where it
+    /// was drawn. Both survive a save, so the label re-places the same way.
+    #[test]
+    fn a_dynamic_dimensions_placement_survives_a_save() {
+        use crate::command::CmdResult;
+        use crate::scene::parametric_constraints::{
+            ConstraintKind, ParametricRef, ParametricScope,
+        };
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 700,200 700,240"}));
+        let drawn = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let line = codec::Handle::new(
+            u64::from_str_radix(drawn[0]["handle"].as_str().unwrap(), 16).unwrap(),
+        );
+        let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
+            kind: ConstraintKind::DistanceY,
+            first: ParametricRef::point(line, 0),
+            second: ParametricRef::point(line, 1),
+            first_point: glam::DVec3::new(700.0, 200.0, 0.0),
+            second_point: glam::DVec3::new(700.0, 240.0, 0.0),
+            location: glam::DVec3::new(740.0, 220.0, 0.0),
+            axis: glam::DVec3::Y,
+            direction: None,
+            name: "d1".to_string(),
+            expression: "40".to_string(),
+            renamed: false,
+            label: "Vertical distance constraint",
+        });
+        app.drive_headless_task(task).unwrap();
+
+        let dimension = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .and_then(|set| set.dimensions.values().next().copied())
+            .expect("the constraint drives a dimension");
+        let placement = |document: &codec::Document| {
+            let codec::EntityType::Dimension(printed) =
+                document.get_entity(dimension).expect("the dimension is in the document")
+            else {
+                panic!("the constraint's dimension is a dimension");
+            };
+            (
+                printed.base().definition_point,
+                printed.base().text_middle_point,
+                printed.base().text_user_positioned,
+            )
+        };
+        let (definition, text, positioned) = placement(&app.tabs[app.active_tab].scene.document);
+        assert!(
+            (definition.x - 740.0).abs() < 1e-6,
+            "the dimension line keeps the side the label was given on: {definition:?}"
+        );
+        assert!(
+            text == codec::types::Vector3::ZERO && !positioned,
+            "a dynamic label is placed automatically, not pinned: {text:?}"
+        );
+        let bytes = codec::DxfWriter::new(&app.tabs[app.active_tab].scene.document)
+            .write_to_vec()
+            .unwrap();
+        let reopened = codec::DxfReader::from_reader(std::io::Cursor::new(bytes))
+            .unwrap()
+            .read()
+            .unwrap();
+        let (saved_definition, saved_text, saved_positioned) = placement(&reopened);
+        assert!(
+            (saved_definition - definition).length() < 1e-6,
+            "the dimension line holds its place through the save: {definition:?} -> {saved_definition:?}"
+        );
+        assert!(
+            saved_text == text && saved_positioned == positioned,
+            "the label is still auto-placed after the save"
+        );
+    }
+
+    /// Editing the value afterwards drives the same geometry: the participant
+    /// the constraint holds moves to the new value in the edit's own command.
+    #[test]
+    fn editing_a_constraint_value_moves_the_geometry_it_drives() {
+        use crate::command::CmdResult;
+        use crate::scene::parametric_constraints::{ConstraintKind, ParametricRef};
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 40,0"}));
+        let drawn = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let line = codec::Handle::new(
+            u64::from_str_radix(drawn[0]["handle"].as_str().unwrap(), 16).unwrap(),
+        );
+        let task = app.apply_cmd_result(CmdResult::AddDimensionalConstraint {
+            kind: ConstraintKind::DistanceX,
+            first: ParametricRef::point(line, 0),
+            second: ParametricRef::point(line, 1),
+            first_point: glam::DVec3::ZERO,
+            second_point: glam::DVec3::new(40.0, 0.0, 0.0),
+            location: glam::DVec3::new(20.0, -10.0, 0.0),
+            axis: glam::DVec3::X,
+            direction: None,
+            name: "d1".to_string(),
+            expression: "40".to_string(),
+            renamed: false,
+            label: "Linear constraint",
+        });
+        app.drive_headless_task(task).unwrap();
+        let end_x = |app: &OpenCADStudio| {
+            let document = &app.tabs[app.active_tab].scene.document;
+            let codec::EntityType::Line(line_entity) = document.get_entity(line).unwrap() else {
+                panic!("the picked entity is the line");
+            };
+            line_entity.end.x
+        };
+        assert!(
+            (end_x(&app) - 40.0).abs() < 1e-6,
+            "the measured value leaves the line where it was drawn: {}",
+            end_x(&app)
+        );
+
+        let edit = request(&mut app, json!({"op":"run","cmd":"DCVALUE d1 100"}));
+        assert_eq!(edit["ok"], json!(true), "the value edit ran: {edit}");
+        assert!(
+            (end_x(&app) - 100.0).abs() < 1e-6,
+            "DCVALUE to 100 moved the constrained line: {}",
+            end_x(&app)
+        );
+    }
+
+    /// Every type the umbrella offers resolves as a command of its own, so
+    /// the option list is not the only way to reach any of them.
+    #[test]
+    fn every_umbrella_type_answers_to_its_own_command_name() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,5 10,5"}));
+        let umbrella = request(&mut app, json!({"op":"run","cmd":"GEOMCONSTRAINT"}));
+        let prompt = umbrella["state"]["command"]["prompt"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let types: Vec<String> = prompt
+            .match_indices('[')
+            .next()
+            .map(|(start, _)| {
+                prompt[start + 1..]
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .split('/')
+                    .map(|token| token.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(types.len() >= 12, "the umbrella lists its types: {prompt}");
+        request(&mut app, json!({"op":"cancel"}));
+        for token in &types {
+            let name = format!("GC{}", token.to_uppercase());
+            let opened = request(&mut app, json!({"op":"run","cmd": &name}));
+            assert!(
+                opened["ok"] == json!(true),
+                "{name} does not reach the constraint it is named for: {opened}"
+            );
+            assert!(
+                !app.command_line
+                    .history_plain_text()
+                    .contains(&format!("Unknown command: {name}")),
+                "{name} is not a command"
+            );
+            request(&mut app, json!({"op":"cancel"}));
+        }
+    }
+
+    /// The geometric umbrella's default follows the type used last, the way
+    /// the dimensional umbrella's does, instead of a fixed `Coincident`.
+    #[test]
+    fn geom_constraint_remembers_the_last_type_used() {
+        use crate::scene::parametric_constraints::{ConstraintKind, ParametricScope};
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,5 10,5"}));
+        let lines: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+        request(&mut app, json!({"op":"select","handles":[&lines[0]]}));
+        let applied = request(&mut app, json!({"op":"run","cmd":"GCHORIZONTAL"}));
+        assert_eq!(applied["ok"], true, "{applied}");
+
+        request(&mut app, json!({"op":"select","handles":[&lines[1]]}));
+        let umbrella = request(&mut app, json!({"op":"run","cmd":"GEOMCONSTRAINT"}));
+        assert_eq!(umbrella["status"], "waiting_input", "{umbrella}");
+        let prompt = umbrella["state"]["command"]["prompt"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            prompt.contains("<Horizontal>"),
+            "the umbrella remembers the type used last: {umbrella}"
+        );
+
+        // Enter takes that remembered type, not a fixed Coincident.
+        let accepted = request(&mut app, json!({"op":"input","kind":"enter"}));
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        let horizontal = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .map(|set| {
+                set.constraints
+                    .iter()
+                    .filter(|constraint| constraint.kind == ConstraintKind::Horizontal)
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(horizontal, 2, "Enter applied the remembered type: {accepted}");
+    }
+
+    /// The dedicated geometric-constraint names run the same handlers as the
+    /// umbrella's tokens, so the two surfaces cannot drift.
+    #[test]
+    fn gc_named_constraints_run_the_umbrella_handlers() {
+        use crate::scene::parametric_constraints::{ConstraintKind, ParametricScope};
+
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,5 16,9"}));
+        let lines: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        let parallel = request(&mut app, json!({"op":"run","cmd":"GCPARALLEL"}));
+        assert_eq!(parallel["ok"], true, "{parallel}");
+        let parallel_count = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .map(|set| {
+                set.constraints
+                    .iter()
+                    .filter(|constraint| constraint.kind == ConstraintKind::Parallel)
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            parallel_count, 1,
+            "GCPARALLEL must add the parallel relation: {parallel}"
+        );
+
+        // A fresh drawing keeps the second pair clear of the first relation.
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,5 16,9"}));
+        let lines: Vec<String> = request(&mut app, json!({"op":"query","type":"Line"}))["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["handle"].as_str().unwrap().to_string())
+            .collect();
+        request(&mut app, json!({"op":"select","handles":[&lines[0], &lines[1]]}));
+        let collinear = request(&mut app, json!({"op":"run","cmd":"GCCOLLINEAR"}));
+        assert_eq!(collinear["ok"], true, "{collinear}");
+        let collinear_count = app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set(ParametricScope::ModelSpace)
+            .map(|set| {
+                set.constraints
+                    .iter()
+                    .filter(|constraint| constraint.kind == ConstraintKind::Colinear)
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            collinear_count, 1,
+            "GCCOLLINEAR must add the collinear relation: {collinear}"
+        );
+
+        // With nothing selected the pick-driven names wait for their objects.
+        request(&mut app, json!({"op":"select","handles":[]}));
+        for cmd in ["GCTANGENT", "GCSYMMETRIC"] {
+            let waiting = request(&mut app, json!({"op":"run","cmd":cmd}));
+            assert_eq!(waiting["status"], "waiting_input", "{cmd}: {waiting}");
+            request(&mut app, json!({"op":"cancel"}));
+        }
+    }
+
     #[test]
     fn command_discovery_explains_batch_and_interactive_use() {
         let mut app = OpenCADStudio::new_for_test();
@@ -3152,6 +4153,166 @@ mod tests {
         let curve = &measured["measurements"][0]["curve"];
         assert!((curve["length"].as_f64().unwrap() - std::f64::consts::TAU * 2.0).abs() < 1e-9);
         assert!((curve["area"].as_f64().unwrap() - std::f64::consts::PI * 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn control_measure_solid_bounds_torus() {
+        let mut app = OpenCADStudio::new_for_test();
+        for center in [
+            [0.0, 0.0, 0.0],
+            [1000000000.25, -1000000000.5, 1000000000.75],
+        ] {
+            request(&mut app, json!({"op":"new"}));
+            let created = request(
+                &mut app,
+                json!({"op":"run","cmd":format!("TORUS {},{},{} 10 3", center[0], center[1], center[2])}),
+            );
+            assert_eq!(created["status"], "completed", "{created}");
+            let queried = request(&mut app, json!({"op":"query","type":"3DSOLID"}));
+            let handle = queried["entities"][0]["handle"].clone();
+            if center[0] != 0.0 {
+                let key =
+                    codec::Handle::new(u64::from_str_radix(handle.as_str().unwrap(), 16).unwrap());
+                let scene = &mut app.tabs[app.active_tab].scene;
+                assert!(scene.meshes.contains_key(&key));
+                // Keep the real mesh but force bounds to use its double-single vertices.
+                let Some(codec::EntityType::Solid3D(solid)) = scene.document.get_entity_mut(key)
+                else {
+                    panic!("expected a torus solid");
+                };
+                solid.acis_data = codec::entities::AcisData::from_sat("");
+            }
+            let measured = request(&mut app, json!({"op":"measure","handles":[handle]}));
+            let bounds = &measured["measurements"][0]["bounds"];
+            for axis in 0..3 {
+                let radius = if axis == 2 { 3.0 } else { 13.0 };
+                let min = bounds["min"][axis].as_f64().unwrap();
+                let max = bounds["max"][axis].as_f64().unwrap();
+                assert!((min - (center[axis] - radius)).abs() < 0.1, "{measured}");
+                assert!((max - (center[axis] + radius)).abs() < 0.1, "{measured}");
+                assert!((max - min - 2.0 * radius).abs() < 0.2, "{measured}");
+            }
+        }
+    }
+
+    #[test]
+    fn control_measure_solid_bounds_roundtrip() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let created = request(
+            &mut app,
+            json!({"op":"run","cmd":"BOX 20,30,40 26,35,40 4"}),
+        );
+        assert_eq!(created["status"], "completed", "{created}");
+        let queried = request(&mut app, json!({"op":"query","type":"3DSOLID"}));
+        let handle = queried["entities"][0]["handle"].clone();
+        let path = std::env::temp_dir().join(format!("ocs-measure-bounds-{}.dwg", session_id()));
+        for stage in 0..3 {
+            let measured = request(&mut app, json!({"op":"measure","handles":[handle]}));
+            let bounds = &measured["measurements"][0]["bounds"];
+            for (field, expected) in [("min", [20.0, 30.0, 40.0]), ("max", [26.0, 35.0, 44.0])] {
+                for axis in 0..3 {
+                    assert!(
+                        (bounds[field][axis].as_f64().unwrap() - expected[axis]).abs() < 1e-6,
+                        "{measured}"
+                    );
+                }
+            }
+            if stage == 0 {
+                assert_eq!(
+                    request(&mut app, json!({"op":"save","path":path}))["ok"],
+                    true
+                );
+                request(&mut app, json!({"op":"new"}));
+                assert_eq!(
+                    request(&mut app, json!({"op":"open","path":path}))["status"],
+                    "completed"
+                );
+            } else if stage == 1 {
+                app.tabs[app.active_tab].scene.meshes.clear();
+                app.tabs[app.active_tab].scene.block_meshes.clear();
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn control_measure_solid_bounds_preserves_curve_bounds() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        for (cmd, kind, min, max, length) in [
+            (
+                "LINE -5,0 5,0",
+                "Line",
+                [-5.0, 0.0, 0.0],
+                [5.0, 0.0, 0.0],
+                10.0,
+            ),
+            (
+                "CIRCLE 20,0 2",
+                "Circle",
+                [18.0, -2.0, 0.0],
+                [22.0, 2.0, 0.0],
+                std::f64::consts::TAU * 2.0,
+            ),
+        ] {
+            assert_eq!(
+                request(&mut app, json!({"op":"run","cmd":cmd}))["status"],
+                "completed"
+            );
+            let queried = request(&mut app, json!({"op":"query","type":kind}));
+            let measured = request(
+                &mut app,
+                json!({"op":"measure","handles":[queried["entities"][0]["handle"]]}),
+            );
+            let measurement = &measured["measurements"][0];
+            assert_eq!(measurement["bounds"], json!({"min":min,"max":max}));
+            assert!((measurement["curve"]["length"].as_f64().unwrap() - length).abs() < 1e-9);
+            assert_eq!(measurement["curve"]["bounded"], true);
+            assert_eq!(measurement["curve"]["closed"], kind == "Circle");
+            if kind == "Circle" {
+                assert!(
+                    (measurement["curve"]["area"].as_f64().unwrap() - std::f64::consts::PI * 4.0)
+                        .abs()
+                        < 1e-9
+                );
+            } else {
+                assert!(measurement["curve"]["area"].is_null());
+            }
+        }
+        for handles in [json!([]), json!(["FFFFFFFFFFFFFFFF"])] {
+            let measured = request(&mut app, json!({"op":"measure","handles":handles}));
+            assert_eq!(measured["ok"], true);
+            assert_eq!(measured["measurements"], json!([]));
+        }
+    }
+
+    #[test]
+    fn control_measure_solid_bounds_without_geometry() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        let scene = &mut app.tabs[app.active_tab].scene;
+        let handle = scene
+            .document
+            .add_entity(codec::EntityType::Solid3D(codec::entities::Solid3D::new()))
+            .unwrap();
+        let entity = scene.document.get_entity(handle).unwrap();
+        let (min, max) = crate::scene::convert::tess::entity_bounds_in(&scene.document, entity);
+        let measured = request(
+            &mut app,
+            json!({"op":"measure","handles":[format!("{:X}", handle.value())]}),
+        );
+        let measurement = &measured["measurements"][0];
+        assert_eq!(measurement["bounds"], json!({"min":min,"max":max}));
+        for field in ["min", "max"] {
+            for axis in 0..3 {
+                assert!(measurement["bounds"][field][axis]
+                    .as_f64()
+                    .unwrap()
+                    .is_finite());
+            }
+        }
+        assert!(measurement["mesh"].is_null());
     }
 
     #[test]
@@ -3488,6 +4649,8 @@ mod tests {
             json!({"op":"input","kind":"point","point":[10.,0.,0.]}),
         );
         assert_eq!(result["code"], "command_busy");
+        assert_eq!(result["command"], "LINE");
+        assert_eq!(result["owner_client_id"], Value::Null, "the user holds it now");
     }
     #[test]
     fn control_preserves_other_documents_and_waits_for_async_open() {
@@ -3770,6 +4933,51 @@ mod tests {
         // detail defaults to full, so the whole entity object rides along.
         assert!(
             done["result"]["entities"][0]["properties"].is_object(),
+            "{done}"
+        );
+    }
+
+    #[test]
+    fn user_select_hands_over_constraints_from_geometry_detail_up() {
+        let mut app = OpenCADStudio::new_for_test();
+        app.main_window = Some(iced::window::Id::unique());
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,10"}));
+        request(
+            &mut app,
+            json!({"op":"user_select","request_id":"us-c","type":"LINE"}),
+        );
+        let handle = user_select_pick(&mut app, "LINE");
+        app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set_mut(
+                crate::scene::parametric_constraints::ParametricScope::ModelSpace,
+            )
+            .add(
+                crate::scene::parametric_constraints::ConstraintKind::Fixed,
+                vec![crate::scene::parametric_constraints::ParametricRef::whole(
+                    codec::Handle::new(u64::from_str_radix(&handle, 16).unwrap()),
+                )],
+                None,
+            );
+        let _ = app.update(Message::CommandFinalize);
+        let done = user_select_result(&mut app, "us-c");
+        assert_eq!(
+            done["result"]["entities"][0]["constraints"],
+            json!([{"kind":"Fixed","participants":[handle],"enabled":true,"conflict":null,"form":null}]),
+            "{done}"
+        );
+
+        // A summary hand-over stays identity-only.
+        request(
+            &mut app,
+            json!({"op":"user_select","request_id":"us-cs","type":"LINE","detail":"summary"}),
+        );
+        user_select_pick(&mut app, "LINE");
+        let _ = app.update(Message::CommandFinalize);
+        let done = user_select_result(&mut app, "us-cs");
+        assert!(
+            done["result"]["entities"][0].get("constraints").is_none(),
             "{done}"
         );
     }
@@ -4075,6 +5283,25 @@ mod tests {
         let read = request(&mut app, json!({"op":"get_selection"}));
         assert_eq!(read["result"]["count"], 1);
         assert_eq!(read["result"]["entities"][0]["block"], Value::Null);
+        assert_eq!(read["result"]["entities"][0]["constraints"], json!([]));
+        app.tabs[app.active_tab]
+            .scene
+            .parametric_constraint_set_mut(
+                crate::scene::parametric_constraints::ParametricScope::ModelSpace,
+            )
+            .add(
+                crate::scene::parametric_constraints::ConstraintKind::Fixed,
+                vec![crate::scene::parametric_constraints::ParametricRef::whole(
+                    codec::Handle::new(u64::from_str_radix(&circle_handle, 16).unwrap()),
+                )],
+                None,
+            );
+        let read = request(&mut app, json!({"op":"get_selection"}));
+        assert_eq!(
+            read["result"]["entities"][0]["constraints"],
+            json!([{"kind": "Fixed", "participants": [circle_handle], "enabled": true, "conflict": null, "form": null}]),
+            "{read}"
+        );
     }
 
     #[test]
@@ -4294,5 +5521,310 @@ mod tests {
             }),
         );
         assert_eq!(moved["ok"], true, "{moved}");
+    }
+
+    fn panel_row_text(app: &OpenCADStudio, label: &str) -> String {
+        app.tabs[app.active_tab]
+            .properties
+            .sections
+            .iter()
+            .flat_map(|section| &section.props)
+            .find(|property| property.label == label)
+            .map(|property| match &property.value {
+                crate::scene::model::object::PropValue::EditText(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .unwrap_or_else(|| panic!("no {label} row on the panel"))
+    }
+
+    /// A transform keeps the selection, so the grip overlay and the Properties
+    /// rows must be rebuilt from the moved entity instead of going on
+    /// describing the place it occupied when the selection was made. Both are
+    /// fed by one snapshot, so a transform that forgets the rebuild leaves the
+    /// viewport drawing handles (and the palette reporting a position) for
+    /// geometry that is no longer there.
+    #[test]
+    fn a_transform_rebuilds_the_selected_grips_and_panel() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        let lines = app.control_request(json!({"op":"query","type":"Line"})).0;
+        let line = lines["entities"][0]["handle"].as_str().unwrap().to_string();
+        let defined = request(
+            &mut app,
+            json!({
+                "op":"block_define",
+                "name":"PARITY",
+                "handles":[line],
+                "base":[0,0,0],
+                "insert_at":[0,0,0]
+            }),
+        );
+        assert_eq!(defined["ok"], true, "{defined}");
+        let insert = defined["result"]["insert"].as_str().unwrap().to_string();
+        let selected = request(&mut app, json!({"op":"select","handles":[insert]}));
+        assert_eq!(selected["ok"], true, "{selected}");
+
+        let before = request(&mut app, json!({"op":"grips"}));
+        assert_eq!(
+            before["grips"][0]["point"][0].as_f64(),
+            Some(0.0),
+            "{before}"
+        );
+
+        let moved = request(
+            &mut app,
+            json!({
+                "op":"entities_transform",
+                "handles":[insert],
+                "action":"move",
+                "vector":[25,0,0]
+            }),
+        );
+        assert_eq!(moved["ok"], true, "{moved}");
+
+        let after = request(&mut app, json!({"op":"grips"}));
+        assert_eq!(
+            after["grips"][0]["point"][0].as_f64(),
+            Some(25.0),
+            "the grip must follow the moved insert: {after}"
+        );
+
+        // Compared against its own rebuild: a panel left behind by the
+        // transform no longer matches what the document says right now.
+        let stale = panel_row_text(&app, "Position X");
+        app.refresh_properties();
+        let fresh = panel_row_text(&app, "Position X");
+        assert_eq!(stale, fresh, "Position X must describe the moved insert");
+    }
+
+    /// Undo answers with what the step changed. An array is one step that
+    /// removes every copy it made, and the response has to name them so a
+    /// script can see what the step did without re-reading the drawing.
+    #[test]
+    fn undo_of_an_array_names_the_copies_it_removed() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        let lines = app.control_request(json!({"op":"query","type":"Line"})).0;
+        let line = lines["entities"][0]["handle"].as_str().unwrap().to_string();
+        let defined = request(
+            &mut app,
+            json!({
+                "op":"block_define",
+                "name":"PARITY",
+                "handles":[line],
+                "base":[0,0,0],
+                "insert_at":[0,0,0]
+            }),
+        );
+        assert_eq!(defined["ok"], true, "{defined}");
+        let insert = defined["result"]["insert"].as_str().unwrap().to_string();
+        let arrayed = request(
+            &mut app,
+            json!({
+                "op":"entities_transform",
+                "handles":[insert],
+                "action":"array",
+                "rows":1,
+                "columns":3,
+                "column_spacing":20
+            }),
+        );
+        assert_eq!(arrayed["ok"], true, "{arrayed}");
+        let created = arrayed["result"]["created"].as_array().unwrap();
+        assert_eq!(created.len(), 2, "{arrayed}");
+
+        let undo = request(&mut app, json!({"op":"undo"}));
+        let changes = undo["changes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("undo must name what it changed: {undo}"));
+        for handle in created {
+            assert!(
+                changes.iter().any(|change| change["handle"] == *handle),
+                "the undo must report copy {handle}: {undo}"
+            );
+        }
+    }
+
+    /// An undo that restores a document-level snapshot — turning entities
+    /// into a block definition touches the block table — changes entity
+    /// geometry through a path the journal cannot diff. The step still knows
+    /// exactly which entities it added and removed, and the response must
+    /// carry them instead of answering `changes: null`.
+    #[test]
+    fn undo_of_a_definition_step_names_the_handles_it_restored() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        let lines = app.control_request(json!({"op":"query","type":"Line"})).0;
+        let line = lines["entities"][0]["handle"].as_str().unwrap().to_string();
+        let defined = request(
+            &mut app,
+            json!({
+                "op":"block_define",
+                "name":"PARITY",
+                "handles":[line],
+                "base":[0,0,0],
+                "insert_at":[0,0,0]
+            }),
+        );
+        assert_eq!(defined["ok"], true, "{defined}");
+        let insert = defined["result"]["insert"].as_str().unwrap().to_string();
+
+        let undo = request(&mut app, json!({"op":"undo"}));
+        let changes = undo["changes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("undo must name what it changed: {undo}"));
+        assert!(
+            changes.iter().any(|change| change["handle"] == *insert),
+            "the undo must report the erased insert {insert}: {undo}"
+        );
+        assert!(
+            changes.iter().any(|change| change["handle"] == *line),
+            "the undo must report the restored line {line}: {undo}"
+        );
+    }
+
+    /// Only a request that is executing records a history step's account.
+    /// An interactive request parks its slot open while the person at the
+    /// screen works, and an undo they take then is not that request's doing.
+    #[test]
+    fn a_history_step_records_nothing_when_no_request_is_routing() {
+        let mut app = OpenCADStudio::new_for_test();
+        let changes = || vec![(codec::Handle::new(1), crate::scene::ChangeKind::Modified)];
+        app.control.note_history_changes(changes());
+        assert!(
+            app.control.take_history_changes().is_none(),
+            "an undo at the screen has no response to answer"
+        );
+        app.control.routing = true;
+        app.control.note_history_changes(changes());
+        assert_eq!(
+            app.control.take_history_changes().map(|changes| changes.len()),
+            Some(1)
+        );
+    }
+
+    /// Recalling a saved set replaces the selection, so the grip overlay has
+    /// to describe the set that is selected now — it is the same snapshot the
+    /// viewport paints and a drag aims from.
+    #[test]
+    fn loading_a_selection_set_rebuilds_the_grips() {
+        let mut app = OpenCADStudio::new_for_test();
+        request(&mut app, json!({"op":"new"}));
+        request(&mut app, json!({"op":"run","cmd":"LINE 0,0 10,0"}));
+        let first = app.control_request(json!({"op":"query","type":"Line"})).0
+            ["entities"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        request(&mut app, json!({"op":"run","cmd":"LINE 20,0 30,0"}));
+        let lines = app.control_request(json!({"op":"query","type":"Line"})).0;
+        let second = lines["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entity| entity["handle"].as_str())
+            .find(|handle| **handle != first)
+            .unwrap()
+            .to_string();
+
+        let selected = request(&mut app, json!({"op":"select","handles":[first]}));
+        assert_eq!(selected["ok"], true, "{selected}");
+        let before = request(&mut app, json!({"op":"grips"}));
+        assert_eq!(
+            before["grips"][0]["point"][0].as_f64(),
+            Some(0.0),
+            "{before}"
+        );
+
+        let saved = request(
+            &mut app,
+            json!({"op":"selection_set_save","name":"SECOND","handles":[second]}),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        let loaded = request(&mut app, json!({"op":"selection_set_load","name":"SECOND"}));
+        assert_eq!(loaded["ok"], true, "{loaded}");
+
+        let after = request(&mut app, json!({"op":"grips"}));
+        assert_eq!(
+            after["grips"][0]["point"][0].as_f64(),
+            Some(20.0),
+            "the grips must belong to the set that is selected now: {after}"
+        );
+    }
+
+    /// An attributed placement that raises the insertion form has no command
+    /// line left to type into, so the form's rows answer through actions.
+    #[test]
+    fn the_attribute_form_is_answerable_through_actions() {
+        use crate::app::insert_attributes_tests::{
+            askable, define, park_insert, placed_attributes,
+        };
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let i = app.active_tab;
+        define(
+            &mut app,
+            i,
+            "ATTDIA_SCRIPT",
+            vec![askable("WIDTH", "Width", "100"), askable("HEIGHT", "", "20")],
+        );
+        park_insert(&mut app, i, "ATTDIA_SCRIPT");
+        assert_eq!(
+            app.active_modal,
+            Some(crate::app::ModalKind::InsertAttributes),
+            "the placement is parked on the form"
+        );
+
+        let missed = request(
+            &mut app,
+            json!({"op":"action","request_id":"miss","name":"dialog_answer","tag":"DEPTH","value":"9"}),
+        );
+        assert_eq!(
+            missed["ok"], false,
+            "a row the form never asked for is refused: {missed}"
+        );
+
+        let answered = request(
+            &mut app,
+            json!({"op":"action","request_id":"answer","name":"dialog_answer","tag":"HEIGHT","value":"48"}),
+        );
+        assert_eq!(answered["ok"], true, "{answered}");
+        let ok = request(
+            &mut app,
+            json!({"op":"action","request_id":"ok","name":"dialog_ok"}),
+        );
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(
+            placed_attributes(&app, i, "ATTDIA_SCRIPT"),
+            vec![
+                ("WIDTH".to_string(), "100".to_string()),
+                ("HEIGHT".to_string(), "48".to_string()),
+            ],
+            "the answered row takes the script's value, the other keeps its default"
+        );
+    }
+
+    #[test]
+    fn a_declined_attribute_form_drops_the_placement() {
+        use crate::app::insert_attributes_tests::{askable, define, park_insert, placed_attributes};
+        let mut app = OpenCADStudio::new_for_test();
+        assert_eq!(request(&mut app, json!({"op":"new"}))["ok"], true);
+        let i = app.active_tab;
+        define(&mut app, i, "ATTDIA_SHRUG", vec![askable("TAG1", "", "7")]);
+        park_insert(&mut app, i, "ATTDIA_SHRUG");
+
+        let declined = request(
+            &mut app,
+            json!({"op":"action","request_id":"decline","name":"dialog_cancel"}),
+        );
+        assert_eq!(declined["ok"], true, "{declined}");
+        assert_eq!(app.active_modal, None, "and the form is gone");
+        assert!(
+            placed_attributes(&app, i, "ATTDIA_SHRUG").is_empty(),
+            "a declined form drops the placement"
+        );
     }
 }

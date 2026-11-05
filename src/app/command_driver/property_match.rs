@@ -1,7 +1,8 @@
 use super::*;
+use crate::command::CadCommand;
 
 impl OpenCADStudio {
-    pub(super) fn handle_match_entity_layer(&mut self, dest: Vec<Handle>, src: Handle) {
+    pub(super) fn handle_match_entity_layer(&mut self, dest: Vec<Handle>, src: Handle, copy: bool) {
         let i = self.active_tab;
         self.tabs[i].active_cmd = None;
         self.tabs[i].snap_result = None;
@@ -19,7 +20,15 @@ impl OpenCADStudio {
             self.command_line
                 .push_info(crate::t!("No editable objects selected.").as_ref());
         } else if let Some(layer) = src_layer {
-            self.push_undo_snapshot(i, "LAYMATCH");
+            self.push_undo_snapshot(i, if copy { "COPYTOLAYER" } else { "LAYMATCH" });
+            // Create the copies now; placement continues without another undo entry.
+            let dest = if copy {
+                self.tabs[i]
+                    .scene
+                    .copy_entities(&dest, &crate::command::EntityTransform::Translate(glam::DVec3::ZERO))
+            } else {
+                dest
+            };
             // Pure mutation lives in the shared kernel; lock-filter (above)
             // plus undo, invalidate, dirty and echo stay caller-side.
             let _ = crate::entities::match_props::match_layer_kernel(
@@ -32,9 +41,25 @@ impl OpenCADStudio {
             // repaint immediately (issue #231 class).
             self.invalidate_property_targets(i, &dest);
             self.tabs[i].dirty = true;
-            self.command_line
-                .push_info(crate::tf!("Layer matched to \"{layer}\".").as_ref());
+            if copy {
+                self.command_line.push_info(
+                    crate::tf!("{} object(s) copied to layer \"{layer}\".", dest.len()).as_ref(),
+                );
+            } else {
+                self.command_line
+                    .push_info(crate::tf!("Layer matched to \"{layer}\".").as_ref());
+            }
             self.sync_ribbon_layers();
+            if copy && !dest.is_empty() {
+                use crate::modules::draw::modify::copy::CopyCommand;
+                let wires = self.tabs[i].scene.wire_models_for(&dest);
+                self.tabs[i].scene.deselect_all();
+                let cmd = CopyCommand::move_layer_copies(dest, wires);
+                self.command_line.push_info(&cmd.prompt());
+                self.command_line.set_step_options(cmd.options());
+                self.tabs[i].active_cmd = Some(Box::new(cmd));
+                self.sync_dyn_fields();
+            }
         } else {
             self.command_line
                 .push_error(crate::t!("Source object not found.").as_ref());
@@ -47,6 +72,7 @@ impl OpenCADStudio {
         src: Handle,
     ) -> Option<Task<Message>> {
         let i = self.active_tab;
+        self.tabs[i].last_matchprop_src = src;
         dest.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
         if dest.is_empty() {
             return Some(Task::none());
@@ -84,9 +110,10 @@ impl OpenCADStudio {
             // Entity-level transfer lives in the shared kernel so headless
             // callers share it; the `&mut Document` xdata paths, undo,
             // tessellation, selection and echo stay caller-side here.
-            // `all()` preserves the interactive behaviour; the xdata paths
-            // below honour the matching flags for future narrow callers.
-            let match_opts = crate::entities::match_props::MatchOpts::all();
+            // MATCHMODE decides what crosses; the xdata paths below honour
+            // the same bits.
+            use crate::entities::match_props::MatchOpts;
+            let match_opts = MatchOpts::current();
             self.apply_property_op(i, "MATCHPROP", &dest, |app, handle| {
                 let mut is_dim = false;
                 let mut is_hatch = false;
@@ -97,7 +124,7 @@ impl OpenCADStudio {
                         crate::entities::match_props::match_properties_kernel(se, e, &match_opts);
                     }
                 }
-                if is_hatch && match_opts.copy_hatch_background {
+                if is_hatch && match_opts.has(MatchOpts::HATCH) {
                     if let Some(values) = &hatch_background_xdata {
                         crate::scene::view::dispatch::set_entity_xdata(
                             &mut app.tabs[i].scene.document,
@@ -113,7 +140,7 @@ impl OpenCADStudio {
                 // (Collapsed: the old outer `dstyle_xdata.is_some() || dst-is-dim`
                 // gate is subsumed — the replace only ever ran when both dst
                 // and src are dim/leader.)
-                if match_opts.copy_dim_overrides
+                if match_opts.has(MatchOpts::DIM)
                     && matches!(
                         app.tabs[i].scene.document.get_entity(handle),
                         Some(codec::EntityType::Dimension(_) | codec::EntityType::Leader(_))
@@ -128,6 +155,11 @@ impl OpenCADStudio {
                         handle,
                         dstyle_xdata.clone().unwrap_or_default(),
                     );
+                }
+                // A centre line is rebuilt on its own sources with the
+                // source's extensions (centre marks are done in the kernel).
+                if match_opts.has(MatchOpts::CENTER) {
+                    app.tabs[i].scene.match_centerline_extensions(src, handle);
                 }
                 // A restyled dimension renders from its baked *D block —
                 // drop the stale block so the new style shows (#398).

@@ -16,7 +16,10 @@ mod representation;
 mod stretch;
 mod targets;
 mod array;
+mod chains;
+mod flip_frames;
 pub(crate) mod options;
+pub(crate) mod chain;
 
 /// Smallest signed distance between two angles in radians, accounting for the
 /// wrap at ±π. Used for BPT rotation snapping and current-row detection.
@@ -125,6 +128,15 @@ pub(crate) fn all_parameters(doc: &Document, definition: Handle) -> Vec<Paramete
     let mut result = parameters(doc, definition, Kind::Move);
     result.extend(parameters(doc, definition, Kind::Rotate));
     result.extend(parameters(doc, definition, Kind::Flip));
+    result.sort_by_key(|p| p.id);
+    result
+}
+
+/// The listing reader over every parameter kind.
+pub(crate) fn all_listed_parameters(doc: &Document, definition: Handle) -> Vec<Parameter> {
+    let mut result = listed_parameters(doc, definition, Kind::Move);
+    result.extend(listed_parameters(doc, definition, Kind::Rotate));
+    result.extend(listed_parameters(doc, definition, Kind::Flip));
     result.sort_by_key(|p| p.id);
     result
 }
@@ -263,6 +275,21 @@ pub(crate) fn parameters(doc: &Document, definition: Handle, kind: Kind) -> Vec<
     let Ok(Some(graph)) = authoring::graph(doc, definition) else {
         return vec![];
     };
+    parameters_at(doc, definition, kind, graph)
+}
+
+/// The same parameters for a reader that only lists them. The graph is resolved
+/// through the links that say a definition holds it, not through the checks that
+/// decide whether an edit can be addressed through it, so a definition keeps
+/// listing its parameters while a graph refuses an edit.
+pub(crate) fn listed_parameters(doc: &Document, definition: Handle, kind: Kind) -> Vec<Parameter> {
+    let Some(graph) = authoring::listed_graph(doc, definition) else {
+        return vec![];
+    };
+    parameters_at(doc, definition, kind, graph)
+}
+
+fn parameters_at(doc: &Document, definition: Handle, kind: Kind, graph: Handle) -> Vec<Parameter> {
     let mut result = vec![];
     for (handle, p) in super::block_point_parameter::parameters(doc, definition) {
         if matches!(kind, Kind::Move | Kind::Stretch) {
@@ -477,6 +504,28 @@ pub(crate) fn create_array(
     )
 }
 
+/// What an action is called: its kind on its own, and once that name is taken
+/// in this definition the lowest number above 1 still free. The name is what
+/// the Actions tab lists and what a chain names an action by, so it has to read
+/// as the action the operator made, not as a slot in the evaluation graph.
+fn next_action_name(doc: &Document, definition: Handle, kind: Kind) -> String {
+    let kind = kind.name();
+    let taken = actions(doc, definition)
+        .into_iter()
+        .map(|(_, action, _, _)| action.element.name.clone())
+        .collect::<Vec<_>>();
+    (1..)
+        .map(|number| {
+            if number == 1 {
+                kind.to_string()
+            } else {
+                format!("{kind}{number}")
+            }
+        })
+        .find(|name| !taken.iter().any(|old| old.eq_ignore_ascii_case(name)))
+        .unwrap()
+}
+
 #[cfg(test)]
 pub(crate) fn create_with_frame(
     doc: &mut Document,
@@ -548,14 +597,17 @@ pub(crate) fn create_with_frame_points(
         .ok_or("The block definition is unavailable.")?
         .entity_handles;
     if targets.iter().any(|h| {
-        !members.contains(h)
-            || doc
-                .get_entity(*h)
-                .is_none_or(|e| !supported(e) || e.common().owner_handle != definition)
+        if let Some(entity) = doc.get_entity(*h) {
+            !members.contains(h) || !supported(entity) || entity.common().owner_handle != definition
+        } else {
+            kind != Kind::Move || chains::frame_target(doc, definition, p.id, *h).is_none()
+        }
     }) {
-        return Err(
-            "Select lines, lightweight polylines, arcs, circles, ellipses, points or text belonging to this block.",
-        );
+        return Err(if kind == Kind::Move {
+            "Select supported targets belonging to this block."
+        } else {
+            "Select lines, lightweight polylines, arcs, circles, ellipses, points or text belonging to this block."
+        });
     }
     let (column_offset, row_offset) = if kind == Kind::Array {
         let (col, row) = array_offsets.unwrap_or((1.0, 1.0));
@@ -614,7 +666,7 @@ pub(crate) fn create_with_frame_points(
     let action = BlockAction {
         element: BlockElement {
             eval: expression(slots.eval, NO_VALUE, BlockEvalValue::None),
-            name: format!("{}{}", kind.name(), slots.eval),
+            name: next_action_name(&staged, definition, kind),
             major: MAJOR,
             minor: MINOR,
             eed_1071: 0,
@@ -719,6 +771,9 @@ pub(crate) fn create_with_frame_points(
     );
     authoring::append_single(&mut staged, graph, slots, handle);
     authoring::graph::bind_ids(&mut staged, graph, slots.eval, &[p.id])?;
+    if kind == Kind::Move {
+        chains::Graph::new(&staged, definition)?;
+    }
     *doc = staged;
     Ok(handle)
 }
@@ -788,6 +843,30 @@ pub(crate) fn validate_frame_points(points: &[DVec3]) -> Result<(), &'static str
     stretch::native_frame(points, plane).map(|_| ())
 }
 
+/// User-editable targets, with owned Point/grip aliases represented once.
+pub(crate) fn editable_action_targets(
+    doc: &Document,
+    definition: Handle,
+    kind: Kind,
+    parameter_id: i32,
+    dependencies: &[Handle],
+) -> Vec<Handle> {
+    let mut seen = std::collections::BTreeSet::new();
+    dependencies
+        .iter()
+        .filter_map(|handle| {
+            if doc.get_entity(*handle).is_some() {
+                Some(*handle)
+            } else if kind == Kind::Move {
+                chains::frame_target(doc, definition, parameter_id, *handle)
+            } else {
+                None
+            }
+        })
+        .filter(|handle| seen.insert(*handle))
+        .collect()
+}
+
 pub(crate) fn retarget_frame_points(
     doc: &mut Document,
     definition: Handle,
@@ -799,11 +878,20 @@ pub(crate) fn retarget_frame_points(
         .into_iter()
         .find(|(h, _, _, _)| *h == handle)
         .ok_or("Select an action belonging to this block.")?;
-    let mut targets = targets.to_vec();
+    let mut targets = targets
+        .iter()
+        .map(|handle| {
+            if kind == Kind::Move {
+                chains::frame_target(doc, definition, id, *handle).unwrap_or(*handle)
+            } else {
+                *handle
+            }
+        })
+        .collect::<Vec<_>>();
     targets.sort();
     targets.dedup();
     if targets.is_empty() {
-        return Err("An action needs at least one object.");
+        return Err("An action needs at least one target.");
     }
     let members = &doc
         .block_records
@@ -812,16 +900,25 @@ pub(crate) fn retarget_frame_points(
         .ok_or("The definition is unavailable.")?
         .entity_handles;
     if targets.iter().any(|h| {
-        !members.contains(h)
-            || doc
-                .get_entity(*h)
-                .is_none_or(|e| e.common().owner_handle != definition || !supported(e))
+        if let Some(entity) = doc.get_entity(*h) {
+            !members.contains(h) || entity.common().owner_handle != definition || !supported(entity)
+        } else {
+            kind != Kind::Move || chains::frame_target(doc, definition, id, *h).is_none()
+        }
     }) {
-        return Err("Select supported drawing objects belonging to this block.");
+        return Err("Select supported targets belonging to this block.");
     }
     let old_targets = action.dependencies.clone();
     let old_geometry = targets::geometry(doc, definition, kind, id, &old_targets)?;
-    let bookkeeping = old_targets.iter().copied().filter(|handle| !old_geometry.contains(handle)).collect::<Vec<_>>();
+    let bookkeeping = old_targets
+        .iter()
+        .copied()
+        .filter(|handle| {
+            !old_geometry.contains(handle)
+                && (kind != Kind::Move
+                    || chains::frame_target(doc, definition, id, *handle).is_none())
+        })
+        .collect::<Vec<_>>();
     let requested_targets = targets.clone();
     let mut staged = doc.clone();
     let ObjectType::DynamicBlock(o) = staged.objects.get_mut(&handle).unwrap() else {
@@ -835,7 +932,12 @@ pub(crate) fn retarget_frame_points(
                 .ok_or("The Stretch parameter is unavailable.")?
                 .end
                 .z;
-            stretch::validate_options(a)?;
+            let action_nodes: std::collections::BTreeSet<i32> = actions(doc, definition)
+                .into_iter()
+                .map(|(_, act, _, _)| act.element.eval.node_id)
+                .filter(|&id| id > 0)
+                .collect();
+            stretch::validate_action_options(a, Some(&action_nodes))?;
             if let Some(corners) = frame {
                 let (points, handles) = stretch::bind_frame(doc, &targets, corners, plane)?;
                 a.points = points;
@@ -892,15 +994,35 @@ pub(crate) fn retarget_frame_points(
         DynamicBlockData::ArrayAction(a) => a.action.dependencies = targets,
         _ => return Err("This action's selection cannot be edited yet."),
     }
-    if !bookkeeping.is_empty() {
+    if !bookkeeping.is_empty() || kind == Kind::Move {
         let action = targets::action_mut(&mut o.data).unwrap();
-        action.dependencies = old_targets.iter().copied().filter(|handle| bookkeeping.contains(handle) || requested_targets.contains(handle)).collect();
+        action.dependencies = old_targets
+            .iter()
+            .copied()
+            .filter(|handle| {
+                bookkeeping.contains(handle)
+                    || requested_targets.contains(handle)
+                    || (kind == Kind::Move
+                        && chains::frame_target(doc, definition, id, *handle)
+                            .is_some_and(|point| requested_targets.contains(&point)))
+            })
+            .collect();
         for handle in requested_targets {
-            if !action.dependencies.contains(&handle) { action.dependencies.push(handle); }
+            let already_present = action.dependencies.iter().any(|existing| {
+                *existing == handle
+                    || (kind == Kind::Move
+                        && chains::frame_target(doc, definition, id, *existing) == Some(handle))
+            });
+            if !already_present {
+                action.dependencies.push(handle);
+            }
         }
     }
     if frame.is_some() && !needs_frame(kind) {
         return Err("Only Stretch actions have an action frame.");
+    }
+    if kind == Kind::Move {
+        chains::Graph::new(&staged, definition)?;
     }
     if staged == *doc {
         return Ok(false);
@@ -1195,6 +1317,14 @@ struct Evaluation<'a> {
     rebuild: bool,
     bases: Option<&'a std::collections::BTreeMap<Handle, DVec3>>,
     base_changed: bool,
+    previous_bases: Option<&'a std::collections::BTreeMap<Handle, DVec3>>,
+    previous_graph: Option<&'a Document>,
+    previous_values: Option<&'a std::collections::BTreeMap<Handle, DVec3>>,
+    requested: Option<&'a std::collections::BTreeSet<Handle>>,
+    resolved_frames: Option<&'a mut std::collections::BTreeMap<Handle, instance::ParameterFrame>>,
+    resolved_active: Option<&'a mut std::collections::BTreeMap<Handle, instance::ParameterFrame>>,
+    frames: Option<&'a std::collections::BTreeMap<Handle, instance::ParameterFrame>>,
+    managed_flip: Option<Handle>,
 }
 
 pub(crate) fn evaluate_framed(
@@ -1205,10 +1335,51 @@ pub(crate) fn evaluate_framed(
     input: Value,
     frames: &std::collections::BTreeMap<Handle, instance::ParameterFrame>,
     base_changed: bool,
+    previous_frames: &std::collections::BTreeMap<Handle, instance::ParameterFrame>,
+    resolved_frames: &mut std::collections::BTreeMap<Handle, instance::ParameterFrame>,
+    resolved_active: &mut std::collections::BTreeMap<Handle, instance::ParameterFrame>,
+    managed_flip: Option<Handle>,
 ) -> Result<bool, &'static str> {
-    let bases = frames.iter().map(|(handle, frame)| (*handle, frame.base)).collect();
-    evaluate_impl(doc, baseline, definition, parameter, input,
-        Evaluation { bases: Some(&bases), base_changed, rebuild: false })
+    let bases = frames
+        .iter()
+        .map(|(handle, frame)| (*handle, frame.base))
+        .collect();
+    let previous_bases = previous_frames
+        .iter()
+        .map(|(handle, frame)| (*handle, frame.base))
+        .collect();
+    let previous_values = previous_frames
+        .iter()
+        .map(|(handle, frame)| (*handle, frame.end))
+        .collect();
+    evaluate_impl(
+        doc,
+        baseline,
+        definition,
+        parameter,
+        input,
+        Evaluation {
+            bases: Some(&bases),
+            previous_bases: Some(&previous_bases),
+            previous_values: Some(&previous_values),
+            base_changed,
+            resolved_frames: Some(resolved_frames),
+            resolved_active: Some(resolved_active),
+            frames: Some(frames),
+            managed_flip,
+            rebuild: false,
+            ..Evaluation::default()
+        },
+    )
+}
+
+/// Effective input before a bulk update, with the graph that produced it.
+#[derive(Clone, Copy)]
+pub(crate) struct RebuildInputs<'a> {
+    pub document: &'a Document,
+    pub frames: &'a std::collections::BTreeMap<Handle, instance::ParameterFrame>,
+    pub values: &'a std::collections::BTreeMap<Handle, DVec3>,
+    pub requested: &'a std::collections::BTreeSet<Handle>,
 }
 
 pub(crate) fn rebuild_framed(
@@ -1216,12 +1387,38 @@ pub(crate) fn rebuild_framed(
     baseline: &Document,
     definition: Handle,
     frames: &std::collections::BTreeMap<Handle, instance::ParameterFrame>,
-) -> Result<(), &'static str> {
-    let Some(p) = all_parameters(baseline, definition).into_iter().next() else { return Ok(()) };
-    let bases = frames.iter().map(|(handle, frame)| (*handle, frame.base)).collect();
-    evaluate_impl(doc, baseline, definition, p.handle, value(doc, &p)?,
-        Evaluation { bases: Some(&bases), rebuild: true, base_changed: false })?;
-    Ok(())
+    previous: Option<RebuildInputs<'_>>,
+) -> Result<std::collections::BTreeMap<Handle, instance::ParameterFrame>, &'static str> {
+    let Some(p) = all_parameters(baseline, definition).into_iter().next() else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let bases = frames
+        .iter()
+        .map(|(handle, frame)| (*handle, frame.base))
+        .collect();
+    let previous_bases = previous.map(|p| p.frames.iter().map(|(h, f)| (*h, f.base)).collect());
+    let mut resolved_frames = std::collections::BTreeMap::new();
+    evaluate_impl(
+        doc,
+        baseline,
+        definition,
+        p.handle,
+        value(doc, &p)?,
+        Evaluation {
+            bases: Some(&bases),
+            frames: Some(frames),
+            rebuild: true,
+            base_changed: false,
+            previous_bases: previous_bases.as_ref().or(Some(&bases)),
+            previous_graph: previous.map(|p| p.document),
+            previous_values: previous.map(|p| p.values),
+            requested: previous.map(|p| p.requested),
+            resolved_frames: Some(&mut resolved_frames),
+            resolved_active: None,
+            managed_flip: None,
+        },
+    )?;
+    Ok(resolved_frames)
 }
 
 fn evaluate_impl(
@@ -1230,7 +1427,7 @@ fn evaluate_impl(
     definition: Handle,
     parameter: Handle,
     input: Value,
-    evaluation: Evaluation<'_>,
+    mut evaluation: Evaluation<'_>,
 ) -> Result<bool, &'static str> {
     let force = evaluation.rebuild;
     let base_for = |p: &Parameter| evaluation.bases.and_then(|bases| bases.get(&p.handle)).copied().unwrap_or(p.base);
@@ -1342,6 +1539,7 @@ fn evaluate_impl(
         }
         value => value,
     };
+    let chain = chains::Graph::new(baseline, definition)?;
     let previous = value(doc, &p)?;
     if !force && !evaluation.base_changed
         && match (previous, input) {
@@ -1354,6 +1552,51 @@ fn evaluate_impl(
     }
     let mut staged = doc.clone();
     set_value(&mut staged, &p, input)?;
+    let previous_chain =
+        chains::Graph::new(evaluation.previous_graph.unwrap_or(baseline), definition)?;
+    let autonomous = previous_chain.autonomous(
+        doc,
+        evaluation.previous_values,
+        evaluation.previous_bases.or(evaluation.bases),
+    )?;
+    let requested = if let Some(requested) = evaluation.requested {
+        requested.clone()
+    } else if force {
+        std::collections::BTreeSet::new()
+    } else {
+        std::collections::BTreeSet::from([parameter])
+    };
+    let mut detached_points = Vec::new();
+    for p in previous_chain
+        .receivers()
+        .filter(|p| !chain.contains(p.handle))
+    {
+        if let Some(current) = all_parameters(baseline, definition)
+            .into_iter()
+            .find(|q| q.handle == p.handle && (q.point || q.linear || q.flip))
+        {
+            let frame = autonomous[&p.handle];
+            if !current.flip {
+                set_value(&mut staged, &current, Value::Point(frame.end))?;
+            }
+            detached_points.push((current, frame));
+        }
+    }
+    let mut active_frames = std::collections::BTreeMap::new();
+    let chain_values = chain.resolve(
+        doc,
+        &mut staged,
+        &requested,
+        &autonomous,
+        evaluation.previous_values,
+        evaluation.bases,
+        &mut active_frames,
+    )?;
+    if let Some(resolved) = evaluation.resolved_active.as_deref_mut() {
+        resolved.extend(active_frames.iter().map(|(handle, frame)| (*handle, *frame)));
+    }
+    let base_for = |p: &Parameter| active_frames.get(&p.handle).map(|f| f.base)
+        .or_else(|| evaluation.bases.and_then(|bases| bases.get(&p.handle)).copied()).unwrap_or(p.base);
     let baseline_members = authoring::members(baseline, definition)
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -1379,6 +1622,7 @@ fn evaluate_impl(
         });
     }
     let all = actions(baseline, definition);
+    let order = chain_order(baseline, definition, &all)?;
     let mut affected = std::collections::BTreeSet::new();
     let mut geometric_targets = std::collections::BTreeMap::new();
     let mut prepared = std::collections::BTreeMap::new();
@@ -1402,7 +1646,24 @@ fn evaluate_impl(
             };
             stretch::validate_polar(baseline, definition, s)?;
         }
-        let geometric = targets::geometry(baseline, definition, *kind, *id, &a.dependencies)?;
+        // An inactive Flip has no effect on its targets. Retained drawings may
+        // include action/parameter dependencies we cannot transform yet; do not
+        // let those inactive links prevent another parameter from evaluating.
+        let inactive_flip = *kind == Kind::Flip
+            && parameters(baseline, definition, *kind)
+                .into_iter()
+                .find(|p| p.id == *id)
+                .is_some_and(|p| value(&staged, &p) == Ok(Value::Flip(false)));
+        let active_dependencies;
+        let dependencies = if inactive_flip || evaluation.managed_flip == Some(*action_handle) {
+            active_dependencies = a.dependencies.iter().copied()
+                .filter(|h| baseline.get_entity(*h).is_some())
+                .collect::<Vec<_>>();
+            &active_dependencies
+        } else {
+            &a.dependencies
+        };
+        let geometric = targets::geometry(baseline, definition, *kind, *id, dependencies)?;
         affected.extend(geometric.iter().copied());
         let target_count = geometric.len();
         geometric_targets.insert(*action_handle, geometric);
@@ -1413,7 +1674,7 @@ fn evaluate_impl(
                 .into_iter().find(|p| p.id == *id)
                 .ok_or("An action has an unsupported parameter binding.")?;
             if !supported_parameter(baseline, q.handle) {
-                return Err("This parameter uses value constraints or chaining not supported yet.");
+                return Err("This parameter uses value constraints not supported yet.");
             }
             if arr.column_offset <= 1e-6 || !arr.column_offset.is_finite()
                 || (q.xy && (arr.row_offset <= 1e-6 || !arr.row_offset.is_finite()))
@@ -1422,7 +1683,7 @@ fn evaluate_impl(
                 return Err("This Array action uses options not supported yet.");
             }
             if !a.action_ids.is_empty() {
-                return Err("Chained actions are not supported yet.");
+                return Err("An Array action cannot chain follow-up actions yet.");
             }
             array_plans.insert(*action_handle, array::Plan::new(
                 &q, base_for(&q), current(&staged, &q), arr, target_count,
@@ -1436,7 +1697,7 @@ fn evaluate_impl(
             .find(|p| p.id == *id)
             .ok_or("An action has an unsupported parameter binding.")?;
         if !supported_parameter(baseline, q.handle) {
-            return Err("This parameter uses value constraints or chaining not supported yet.");
+            return Err("This parameter uses value constraints not supported yet.");
         }
         let end = current(&staged, &q);
         let base = base_for(&q);
@@ -1476,9 +1737,16 @@ fn evaluate_impl(
                 if value(&staged, &q)? == Value::Flip(false) {
                     crate::command::EntityTransform::Translate(DVec3::ZERO)
                 } else {
+                    let (p1, p2) = if let Some(frame) = active_frames.get(&q.handle)
+                        .or_else(|| evaluation.frames.and_then(|f| f.get(&q.handle)))
+                    {
+                        (frame.base, frame.end)
+                    } else {
+                        (q.base, q.end)
+                    };
                     crate::command::EntityTransform::Mirror {
-                        p1: q.base,
-                        p2: q.end,
+                        p1,
+                        p2,
                         working_normal: DVec3::Z,
                     }
                 }
@@ -1495,10 +1763,6 @@ fn evaluate_impl(
             }
             Kind::Array => unreachable!(),
         };
-        // Do not silently ignore retained native action chains.
-        if !a.action_ids.is_empty() {
-            return Err("Chained actions are not supported yet.");
-        }
         let o = action_object;
         match &o.data {
             DynamicBlockData::MoveAction(m)
@@ -1539,7 +1803,8 @@ fn evaluate_impl(
         if let Some(e) = staged.get_entity(h) {
             entity.common_mut().invisible = e.common().invisible;
         }
-        for (action_handle, a, kind, _id) in &all {
+        for index in &order {
+            let (action_handle, a, kind, _id) = &all[*index];
             if !a.dependencies.contains(&h) || *kind == Kind::Array {
                 continue;
             }
@@ -1616,6 +1881,23 @@ fn evaluate_impl(
             }
         }
     }
+    for (p, frame) in detached_points {
+        if !p.flip {
+            set_value(&mut staged, &p, Value::Point(frame.end))?;
+        }
+        if let Some(frames) = evaluation.resolved_frames.as_deref_mut() {
+            frames.insert(p.handle, frame);
+        }
+    }
+    for (handle, frame) in chain_values {
+        if let Some(frames) = evaluation.resolved_frames.as_deref_mut() {
+            frames.insert(handle, frame);
+        }
+        let p = chain.parameter(handle);
+        if !p.flip {
+            set_value(&mut staged, p, Value::Point(frame.end))?;
+        }
+    }
     *doc = staged;
     Ok(true)
 }
@@ -1637,26 +1919,157 @@ fn supported_parameter(doc: &Document, handle: Handle) -> bool {
             && !(s.flags & 3 == 3 && s.minimum > s.maximum)
     };
     match &o.data {
-        DynamicBlockData::FlipParameter(p) => !p.parameter.parameter.chain_actions,
-        DynamicBlockData::RotationParameter(p) => {
-            !p.parameter.parameter.chain_actions && valid_value_set(&p.value_set)
-        }
-        DynamicBlockData::PointParameter(p) => !p.parameter.parameter.chain_actions,
-        DynamicBlockData::LinearParameter(p) => {
-            !p.parameter.parameter.chain_actions && valid_value_set(&p.value_set)
-        }
+        DynamicBlockData::FlipParameter(_) | DynamicBlockData::PointParameter(_) => true,
+        DynamicBlockData::RotationParameter(p) => valid_value_set(&p.value_set),
+        DynamicBlockData::LinearParameter(p) => valid_value_set(&p.value_set),
         DynamicBlockData::XYParameter(p) => {
-            !p.parameter.parameter.chain_actions
-                && valid_value_set(&p.x_value_set)
-                && valid_value_set(&p.y_value_set)
+            valid_value_set(&p.x_value_set) && valid_value_set(&p.y_value_set)
         }
         DynamicBlockData::PolarParameter(p) => {
-            !p.parameter.parameter.chain_actions
-                && valid_value_set(&p.distance_value_set)
-                && valid_value_set(&p.angle_value_set)
+            valid_value_set(&p.distance_value_set) && valid_value_set(&p.angle_value_set)
         }
         _ => false,
     }
+}
+
+/// The order the actions of one definition run in.
+///
+/// An action that names follow-up actions chains them: the follow-up works on the
+/// member as the first action left it, so the chain is the only record of the
+/// order the operator chose and has to decide the sequence. A chain names its
+/// follow-up by the node the evaluation graph gives that action, the same id
+/// space the parameter's own element lists are read in. Actions no chain points
+/// at keep the order the evaluation graph lists. Known non-action nodes and
+/// actions of other parameters are retained connections rather than follow-ups.
+/// Other names are checked before any ordering happens, so a chain that
+/// resolves to nothing, that two actions answer to, that names more than one
+/// follow-up, that joins two sequences, or that runs into an array action is
+/// refused. A chain that loops back on itself has no first action, so the loop is
+/// left in the order the graph lists rather than guessed at.
+fn chain_order(
+    doc: &Document,
+    definition: Handle,
+    all: &[(Handle, &BlockAction, Kind, i32)],
+) -> Result<Vec<usize>, &'static str> {
+    let mut by_chain_id = std::collections::BTreeMap::new();
+    let mut shared_chain_ids = std::collections::BTreeSet::new();
+    let mut listed = std::collections::BTreeSet::new();
+    for (index, (handle, action, _, _)) in all.iter().enumerate() {
+        if !listed.insert(*handle) {
+            return Err("The evaluation graph lists one action twice.");
+        }
+        // A file that carries no evaluation expression leaves every action at
+        // node 0, the id for "no node", so only a named node can be chained to.
+        let node = action.element.eval.node_id;
+        if node > 0 && by_chain_id.insert(node, index).is_some() {
+            shared_chain_ids.insert(node);
+        }
+    }
+    let graph_nodes: std::collections::BTreeSet<_> = authoring::graph(doc, definition)?
+        .and_then(|h| match doc.objects.get(&h) {
+            Some(ObjectType::DynamicBlock(o)) => match &o.data {
+                DynamicBlockData::EvaluationGraph(g) => Some(
+                    g.nodes
+                        .iter()
+                        .filter_map(|n| match doc.objects.get(&n.expression)? {
+                            ObjectType::BlockVisibilityParameter(p) => Some(p.eval_node_id),
+                            ObjectType::DynamicBlock(o) => match &o.data {
+                                DynamicBlockData::ProxyNode(p) => Some(p.node_id),
+                                DynamicBlockData::BasePointParameter(p) => {
+                                    Some(p.parameter.parameter.element.eval.node_id)
+                                }
+                                DynamicBlockData::AlignmentParameter(p) => {
+                                    Some(p.parameter.parameter.element.eval.node_id)
+                                }
+                                DynamicBlockData::LookupParameter(p) => {
+                                    Some(p.parameter.parameter.element.eval.node_id)
+                                }
+                                DynamicBlockData::UserParameter(p) => {
+                                    Some(p.parameter.parameter.element.eval.node_id)
+                                }
+                                DynamicBlockData::LookupAction(p) => {
+                                    Some(p.action.element.eval.node_id)
+                                }
+                                DynamicBlockData::GripLocationComponent(p) => Some(p.eval.node_id),
+                                DynamicBlockData::AlignmentGrip(p)
+                                | DynamicBlockData::LinearGrip(p) => {
+                                    Some(p.grip.element.eval.node_id)
+                                }
+                                DynamicBlockData::FlipGrip(p) => Some(p.grip.element.eval.node_id),
+                                DynamicBlockData::LookupGrip(p)
+                                | DynamicBlockData::PolarGrip(p)
+                                | DynamicBlockData::RotationGrip(p)
+                                | DynamicBlockData::VisibilityGrip(p)
+                                | DynamicBlockData::XYGrip(p)
+                                | DynamicBlockData::PropertiesTableGrip(p) => {
+                                    Some(p.element.eval.node_id)
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .chain(all_parameters(doc, definition).into_iter().map(|p| p.id))
+                        .collect(),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut followed_by = std::collections::BTreeMap::new();
+    let mut next_action = std::collections::BTreeMap::new();
+    for (index, (_, action, kind, owner)) in all.iter().enumerate() {
+        if matches!(*kind, Kind::Stretch | Kind::PolarStretch | Kind::Array) {
+            continue;
+        }
+        for id in &action.action_ids {
+            if shared_chain_ids.contains(id) {
+                return Err("An action chain names more than one action.");
+            }
+            let Some(&next) = by_chain_id.get(id) else {
+                if graph_nodes.contains(id) {
+                    continue;
+                }
+                return Err("An action chain names an object outside this block.");
+            };
+            if all[next].3 != *owner {
+                continue;
+            }
+            if next_action.insert(index, next).is_some() {
+                return Err("An action chain cannot name more than one follow-up action yet.");
+            }
+            if all[next].2 == Kind::Array {
+                return Err("An Array action cannot be the follow-up of a chain yet.");
+            }
+            if followed_by.insert(next, index).is_some() {
+                return Err("An action chain joins two sequences.");
+            }
+        }
+    }
+    let mut order = Vec::with_capacity(all.len());
+    let mut placed = std::collections::BTreeSet::new();
+    for head in 0..all.len() {
+        if followed_by.contains_key(&head) {
+            continue;
+        }
+        let mut queue = std::collections::VecDeque::from([head]);
+        while let Some(index) = queue.pop_front() {
+            if !placed.insert(index) {
+                continue;
+            }
+            order.push(index);
+            if let Some(&next) = next_action.get(&index) {
+                queue.push_back(next);
+            }
+        }
+    }
+    // A cycle has no head, so whatever is left keeps the graph's own order.
+    for index in 0..all.len() {
+        if placed.insert(index) {
+            order.push(index);
+        }
+    }
+    Ok(order)
 }
 
 pub(crate) fn constrain_value_set(value: f64, set: &codec::objects::BlockParameterValueSet) -> f64 {

@@ -87,13 +87,13 @@ impl OpenCADStudio {
         match crate::scene::block_orientation_parameter::set_alignment_type(&mut staged, definition, parameter, perpendicular) {
             Ok(changed) => {
                 if changed {
-                    self.push_undo_snapshot(i, "Alignment type");
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Alignment type"));
                     self.apply_action_document(i, staged);
                     self.tabs[i].scene.bump_geometry();
                     self.tabs[i].dirty = true;
                     self.finish_pending_history(i);
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 self.refresh_properties();
             }
             Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
@@ -104,6 +104,9 @@ impl OpenCADStudio {
     pub(super) fn commit_authoring_action_option(&mut self, field: &'static str) -> Task<Message> {
         if field.starts_with("authoring_action_base_") {
             return self.commit_authoring_action_base(field);
+        }
+        if field == "authoring_action_chain" {
+            return self.commit_authoring_action_chain();
         }
         use crate::scene::block_actions::options;
         let i = self.active_tab;
@@ -126,14 +129,48 @@ impl OpenCADStudio {
         let mut staged = self.tabs[i].scene.document.clone();
         match options::set(&mut staged, definition, handle, multiplier, angle) {
             Ok(true) => {
-                let staged = match crate::scene::block_actions::instance::refresh(&staged, definition) {
+                let staged = match crate::scene::block_actions::instance::refresh_after_edit(
+                    &staged, &self.tabs[i].scene.document, definition,
+                ) {
                     Ok(staged) => staged,
                     Err(error) => {
                         self.command_line.push_error(crate::t!(error).as_ref());
                         return Task::none();
                     }
                 };
-                self.push_undo_snapshot(i, "Edit block action override");
+                self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Edit block action override"));
+                self.apply_action_document(i, staged);
+                self.tabs[i].dirty = true;
+                self.tabs[i].scene.bump_geometry();
+                self.finish_pending_history(i);
+                self.tabs[i].properties.edit_buf.remove(&key);
+                self.refresh_properties();
+            }
+            Ok(false) => { self.tabs[i].properties.edit_buf.remove(&key); }
+            Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
+        }
+        Task::none()
+    }
+
+    pub(super) fn commit_authoring_action_chain(&mut self) -> Task<Message> {
+        use crate::scene::block_actions::{chain, instance};
+        let i = self.active_tab;
+        let Some(session) = self.tabs[i].active_block_edit_session() else { return Task::none() };
+        let definition = session.br_handle;
+        let Some(handle) = self.tabs[i].selected_authoring else { return Task::none() };
+        let key = crate::ui::properties::FieldKey::Geom("authoring_action_chain");
+        let Some(input) = self.tabs[i].properties.edit_buf.get(&key).cloned() else { return Task::none() };
+        let mut staged = self.tabs[i].scene.document.clone();
+        match chain::set_by_name(&mut staged, definition, handle, &input) {
+            Ok(true) => {
+                let staged = match instance::refresh(&staged, definition) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        self.command_line.push_error(crate::t!(error).as_ref());
+                        return Task::none();
+                    }
+                };
+                self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Edit block action chain"));
                 self.apply_action_document(i, staged);
                 self.tabs[i].dirty = true;
                 self.tabs[i].scene.bump_geometry();
@@ -182,7 +219,7 @@ impl OpenCADStudio {
         match result {
             Ok(true) => match instance::refresh(&staged, definition) {
                 Ok(staged) => {
-                    self.push_undo_snapshot(i, "Edit block action base point");
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Edit block action base point"));
                     self.apply_action_document(i, staged);
                     self.tabs[i].dirty = true;
                     self.tabs[i].scene.bump_geometry();
@@ -255,11 +292,14 @@ impl OpenCADStudio {
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, index, g)| (index, g.id, g.is_midpoint, g.world))
     }
+    /// The chaining bit and the value sets a parameter's row offers. A `None` chaining
+    /// means this kind's actions never run, so the bit would store a promise the
+    /// definition cannot keep.
     pub(super) fn authoring_parameter_properties(
         &self,
         handle: Handle,
     ) -> Option<(
-        bool,
+        Option<bool>,
         Vec<(
             &'static str,
             &'static str,
@@ -276,48 +316,106 @@ impl OpenCADStudio {
         };
         let (chain_actions, value_sets) = match &object.data {
             codec::objects::DynamicBlockData::LinearParameter(parameter) => (
-                parameter.parameter.parameter.chain_actions,
+                Some(parameter.parameter.parameter.chain_actions),
                 vec![("linear_distance", "Distance", &parameter.value_set)],
             ),
             codec::objects::DynamicBlockData::PolarParameter(parameter) => (
-                parameter.parameter.parameter.chain_actions,
+                Some(parameter.parameter.parameter.chain_actions),
                 vec![
                     ("polar_distance", "Distance", &parameter.distance_value_set),
                     ("polar_angle", "Angle", &parameter.angle_value_set),
                 ],
             ),
             codec::objects::DynamicBlockData::XYParameter(parameter) => (
-                parameter.parameter.parameter.chain_actions,
+                Some(parameter.parameter.parameter.chain_actions),
                 vec![
                     ("xy_x", "X Distance", &parameter.x_value_set),
                     ("xy_y", "Y Distance", &parameter.y_value_set),
                 ],
             ),
             codec::objects::DynamicBlockData::RotationParameter(parameter) => (
-                parameter.parameter.parameter.chain_actions,
+                Some(parameter.parameter.parameter.chain_actions),
                 vec![("rotation_angle", "Angle", &parameter.value_set)],
             ),
             codec::objects::DynamicBlockData::PointParameter(parameter) => {
-                (parameter.parameter.parameter.chain_actions, vec![])
-            }
-            codec::objects::DynamicBlockData::AlignmentParameter(parameter) => {
-                (parameter.parameter.parameter.chain_actions, vec![])
+                (Some(parameter.parameter.parameter.chain_actions), vec![])
             }
             codec::objects::DynamicBlockData::FlipParameter(parameter) => {
-                (parameter.parameter.parameter.chain_actions, vec![])
+                (Some(parameter.parameter.parameter.chain_actions), vec![])
             }
-            codec::objects::DynamicBlockData::BasePointParameter(parameter) => {
-                (parameter.parameter.parameter.chain_actions, vec![])
-            }
-            codec::objects::DynamicBlockData::LookupParameter(parameter) => {
-                (parameter.parameter.parameter.chain_actions, vec![])
-            }
-            codec::objects::DynamicBlockData::UserParameter(parameter) => {
-                (parameter.parameter.parameter.chain_actions, vec![])
-            }
+            codec::objects::DynamicBlockData::AlignmentParameter(_)
+            | codec::objects::DynamicBlockData::BasePointParameter(_)
+            | codec::objects::DynamicBlockData::LookupParameter(_)
+            | codec::objects::DynamicBlockData::UserParameter(_) => (None, vec![]),
             _ => return None,
         };
         Some((chain_actions, value_sets))
+    }
+
+    /// Flip the bit that says a parameter's actions run one after the other,
+    /// each acting on the member as the previous action left it. Only a parameter
+    /// whose actions the evaluator runs has such an order to declare.
+    fn set_chain_actions(document: &mut codec::Document, handle: Handle, value: bool) -> bool {
+        use codec::objects::{DynamicBlockData, ObjectType};
+        let Some(ObjectType::DynamicBlock(object)) = document.objects.get_mut(&handle) else {
+            return false;
+        };
+        let bit = match &mut object.data {
+            DynamicBlockData::LinearParameter(p) => &mut p.parameter.parameter.chain_actions,
+            DynamicBlockData::PolarParameter(p) => &mut p.parameter.parameter.chain_actions,
+            DynamicBlockData::XYParameter(p) => &mut p.parameter.parameter.chain_actions,
+            DynamicBlockData::RotationParameter(p) => &mut p.parameter.parameter.chain_actions,
+            DynamicBlockData::PointParameter(p) => &mut p.parameter.parameter.chain_actions,
+            DynamicBlockData::FlipParameter(p) => &mut p.parameter.parameter.chain_actions,
+            _ => return false,
+        };
+        if *bit == value {
+            return false;
+        }
+        *bit = value;
+        true
+    }
+
+    pub(super) fn toggle_authoring_chain_actions(&mut self) -> Task<Message> {
+        let i = self.active_tab;
+        let Some(handle) = self.tabs[i].selected_authoring else {
+            return Task::none();
+        };
+        let Some((Some(chain_actions), _)) = self.authoring_parameter_properties(handle) else {
+            return Task::none();
+        };
+        let mut document = self.tabs[i].scene.document.clone();
+        if !Self::set_chain_actions(&mut document, handle, !chain_actions) {
+            return Task::none();
+        }
+        if matches!(document.objects.get(&handle),
+            Some(codec::objects::ObjectType::DynamicBlock(object))
+                if matches!(&object.data, codec::objects::DynamicBlockData::PointParameter(_)))
+        {
+            let Some(definition) = self.tabs[i]
+                .active_block_edit_session()
+                .map(|session| session.br_handle)
+            else {
+                return Task::none();
+            };
+            document = match crate::scene::block_actions::instance::refresh_after_edit(
+                &document,
+                &self.tabs[i].scene.document,
+                definition,
+            ) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.command_line.push_error(crate::t!(error).as_ref());
+                    return Task::none();
+                }
+            };
+        }
+        self.push_undo_snapshot(i, super::document::HistoryLabel::Message("BEDIT Chain parameter actions"));
+        self.apply_action_document(i, document);
+        self.tabs[i].scene.bump_geometry();
+        self.tabs[i].dirty = true;
+        self.refresh_properties();
+        Task::none()
     }
 
     pub(super) fn toggle_authoring_value_set_flag(&mut self, field: &'static str) -> Task<Message> {
@@ -328,7 +426,7 @@ impl OpenCADStudio {
         let mut document = self.tabs[i].scene.document.clone();
         match toggle_authoring_value_set_flag(&mut document, handle, field) {
             Ok(true) => {
-                self.push_undo_snapshot(i, "BEDIT Parameter value set");
+                self.push_undo_snapshot(i, super::document::HistoryLabel::Message("BEDIT Parameter value set"));
                 self.tabs[i].scene.document = document;
                 self.tabs[i].scene.bump_geometry();
                 self.tabs[i].dirty = true;
@@ -352,7 +450,7 @@ impl OpenCADStudio {
         let mut document = self.tabs[i].scene.document.clone();
         match set_authoring_value_set_field(&mut document, handle, field, &input) {
             Ok(true) => {
-                self.push_undo_snapshot(i, "BEDIT Parameter value set");
+                self.push_undo_snapshot(i, super::document::HistoryLabel::Message("BEDIT Parameter value set"));
                 self.tabs[i].scene.document = document;
                 self.tabs[i].scene.bump_geometry();
                 self.tabs[i].dirty = true;
@@ -369,6 +467,139 @@ impl OpenCADStudio {
 
     pub(super) fn commit_authoring_name(&mut self) -> Task<Message> {
         self.commit_authoring_metadata("authoring_name")
+    }
+
+    /// A manager edit changes the definition's own parameter objects, and the
+    /// references of that definition are rebuilt from the new values, so the
+    /// staged document goes back into the live one the way an action commit does.
+    fn apply_parameters_manager_edit(&mut self, i: usize, staged: codec::Document) {
+        self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Parameters Manager edit"));
+        self.apply_action_document(i, staged);
+        self.tabs[i].dirty = true;
+        self.tabs[i].scene.bump_geometry();
+        self.finish_pending_history(i);
+        self.refresh_properties();
+    }
+
+    /// The pane loses its open cell and nothing else: what the operator filtered
+    /// the list to stays, so applying a number does not relist every row.
+    pub(super) fn clear_parameters_manager_cell(&mut self, i: usize) {
+        let panel = &mut self.tabs[i].parameters_panel;
+        panel.editing = None;
+        panel.edit_buf.clear();
+    }
+
+    /// Apply the number typed in the open cell. `keep_open` is set when the cell
+    /// itself asked for the commit (Enter); a commit driven by the field moving
+    /// away holds a refused number back, because there is no field left to fix it
+    /// in.
+    pub(super) fn commit_parameters_manager(&mut self, keep_open: bool) -> Task<Message> {
+        use crate::scene::block_parameters_manager as manager;
+        let i = self.active_tab;
+        let Some(edit) = self.tabs[i].parameters_panel.editing.clone() else {
+            return Task::none();
+        };
+        let typed = self.tabs[i].parameters_panel.edit_buf.clone();
+        // Opening a cell and leaving it alone writes nothing; an empty field is
+        // the sign that nothing was typed into it.
+        if typed.trim().is_empty() {
+            self.clear_parameters_manager_cell(i);
+            return Task::none();
+        }
+        let Some(definition) = self.tabs[i]
+            .active_block_edit_session()
+            .map(|session| session.br_handle)
+        else {
+            self.clear_parameters_manager_cell(i);
+            self.command_line
+                .push_error(crate::t!("The Block Editor session is no longer active.").as_ref());
+            return Task::none();
+        };
+        if edit.definition != definition {
+            self.clear_parameters_manager_cell(i);
+            self.command_line
+                .push_error(crate::t!("The Block Editor session is no longer active.").as_ref());
+            return Task::none();
+        }
+        // The cells print in the drawing's units, so a typed value is read back
+        // in them too.
+        crate::entities::common::set_unit_context(
+            crate::entities::common::UnitContext::from_header(&self.tabs[i].scene.document.header),
+        );
+        let Some(value) = crate::app::block_parameter_properties::parse_value(&typed) else {
+            // A refusal from the cell itself leaves the field open with what was
+            // typed in it, so the number only has to be corrected, not retyped.
+            // A refusal after the field has gone away has nothing left to correct.
+            if !keep_open {
+                self.clear_parameters_manager_cell(i);
+            }
+            self.command_line
+                .push_error(crate::t!("Specify a finite numeric parameter value.").as_ref());
+            return Task::none();
+        };
+        let mut staged = self.tabs[i].scene.document.clone();
+        let written = manager::write_number(
+            &mut staged,
+            definition,
+            edit.parameter,
+            edit.component,
+            value,
+        );
+        match written {
+            Ok(true) => {
+                let staged = match crate::scene::block_actions::instance::refresh_after_edit(
+                    &staged,
+                    &self.tabs[i].scene.document,
+                    definition,
+                ) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        if !keep_open {
+                            self.clear_parameters_manager_cell(i);
+                        }
+                        self.command_line.push_error(crate::t!(error).as_ref());
+                        return Task::none();
+                    }
+                };
+                self.apply_parameters_manager_edit(i, staged);
+                self.clear_parameters_manager_cell(i);
+            }
+            Ok(false) => {
+                self.clear_parameters_manager_cell(i);
+            }
+            Err(error) => {
+                if !keep_open {
+                    self.clear_parameters_manager_cell(i);
+                }
+                self.command_line.push_error(crate::t!(error).as_ref());
+            }
+        }
+        Task::none()
+    }
+
+    pub(super) fn toggle_parameters_manager_show(&mut self, name: &str) -> Task<Message> {
+        use crate::scene::block_parameters_manager as manager;
+        let i = self.active_tab;
+        let Some(definition) = self.tabs[i]
+            .active_block_edit_session()
+            .map(|session| session.br_handle)
+        else {
+            self.command_line
+                .push_error(crate::t!("The Block Editor session is no longer active.").as_ref());
+            return Task::none();
+        };
+        let mut staged = self.tabs[i].scene.document.clone();
+        let Some((parameter, _)) = manager::target_of(&staged, definition, name) else {
+            self.command_line
+                .push_error(crate::t!(manager::NO_FLAG).as_ref());
+            return Task::none();
+        };
+        match manager::toggle_show(&mut staged, definition, parameter) {
+            Ok(true) => self.apply_parameters_manager_edit(i, staged),
+            Ok(false) => {}
+            Err(error) => self.command_line.push_error(crate::t!(error).as_ref()),
+        }
+        Task::none()
     }
 
     pub(super) fn commit_authoring_metadata(&mut self, key: &'static str) -> Task<Message> {
@@ -407,7 +638,7 @@ impl OpenCADStudio {
         match result {
             Ok(changed) => {
                 if changed {
-                    self.push_undo_snapshot(i, "Edit block parameter metadata");
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Edit block parameter metadata"));
                     self.tabs[i].scene.document = staged;
                     self.tabs[i].dirty = true;
                     self.tabs[i].scene.bump_geometry();
@@ -806,7 +1037,7 @@ impl OpenCADStudio {
         ) {
             Ok(changed) => {
                 if changed {
-                    self.push_undo_snapshot(i, "Block authoring grip");
+                    self.push_undo_snapshot(i, super::document::HistoryLabel::Message("Block authoring grip"));
                     // Keep the live entity-change recorder attached. Basepoint edits
                     // can also relocate INSERT attributes outside the edited block.
                     let doc = &mut self.tabs[i].scene.document;

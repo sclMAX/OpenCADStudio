@@ -311,8 +311,10 @@ impl MLeaderCommand {
             ml.text_color = source.common.color;
             ml.context.text_color = source.common.color;
             ml.text_frame = source.background_fill_flags & 0x10 != 0;
-            ml.context.background_fill_enabled = source.background_fill_flags & 0x01 != 0;
-            ml.context.background_mask_fill_on = source.background_fill_flags & 0x02 != 0;
+            // MTEXT bit 1 fills, bit 2 fills with the background: an MLEADER
+            // keeps them in codes 292 and 291.
+            ml.context.background_mask_fill_on = source.background_fill_flags & 0x01 != 0;
+            ml.context.background_fill_enabled = source.background_fill_flags & 0x02 != 0;
             ml.context.background_scale_factor = source.background_scale;
             ml.context.background_fill_color = source.background_color;
             ml.context.background_transparency = source.background_transparency;
@@ -947,7 +949,7 @@ fn v3(p: DVec3) -> Vector3 {
     Vector3::new(p.x, p.y, p.z)
 }
 
-fn build_mleader(
+pub(crate) fn build_mleader(
     text: &str,
     verts: &[DVec3],
     content_point: Option<DVec3>,

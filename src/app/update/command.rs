@@ -69,6 +69,25 @@ fn polyline_add_vertex_target(entity: &AcadEntityType, grip_id: usize) -> Option
     }
 }
 
+/// The modes Ctrl steps through after the one a polyline grip was picked up in.
+fn grip_ctrl_stages(
+    items: &[crate::scene::model::object::GripMenuItem],
+) -> Vec<crate::scene::model::object::GripMenuAction> {
+    use crate::scene::model::object::GripMenuAction as Action;
+    if !items.iter().any(|item| item.action == Action::AddVertex) {
+        return Vec::new();
+    }
+    [
+        Action::AddVertex,
+        Action::RemoveVertex,
+        Action::ConvertToArc,
+        Action::ConvertToLine,
+    ]
+    .into_iter()
+    .filter(|action| items.iter().any(|item| item.action == *action))
+    .collect()
+}
+
 fn polyline_vertex_count(entity: &AcadEntityType) -> Option<usize> {
     match entity {
         AcadEntityType::LwPolyline(polyline) => Some(polyline.vertices.len()),
@@ -219,6 +238,15 @@ impl OpenCADStudio {
         // editor holds a document-local handle into one tab, so drop it
         // now rather than risk it applying to a different tab's document.
         self.cancel_attr_editor();
+        // The Block Properties Table list names an insert of the tab being
+        // closed, so it goes with that tab.
+        self.table_popup = None;
+        // The insertion attribute form parks a placement on the tab it belongs
+        // to, so a closed tab has to take the form — and the placement — with it.
+        if self.focus_dialog(crate::app::ModalKind::InsertAttributes) {
+            self.cancel_insert_attr_dialog();
+            self.close_active_modal();
+        }
         if self.tabs.get(idx).map_or(false, |t| t.dirty) {
             self.pending_close = Some(crate::app::PendingClose::Tab(self.tabs[idx].id));
             return self.open_unsaved_dialog_window();
@@ -254,6 +282,16 @@ impl OpenCADStudio {
         #[cfg(target_arch = "wasm32")]
         if let Some(closing_id) = closing_tab_id {
             crate::io::fs_access::drop_handle(closing_id);
+        }
+        // The drawing is gone, and the positions it had placed are not the
+        // next drawing's: forget them with the tab.
+        if let Some(closing_id) = closing_tab_id {
+            crate::modules::draw::draw::attdef::session().forget_place_of(closing_id);
+            crate::modules::annotate::text::forget_place_of(closing_id);
+        }
+        // Tool dialogs on the closing drawing go with it.
+        if idx == self.active_tab {
+            self.close_document_tools(None);
         }
         // Only-tab case: when the lone non-start tab closes, fall
         // back to the Start tab if it exists; otherwise spawn a
@@ -371,6 +409,20 @@ impl OpenCADStudio {
                     self.command_line.input.push_str(&s);
                 }
             } else {
+                // A letter after digits typed into a field makes the whole
+                // entry an option keyword such as `2P` or `3P` (#2312).
+                if s.starts_with(|c: char| c.is_alphabetic())
+                    && self.command_line.input.is_empty()
+                    && self.dyn_input
+                    && !self.tabs[i].dyn_fields.is_empty()
+                {
+                    let a = self.tabs[i]
+                        .dyn_active
+                        .min(self.tabs[i].dyn_fields.len() - 1);
+                    if let Some(typed) = self.tabs[i].dyn_fields[a].buffer.take() {
+                        self.command_line.input = typed;
+                    }
+                }
                 // Preserve case while entering a command or literal/free-text
                 // value. Active single-token prompt keywords keep their
                 // established uppercase normalization.
@@ -487,6 +539,10 @@ impl OpenCADStudio {
         // dropdown so the dispatched command's new prompt is
         // immediately visible on the overlay.
         self.command_line.close_history();
+        // A table cell's editor: Enter writes the cell and moves down.
+        if let Some(task) = self.table_cell_enter() {
+            return task;
+        }
         if self.awaiting_fill_close_answer() {
             let input = std::mem::take(&mut self.command_line.input);
             return self.on_graphic_fill_close_input(&input);
@@ -843,6 +899,7 @@ impl OpenCADStudio {
             if val.is_empty() {
                 return Task::none();
             }
+            self.command_line.answer_last_prompt(&val);
             return self.dispatch_command(&format!("SETVAR {name} {val}"));
         }
         let i_tab = self.active_tab;
@@ -850,6 +907,7 @@ impl OpenCADStudio {
             if let Some(command) = self.command_line.selected_suggestion() {
                 self.command_line.input.clear();
                 self.command_line.autocomplete_cursor = None;
+                self.command_line.push_command(&command);
                 return self.dispatch_command(&command);
             }
         } else if self.command_line.has_contextual_suggestions() {
@@ -889,6 +947,9 @@ impl OpenCADStudio {
                         }
                         return Task::batch(tasks);
                     }
+                    // Echo the line like a single word; a variable answered on
+                    // it is restated to its name when its prompt takes the value.
+                    self.command_line.push_command(raw.trim());
                     return self.run_command_line(&raw);
                 }
             }
@@ -1306,7 +1367,12 @@ impl OpenCADStudio {
             self.resolve_user_select(false);
             return Task::none();
         }
-        if self.ribbon.escape_extension() {
+        if self.ribbon.escape_search()
+            || self.ribbon.close_menu()
+            || self.ribbon.close_app_menu()
+            || self.ribbon.escape_extension()
+            || self.ribbon.close_popup()
+        {
             return Task::none();
         }
         if self.awaiting_fill_close_answer() {
@@ -1320,8 +1386,12 @@ impl OpenCADStudio {
         self.snapper.clear_override();
         // Clear the deferred snap dwell — the command is being cancelled.
         self.snap_dwell = None;
-        // Open MText editor swallows Escape (cancel without committing).
-        if self.mtext_editor.is_some() {
+        // Open MText editor swallows Escape (cancel without committing). An
+        // open menu or the colour list closes first, one per Escape.
+        if let Some(ed) = self.mtext_editor.as_mut() {
+            if ed.menu.take().is_some() || std::mem::take(&mut ed.color_picker_open) {
+                return Task::none();
+            }
             self.mtext_cancel();
             return self.post_editor_closed(false);
         }
@@ -1431,12 +1501,23 @@ impl OpenCADStudio {
         {
             let mut sel = self.tabs[i_e].scene.selection.borrow_mut();
             if sel.menu.open_at.is_some() {
-                sel.menu.open_at = None;
+                sel.menu.close();
                 return Task::none();
             }
         }
         if self.layout_rename_state.take().is_some() {
             return Task::none();
+        }
+        // A palette cell holding typed text reverts first: the value goes
+        // back to the model's and the row keeps its focus and its
+        // reference selected. A second Esc then escalates as usual.
+        if self.tabs[i_e].active_cmd.is_none() {
+            let panel = &mut self.tabs[i_e].properties;
+            if let Some(key) = panel.active_field.clone() {
+                if panel.edit_buf.remove(&key).is_some() {
+                    return Task::none();
+                }
+            }
         }
         // Typed text on the command line cancels first — one
         // Esc empties the buffer, a second Esc then escalates
@@ -1454,12 +1535,12 @@ impl OpenCADStudio {
             if let Some(r) = result {
                 return self.apply_cmd_result(r);
             }
-        } else if self.tabs[i].scene.active_viewport.is_some() {
-            // ESC while in MSPACE → exit back to paper space.
-            return Task::done(Message::ExitViewport);
         } else {
+            // In a viewport's model space Esc deselects too and the viewport
+            // stays active: PSPACE, or a double-click outside it, leaves it.
             self.tabs[i].selected_authoring = None;
             self.tabs[i].scene.deselect_all();
+            self.tabs[i].last_crossing_window = None;
             self.refresh_properties();
             self.tabs[i].scene.set_box_hover_highlights(&[]);
             let mut sel = self.tabs[i].scene.selection.borrow_mut();
@@ -1768,6 +1849,191 @@ impl OpenCADStudio {
             self.refresh_layer_panel();
         }
         Task::none()
+    }
+
+    /// The action of the Ctrl cycle waiting for the next click, if the cycle
+    /// still belongs to the hot grip.
+    pub(super) fn grip_ctrl_one_shot(
+        &self,
+        i: usize,
+    ) -> Option<crate::scene::model::object::GripMenuAction> {
+        let cycle = self.grip_ctrl_cycle.as_ref()?;
+        let active = self.tabs[i].active_grip.as_ref()?;
+        (active.handle == cycle.handle && active.grip_id == cycle.active_grip_id)
+            .then_some(cycle.one_shot)
+            .flatten()
+    }
+
+    /// Ctrl on a hot polyline grip moves to its next mode, as the grip menu
+    /// offers them. Each stage starts from the geometry the grip was picked up
+    /// with, so a stage left behind leaves nothing in the drawing or in undo.
+    pub(super) fn cycle_grip_ctrl_mode(&mut self) -> Task<Message> {
+        use crate::entities::traits::EntityTypeOps;
+        use crate::scene::model::object::GripMenuAction as Action;
+        let i = self.active_tab;
+        if self.tabs[i].grip_copy || self.grip_pending.is_some() {
+            return Task::none();
+        }
+        let Some(active) = self.tabs[i].active_grip.as_ref() else {
+            return Task::none();
+        };
+        let [target] = active.targets.as_slice() else {
+            return Task::none();
+        };
+        if active.gizmo {
+            return Task::none();
+        }
+        let (handle, active_grip_id) = (active.handle, active.grip_id);
+        let mut cycle = self
+            .grip_ctrl_cycle
+            .take()
+            .filter(|cycle| cycle.handle == handle && cycle.active_grip_id == active_grip_id)
+            .unwrap_or(crate::app::GripCtrlCycle {
+                handle,
+                grip_id: active_grip_id,
+                is_translate: target.is_translate,
+                world: active.origin_world,
+                stage: 0,
+                active_grip_id,
+                one_shot: None,
+            });
+        let original = self
+            .grip_originals
+            .iter()
+            .find(|(owner, _)| *owner == handle)
+            .map(|(_, entity)| entity.clone())
+            .or_else(|| self.tabs[i].scene.document.get_entity(handle).cloned());
+        let Some(original) = original else {
+            return Task::none();
+        };
+        // Other grips (and entities whose Add Vertex is not a placement) keep
+        // their single behaviour.
+        if polyline_add_vertex_target(&original, cycle.grip_id).is_none() {
+            return Task::none();
+        }
+        let items = original.grip_menu(cycle.grip_id);
+        let stages = grip_ctrl_stages(&items);
+        if stages.is_empty() || self.reject_locked_edit(i, handle) {
+            return Task::none();
+        }
+
+        self.cancel_active_grip_edit();
+        cycle.stage = (cycle.stage + 1) % (stages.len() + 1);
+        cycle.one_shot = None;
+        let mut task = Task::none();
+        let label = match cycle.stage.checked_sub(1).map(|stage| stages[stage]) {
+            None => {
+                let edit = self.grip_edit_for_hit(
+                    i,
+                    handle,
+                    cycle.grip_id,
+                    cycle.is_translate,
+                    cycle.world,
+                );
+                // A rectangle's grips start in their own Resize / Move Parallel.
+                let stretches =
+                    matches!(edit.mode, crate::scene::pick::grip::GripEditMode::Stretch);
+                self.tabs[i].active_grip = Some(edit);
+                self.sync_dyn_fields();
+                stretches.then_some("Stretch")
+            }
+            Some(Action::AddVertex) => {
+                // The menu's own placement: it prompts for the new vertex.
+                let index = items
+                    .iter()
+                    .position(|item| item.action == Action::AddVertex);
+                self.grip_popup = Some(crate::app::GripPopup {
+                    handle,
+                    grip_id: cycle.grip_id,
+                    anchor: self.tabs[i].last_cursor_screen,
+                    items: items.clone(),
+                    selected: 0,
+                    pinned: true,
+                });
+                task = self.on_grip_menu_pick(index.unwrap_or(0));
+                None
+            }
+            Some(Action::ConvertToArc) => {
+                let dirty_before = self.tabs[i].dirty;
+                if let Some(entity) = self.tabs[i].scene.document.get_entity_mut(handle) {
+                    entity.apply_grip_menu(cycle.grip_id, Action::ConvertToArc);
+                }
+                self.tabs[i]
+                    .scene
+                    .bump_entities(&[(handle, crate::scene::ChangeKind::Modified)]);
+                self.tabs[i].dirty = true;
+                self.refresh_selected_grips();
+                self.refresh_properties();
+                let world = self.tabs[i]
+                    .selected_grip_handles
+                    .iter()
+                    .zip(self.tabs[i].selected_grips.iter())
+                    .find(|(owner, grip)| **owner == handle && grip.id == cycle.grip_id)
+                    .map_or(cycle.world, |(_, grip)| grip.world);
+                self.grip_originals = vec![(handle, original)];
+                self.grip_dirty_before = Some(dirty_before);
+                self.tabs[i].active_grip =
+                    Some(GripEdit::single(handle, cycle.grip_id, false, world));
+                Some("Convert to Arc")
+            }
+            Some(action) => {
+                self.tabs[i].active_grip = Some(GripEdit::single(
+                    handle,
+                    cycle.grip_id,
+                    cycle.is_translate,
+                    cycle.world,
+                ));
+                cycle.one_shot = Some(action);
+                items
+                    .iter()
+                    .find(|item| item.action == action)
+                    .map(|item| item.label)
+            }
+        };
+        if let Some(label) = label {
+            self.command_line
+                .push_info(&format!("{}:", crate::i18n::translate(label)));
+        }
+        let Some(active_grip_id) = self.tabs[i].active_grip.as_ref().map(|grip| grip.grip_id)
+        else {
+            return task;
+        };
+        cycle.active_grip_id = active_grip_id;
+        self.grip_ctrl_cycle = Some(cycle);
+        // Show the new mode at the cursor without waiting for the next move.
+        let at = self.tabs[i].last_cursor_screen;
+        Task::batch([task, Task::done(Message::ViewportMove(at))])
+    }
+
+    /// The click that confirms Remove Vertex or Convert to Line: the menu's
+    /// own action, recorded as one undo step.
+    pub(super) fn commit_grip_ctrl_one_shot(&mut self, i: usize) -> Task<Message> {
+        use crate::entities::traits::EntityTypeOps;
+        let Some(action) = self.grip_ctrl_one_shot(i) else {
+            return Task::none();
+        };
+        let Some(cycle) = self.grip_ctrl_cycle.take() else {
+            return Task::none();
+        };
+        self.cancel_active_grip_edit();
+        let items = self.tabs[i]
+            .scene
+            .document
+            .get_entity(cycle.handle)
+            .map(|entity| entity.grip_menu(cycle.grip_id))
+            .unwrap_or_default();
+        let Some(index) = items.iter().position(|item| item.action == action) else {
+            return Task::none();
+        };
+        self.grip_popup = Some(crate::app::GripPopup {
+            handle: cycle.handle,
+            grip_id: cycle.grip_id,
+            anchor: self.tabs[i].last_cursor_screen,
+            items,
+            selected: index,
+            pinned: true,
+        });
+        self.on_grip_menu_pick(index)
     }
 
     pub(super) fn on_grip_menu_pick(&mut self, idx: usize) -> Task<Message> {
@@ -2360,7 +2626,7 @@ impl OpenCADStudio {
 
     pub(super) fn on_qselect_open(&mut self) -> Task<Message> {
         let i = self.active_tab;
-        self.tabs[i].scene.selection.borrow_mut().menu.open_at = None;
+        self.tabs[i].scene.selection.borrow_mut().menu.close();
         let remembered = self.qselect_settings.clone();
         let scope = remembered
             .as_ref()
@@ -2720,7 +2986,7 @@ impl OpenCADStudio {
             panel
                 .edit_buf
                 .remove(&crate::ui::properties::FieldKey::Geom(field));
-            panel.edit_choice_open = false;
+            panel.edit_choice_open = None;
             crate::scene::creation_style::current_transparency_label(transparency)
         } else {
             value
@@ -2735,7 +3001,7 @@ impl OpenCADStudio {
         let i = self.active_tab;
         if field == "ole_lock_aspect" {
             self.set_ole_lock_aspect(i, &value);
-            self.tabs[i].properties.edit_choice_open = false;
+            self.tabs[i].properties.edit_choice_open = None;
             return Task::none();
         }
         if field == "ext_pcx_locked" {
@@ -2749,10 +3015,18 @@ impl OpenCADStudio {
                     );
                 }
             });
-            self.tabs[i].properties.edit_choice_open = false;
+            self.tabs[i].properties.edit_choice_open = None;
             return Task::none();
         }
         let handles = self.property_target_handles(i);
+        if crate::app::properties::field_moves_geometry(field)
+            && self.any_entity_is_fixed(i, &handles)
+        {
+            self.command_line
+                .push_error(crate::app::properties::HELD_BY_FIXED);
+            self.tabs[i].properties.edit_choice_open = None;
+            return Task::none();
+        }
         // The Annotative Yes/No list drives the per-object annotative toggle
         // (MTEXT's own flag, the annotation context for the rest).
         if field == "annotative" {
@@ -2885,7 +3159,7 @@ impl OpenCADStudio {
                         );
                     }
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "material" {
@@ -2929,7 +3203,7 @@ impl OpenCADStudio {
                         }
                     }
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "tol_text_style" {
@@ -2963,7 +3237,7 @@ impl OpenCADStudio {
                     self.invalidate_property_targets(i, &handles);
                     self.refresh_properties();
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field.starts_with("dim_") {
@@ -2994,7 +3268,7 @@ impl OpenCADStudio {
                         }
                     }
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "vscale_std" {
@@ -3008,7 +3282,7 @@ impl OpenCADStudio {
                             .set_viewport_scale_named_for(handle, &value);
                     }
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "vp_ucs_name" {
@@ -3036,7 +3310,7 @@ impl OpenCADStudio {
                     self.invalidate_property_targets(i, &handles);
                     self.refresh_properties();
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "vp_named_view" {
@@ -3065,7 +3339,7 @@ impl OpenCADStudio {
                     self.invalidate_property_targets(i, &handles);
                     self.refresh_properties();
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if crate::scene::model::solid_history::is_loft_geometry_choice(field) {
@@ -3079,7 +3353,7 @@ impl OpenCADStudio {
                         .scene
                         .apply_solid_history_property(handle, field, &value);
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == crate::scene::model::solid_history::PROP_OPERAND {
@@ -3091,7 +3365,7 @@ impl OpenCADStudio {
                         &value,
                     );
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 self.refresh_properties();
                 return Task::none();
             }
@@ -3104,7 +3378,7 @@ impl OpenCADStudio {
                         .scene
                         .apply_solid_history_choice(handle, field, &value);
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if crate::scene::model::solid_history::is_surface_property_choice(field) {
@@ -3150,7 +3424,7 @@ impl OpenCADStudio {
                         app.tabs[i].scene.reseed_derived_caches(handle);
                     }
                 });
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "tol_dim_style" {
@@ -3194,7 +3468,35 @@ impl OpenCADStudio {
                     self.invalidate_property_targets(i, &handles);
                     self.refresh_properties();
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
+                return Task::none();
+            }
+            if field == "tbl_cell_border_lt" {
+                let linetype = self.tabs[i]
+                    .scene
+                    .document
+                    .line_types
+                    .iter()
+                    .find(|lt| lt.name.eq_ignore_ascii_case(value.trim()))
+                    .map(|lt| lt.handle);
+                let cells = self.picked_cell_positions(i);
+                if linetype.is_some() {
+                    self.apply_property_op(i, "TABLE CELL BORDER", &handles, |app, handle| {
+                        use crate::entities::table::TableCellBordersExt;
+                        if let Some(codec::EntityType::Table(table)) =
+                            app.tabs[i].scene.document.get_entity_mut(handle)
+                        {
+                            for &(row, column) in &cells {
+                                table.edit_cell_borders(row, column, |border| {
+                                    border.line_type_handle = linetype;
+                                    codec::entities::table::BorderPropertyFlags::LINE_TYPE
+                                });
+                            }
+                            table.block_record_handle = None;
+                        }
+                    });
+                }
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             if field == "tbl_style_handle" {
@@ -3238,7 +3540,7 @@ impl OpenCADStudio {
                     self.invalidate_property_targets(i, &handles);
                     self.refresh_properties();
                 }
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 return Task::none();
             }
             self.push_undo_snapshot(i, "CHPROP");
@@ -3465,7 +3767,7 @@ impl OpenCADStudio {
             } else if field == "dyn_visibility" {
                 // A visibility state picked in Properties, applied like a
                 // pick from the reference's visibility grip.
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 for &handle in &handles {
                     let state = self.tabs[i]
                         .scene
@@ -3477,7 +3779,7 @@ impl OpenCADStudio {
                     }
                 }
             } else if field == "dyn_lookup" {
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 let mut changed = false;
                 for &handle in &handles {
                     if self.tabs[i].scene.is_layer_locked(handle) {
@@ -3509,7 +3811,7 @@ impl OpenCADStudio {
                     .properties
                     .edit_buf
                     .remove(&crate::ui::properties::FieldKey::Geom("block"));
-                self.tabs[i].properties.edit_choice_open = false;
+                self.tabs[i].properties.edit_choice_open = None;
                 let canon = self.tabs[i]
                     .scene
                     .document
@@ -3517,22 +3819,67 @@ impl OpenCADStudio {
                     .get(&value)
                     .map(|br| br.name.clone());
                 if let Some(canon) = canon {
-                    let mut changes = Vec::new();
-                    for &handle in &handles {
-                        if self.tabs[i].scene.is_layer_locked(handle) {
-                            continue;
-                        }
-                        if let Some(codec::EntityType::Insert(ins)) =
-                            self.tabs[i].scene.document.get_entity_mut(handle)
-                        {
-                            if ins.block_name != canon {
-                                ins.block_name = canon.clone();
-                                changes.push((handle, crate::scene::ChangeKind::Modified));
+                    let to = self.tabs[i]
+                        .scene
+                        .document
+                        .block_records
+                        .get(&canon)
+                        .map(|record| record.handle);
+                    if let Some(to) = to {
+                        let mut planned = Vec::new();
+                        for &handle in &handles {
+                            if self.tabs[i].scene.is_layer_locked(handle) {
+                                continue;
+                            }
+                            let Some((from, differs)) = self.tabs[i]
+                                .scene
+                                .document
+                                .get_entity(handle)
+                                .and_then(|entity| match entity {
+                                    codec::EntityType::Insert(ins) => {
+                                        let record = self.tabs[i]
+                                            .scene
+                                            .document
+                                            .block_records
+                                            .get(&ins.block_name)?;
+                                        // Compare what the row shows: an
+                                        // evaluated copy already names this
+                                        // definition, so re-picking it asks
+                                        // for no change.
+                                        let effective =
+                                            crate::app::control::block_ops::resolve_effective_block(
+                                                &self.tabs[i].scene.document,
+                                                ins,
+                                            )
+                                            .1;
+                                        Some((record.handle, effective != Some(to)))
+                                    }
+                                    _ => None,
+                                })
+                            else {
+                                continue;
+                            };
+                            if differs {
+                                planned.push((handle, from));
                             }
                         }
-                    }
-                    if !changes.is_empty() {
-                        self.tabs[i].scene.bump_entities(&changes);
+                        if !planned.is_empty() {
+                            let mut changes = Vec::new();
+                            for (handle, from) in planned {
+                                // An evaluated copy must stop resolving
+                                // through its old definition before it takes
+                                // the new name.
+                                crate::app::control::block_ops::detach_representation(
+                                    &mut self.tabs[i].scene.document,
+                                    handle,
+                                );
+                                self.tabs[i]
+                                    .scene
+                                    .repoint_representation(handle, from, to, &canon);
+                                changes.push((handle, crate::scene::ChangeKind::Modified));
+                            }
+                            self.tabs[i].scene.bump_entities(&changes);
+                        }
                     }
                 }
             } else if field == "plot_style" {
@@ -3697,7 +4044,7 @@ impl OpenCADStudio {
             }
             self.invalidate_property_targets(i, &handles);
             self.tabs[i].dirty = true;
-            self.tabs[i].properties.edit_choice_open = false;
+            self.tabs[i].properties.edit_choice_open = None;
             if field == "spline_method" {
                 self.tabs[i].properties.prop_vertex = 0;
                 self.tabs[i].properties.prop_vertex_indicator_active = false;
@@ -4094,6 +4441,17 @@ impl OpenCADStudio {
         let i = self.active_tab;
         self.tabs[i].properties.active_field = None;
         let handles = self.property_target_handles(i);
+        if crate::app::properties::field_moves_geometry(field)
+            && self.any_entity_is_fixed(i, &handles)
+        {
+            self.tabs[i]
+                .properties
+                .edit_buf
+                .remove(&crate::ui::properties::FieldKey::Geom(field));
+            self.command_line
+                .push_error(crate::app::properties::HELD_BY_FIXED);
+            return Task::none();
+        }
         if field.starts_with("assoc_array_") {
             self.on_assoc_array_field_commit(i, field, &handles);
             return Task::none();
@@ -4305,7 +4663,7 @@ impl OpenCADStudio {
                     // Name row on a block reference: an existing name
                     // re-points the selected inserts; a new one renames
                     // the definition they share. Commit closes the list.
-                    self.tabs[i].properties.edit_choice_open = false;
+                    self.tabs[i].properties.edit_choice_open = None;
                     self.apply_block_name_commit(i, &handles, val.trim());
                 } else if field == "frozen_layers" {
                     // Resolve layer names → handles, then apply to viewports.
@@ -4539,6 +4897,18 @@ impl OpenCADStudio {
                         }
                     }
                 }
+                // A cloud's Arc Length is REVCLOUD's arc length from now on.
+                if field == "revcloud_arc_length" {
+                    if let Ok(length) = val.trim().parse::<f64>() {
+                        if length.is_finite() && length > 0.0 {
+                            crate::io::set_drawing_variable(
+                                &mut self.tabs[i].scene.document,
+                                crate::entities::revcloud::ARC_LENGTH_VARIABLE,
+                                &format!("{length:.6}"),
+                            );
+                        }
+                    }
+                }
                 if field.starts_with("tbl_") {
                     for &handle in &handles {
                         if let Some(codec::EntityType::Table(table)) =
@@ -4585,9 +4955,9 @@ impl OpenCADStudio {
 
     /// Properties-panel Name commit for block references. A `new` matching an
     /// existing regular block re-points the selected inserts to it; otherwise
-    /// the definition the (single-block) selection references is renamed and
-    /// every insert of it follows. Anonymous/xref definitions never get here —
-    /// their Name row stays read-only.
+    /// the definition the selection references is renamed and every insert of
+    /// it follows, including a reference showing an evaluated copy of it.
+    /// Anonymous/xref definitions are refused.
     fn apply_block_name_commit(&mut self, i: usize, handles: &[codec::Handle], new: &str) {
         if new.is_empty() {
             return;
@@ -4602,48 +4972,109 @@ impl OpenCADStudio {
             .map(|br| {
                 (
                     br.name.clone(),
+                    br.handle,
                     br.is_anonymous() || br.flags.is_xref || br.name.contains('|'),
                 )
             });
-        if let Some((canon, protected)) = target {
+        if let Some((canon, to, protected)) = target {
             if protected {
                 return;
             }
-            let mut changes = Vec::new();
+            let mut planned = Vec::new();
             for &handle in handles {
                 if self.tabs[i].scene.is_layer_locked(handle) {
                     continue;
                 }
-                if let Some(codec::EntityType::Insert(ins)) =
-                    self.tabs[i].scene.document.get_entity_mut(handle)
-                {
-                    if ins.block_name != canon {
-                        ins.block_name = canon.clone();
-                        changes.push((handle, crate::scene::ChangeKind::Modified));
-                    }
+                let Some((from, differs)) =
+                    self.tabs[i].scene.document.get_entity(handle).and_then(
+                        |entity| match entity {
+                            codec::EntityType::Insert(ins) => {
+                                let record = self.tabs[i]
+                                    .scene
+                                    .document
+                                    .block_records
+                                    .get(&ins.block_name)?;
+                                // An evaluated copy already carries the
+                                // definition's name in this row.
+                                let effective =
+                                    crate::app::control::block_ops::resolve_effective_block(
+                                        &self.tabs[i].scene.document,
+                                        ins,
+                                    )
+                                    .1;
+                                Some((record.handle, effective != Some(to)))
+                            }
+                            _ => None,
+                        },
+                    )
+                else {
+                    continue;
+                };
+                if differs {
+                    planned.push((handle, from));
                 }
             }
-            if !changes.is_empty() {
+            if !planned.is_empty() {
+                let mut changes = Vec::new();
+                for (handle, from) in planned {
+                    // An evaluated copy must stop resolving through its old
+                    // definition before it takes the new name.
+                    crate::app::control::block_ops::detach_representation(
+                        &mut self.tabs[i].scene.document,
+                        handle,
+                    );
+                    self.tabs[i]
+                        .scene
+                        .repoint_representation(handle, from, to, &canon);
+                    changes.push((handle, crate::scene::ChangeKind::Modified));
+                }
                 self.tabs[i].scene.bump_entities(&changes);
             }
             return;
         }
         // New name → rename. Only when every selected insert references the
         // same definition; a mixed selection makes the rename target ambiguous.
-        let mut old: Option<String> = None;
+        let mut old: Option<Option<codec::Handle>> = None;
         for &handle in handles {
             if let Some(codec::EntityType::Insert(ins)) =
                 self.tabs[i].scene.document.get_entity(handle)
             {
-                match &old {
-                    None => old = Some(ins.block_name.clone()),
-                    Some(o) if o.eq_ignore_ascii_case(&ins.block_name) => {}
+                let (name, definition, _) = crate::app::control::block_ops::resolve_effective_block(
+                    &self.tabs[i].scene.document,
+                    ins,
+                );
+                let definition = definition.or_else(|| {
+                    self.tabs[i]
+                        .scene
+                        .document
+                        .block_records
+                        .get(&name)
+                        .map(|record| record.handle)
+                });
+                match old {
+                    None => old = Some(definition),
+                    Some(current) if current == definition => {}
                     _ => return,
                 }
             }
         }
-        if let Some(old) = old {
-            self.tabs[i].scene.rename_block(&old, new);
+        let Some(Some(old)) = old else {
+            return;
+        };
+        let Some(old) = self.tabs[i]
+            .scene
+            .document
+            .block_records
+            .iter()
+            .find(|record| record.handle == old)
+            .map(|record| record.name.clone())
+        else {
+            return;
+        };
+        self.push_undo_snapshot(i, "BLOCK RENAME");
+        if !self.tabs[i].scene.rename_block(&old, new) {
+            self.command_line
+                .push_error(crate::tf!("Could not rename block \"{old}\" to \"{new}\".").as_ref());
         }
     }
 
@@ -4767,7 +5198,7 @@ impl OpenCADStudio {
     /// the tab it belongs to closes or the active tab switches — its handle is
     /// document-local and must not outlive its tab.
     pub(in crate::app) fn cancel_attr_editor(&mut self) {
-        if self.active_modal == Some(crate::app::ModalKind::AttributeEditor) {
+        if self.focus_dialog(crate::app::ModalKind::AttributeEditor) {
             self.active_modal = None;
             self.reset_modal_geometry();
         }
@@ -5008,12 +5439,12 @@ mod transparency_property_tests {
             field: "transparency",
             value: "37".into(),
         });
-        app.tabs[i].properties.edit_choice_open = true;
+        app.tabs[i].properties.edit_choice_open = Some("transparency");
         let _ = app.update(Message::PropGeomChoiceChanged {
             field: "transparency",
             value: "50".into(),
         });
-        assert!(!app.tabs[i].properties.edit_choice_open);
+        assert!(app.tabs[i].properties.edit_choice_open.is_none());
         assert!(!app.tabs[i]
             .properties
             .edit_buf
@@ -5293,6 +5724,118 @@ mod layer_name_target_tests {
     // #22 migration lands.
     use crate::app::{Message, OpenCADStudio};
     use crate::ui::window::layers::LayerSortCol;
+
+    #[test]
+    fn ribbon_layer_color_changes_only_named_layer_and_supports_undo() {
+        use codec::types::Color;
+        let mut app = app_with_zulu_alpha();
+        let i = app.active_tab;
+        let _ = app.update(Message::LayerSelect("ALPHA".into()));
+        let selected = app.tabs[i].layers.selected_multi.clone();
+        let alpha = app.tabs[i]
+            .scene
+            .document
+            .layers
+            .get("ALPHA")
+            .unwrap()
+            .color;
+        let old = app.tabs[i].scene.document.layers.get("ZULU").unwrap().color;
+        let creation = app.tabs[i].scene.document.header.current_entity_color;
+        let mut line = codec::entities::Line::new();
+        line.common.color = Color::Index(2);
+        line.common.layer = "ZULU".into();
+        let handle = app.tabs[i].scene.add_entity(codec::EntityType::Line(line));
+        app.tabs[i].scene.select_entity(handle, true);
+        let epoch = app.tabs[i].scene.geometry_epoch;
+        let _ = app.update(Message::RibbonLayerColorChanged {
+            layer: "ZULU".into(),
+            color: Color::Index(1),
+        });
+        assert_eq!(
+            app.tabs[i].scene.document.layers.get("ZULU").unwrap().color,
+            Color::Index(1)
+        );
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .layers
+                .get("ALPHA")
+                .unwrap()
+                .color,
+            alpha
+        );
+        assert_eq!(app.tabs[i].layers.selected_multi, selected);
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .get_entity(handle)
+                .unwrap()
+                .common()
+                .color,
+            Color::Index(2)
+        );
+        assert_eq!(
+            app.tabs[i].scene.document.header.current_entity_color,
+            creation
+        );
+        assert!(app.tabs[i].scene.geometry_epoch > epoch);
+        assert_eq!(app.tabs[i].recent_colors.first(), Some(&Color::Index(1)));
+        app.undo_active_tab();
+        assert_eq!(
+            app.tabs[i].scene.document.layers.get("ZULU").unwrap().color,
+            old
+        );
+        app.redo_active_tab();
+        assert_eq!(
+            app.tabs[i].scene.document.layers.get("ZULU").unwrap().color,
+            Color::Index(1)
+        );
+        let history = app.tabs[i].history.undo_stack.len();
+        let _ = app.update(Message::RibbonLayerColorChanged {
+            layer: "missing".into(),
+            color: Color::Index(3),
+        });
+        let _ = app.update(Message::RibbonLayerColorChanged {
+            layer: "ZULU".into(),
+            color: Color::ByLayer,
+        });
+        assert_eq!(app.tabs[i].history.undo_stack.len(), history);
+        let _ = app.update(Message::OpenColorWindow(
+            crate::app::ColorPickTarget::RibbonLayer("ZULU".into()),
+            Color::Index(1),
+        ));
+        let _ = app.update(Message::ColorWindowPick(
+            Color::Rgb {
+                r: 12,
+                g: 34,
+                b: 56,
+            },
+            Some("TEST$Color".into()),
+        ));
+        let layer = app.tabs[i].scene.document.layers.get("ZULU").unwrap();
+        assert_eq!(
+            layer.color,
+            Color::Rgb {
+                r: 12,
+                g: 34,
+                b: 56
+            }
+        );
+        assert_eq!(layer.book_name.as_deref(), Some("TEST"));
+        assert_eq!(layer.color_name.as_deref(), Some("Color"));
+        assert_eq!(
+            app.tabs[i]
+                .scene
+                .document
+                .layers
+                .get("ALPHA")
+                .unwrap()
+                .color,
+            alpha
+        );
+    }
 
     fn rename_layer(app: &mut OpenCADStudio, old_name: &str, new_name: &str) {
         let i = app.active_tab;
@@ -5605,53 +6148,11 @@ mod tablestyle_buffer_tests {
     fn table_new_reloads_cell_buffers() {
         let mut app = OpenCADStudio::new_for_test();
         app.automation_op(r#"{"op":"new"}"#);
-        app.ts_cell_textstyle[0] = "STALE_SENTINEL".to_string();
+        app.ts_cell_height = "STALE_SENTINEL".to_string();
         let _ = app.style_new(StyleKind::Table);
         assert_ne!(
-            app.ts_cell_textstyle[0], "STALE_SENTINEL",
+            app.ts_cell_height, "STALE_SENTINEL",
             "buffers must reload from the fresh style"
-        );
-    }
-
-    #[test]
-    fn table_cell_unknown_text_style_is_rejected() {
-        let mut app = OpenCADStudio::new_for_test();
-        app.automation_op(r#"{"op":"new"}"#);
-        let i = app.active_tab;
-        let style_name = app.tabs[i]
-            .scene
-            .document
-            .objects
-            .values()
-            .find_map(|o| match o {
-                codec::objects::ObjectType::TableStyle(s) => Some(s.name.clone()),
-                _ => None,
-            })
-            .expect("fresh doc ships a table style");
-        app.tablestyle_selected = style_name.clone();
-        app.ts_cell_textstyle[0] = "NOPE".to_string();
-        let before = app.command_line.history.len();
-        let _ = app.on_table_style_cell_apply(0);
-        let cell_name = app.tabs[i]
-            .scene
-            .document
-            .objects
-            .values()
-            .find_map(|o| match o {
-                codec::objects::ObjectType::TableStyle(s) if s.name == style_name => {
-                    Some(s.data_row_style.text_style_name.clone())
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert_ne!(cell_name, "NOPE", "dangling name must not persist");
-        assert_eq!(
-            app.ts_cell_textstyle[0], "NOPE",
-            "rejected text stays in the buffer for correction"
-        );
-        assert!(
-            app.command_line.history.len() > before,
-            "rejection must say something"
         );
     }
 }
@@ -5743,6 +6244,148 @@ mod tab_close_tests {
         );
     }
 
+    /// A closing drawing takes its remembered ATTDEF placement with it: the
+    /// coordinates belong to the drawing that placed them.
+    #[test]
+    fn closing_a_tab_drops_the_place_it_remembered() {
+        let mut app = three_tabs();
+        let i = app
+            .tabs
+            .iter()
+            .position(|tab| !tab.is_start)
+            .expect("a drawing tab, not the fixed start page");
+        let id = app.tabs[i].id;
+        crate::modules::draw::draw::attdef::session().set_place(id, &Default::default());
+        assert!(
+            crate::modules::draw::draw::attdef::session().last_in(id).is_some(),
+            "the drawing remembered a place"
+        );
+
+        let _ = app.update(Message::TabClose(id));
+
+        assert!(
+            crate::modules::draw::draw::attdef::session()
+                .last_in(id)
+                .is_none(),
+            "the place belonged to the drawing that just closed"
+        );
+    }
+
+    /// Discarding through the unsaved prompt is a close as much as clicking
+    /// the × is: the discarded drawing's remembered place goes with it, and a
+    /// drawing that stayed open keeps its own.
+    #[test]
+    fn discarding_a_dirty_tab_drops_the_place_it_remembered() {
+        let mut app = three_tabs();
+        let kept_id = app.tabs[1].id;
+        let closed_id = app.tabs[2].id;
+        crate::modules::draw::draw::attdef::session().set_place(kept_id, &Default::default());
+        crate::modules::draw::draw::attdef::session().set_place(closed_id, &Default::default());
+        assert!(
+            crate::modules::draw::draw::attdef::session()
+                .last_in(closed_id)
+                .is_some(),
+            "the drawing remembered a place"
+        );
+        app.tabs[2].dirty = true;
+
+        let _ = app.update(Message::TabClose(closed_id));
+        assert!(
+            app.pending_close.is_some(),
+            "closing a dirty drawing opens the unsaved prompt"
+        );
+        let _ = app.update(Message::UnsavedDialogDiscard);
+
+        assert!(
+            app.tabs.iter().all(|t| t.id != closed_id),
+            "the discarded drawing is gone"
+        );
+        assert!(
+            crate::modules::draw::draw::attdef::session()
+                .last_in(closed_id)
+                .is_none(),
+            "and the place it remembered went with it"
+        );
+        assert!(
+            crate::modules::draw::draw::attdef::session()
+                .last_in(kept_id)
+                .is_some(),
+            "the drawing still open keeps its own place"
+        );
+    }
+
+    /// A text line is remembered the same way an attribute placement is: the
+    /// next TEXT in the drawing continues below it, so closing the drawing has
+    /// to take the line with it.
+    #[test]
+    fn closing_a_tab_drops_the_line_it_remembered() {
+        let mut app = three_tabs();
+        let i = app
+            .tabs
+            .iter()
+            .position(|tab| !tab.is_start)
+            .expect("a drawing tab, not the fixed start page");
+        let id = app.tabs[i].id;
+        crate::modules::annotate::text::session().set_place(id, &Default::default());
+        assert!(
+            crate::modules::annotate::text::session()
+                .last_in(id)
+                .is_some(),
+            "the drawing remembered a line"
+        );
+
+        let _ = app.update(Message::TabClose(id));
+
+        assert!(
+            crate::modules::annotate::text::session()
+                .last_in(id)
+                .is_none(),
+            "the line belonged to the drawing that just closed"
+        );
+    }
+
+    /// Discarding a dirty drawing ends it just as closing does, so its line
+    /// goes too — while the drawings still open keep theirs.
+    #[test]
+    fn discarding_a_dirty_tab_drops_the_line_it_remembered() {
+        let mut app = three_tabs();
+        let kept_id = app.tabs[1].id;
+        let closed_id = app.tabs[2].id;
+        crate::modules::annotate::text::session().set_place(kept_id, &Default::default());
+        crate::modules::annotate::text::session().set_place(closed_id, &Default::default());
+        assert!(
+            crate::modules::annotate::text::session()
+                .last_in(closed_id)
+                .is_some(),
+            "the drawing remembered a line"
+        );
+        app.tabs[2].dirty = true;
+
+        let _ = app.update(Message::TabClose(closed_id));
+        assert!(
+            app.pending_close.is_some(),
+            "closing a dirty drawing opens the unsaved prompt"
+        );
+        let _ = app.update(Message::UnsavedDialogDiscard);
+
+        assert!(
+            app.tabs.iter().all(|t| t.id != closed_id),
+            "the discarded drawing is gone"
+        );
+        assert!(
+            crate::modules::annotate::text::session()
+                .last_in(closed_id)
+                .is_none(),
+            "the discarded drawing's line went with it"
+        );
+        assert!(
+            crate::modules::annotate::text::session()
+                .last_in(kept_id)
+                .is_some(),
+            "the drawing still open keeps its own line"
+        );
+    }
+
     /// Double-clicking one tab's × in a single batch must close that tab
     /// exactly once; the second message must not slide onto the tab that
     /// shifted into its place.
@@ -5805,5 +6448,179 @@ mod tab_close_tests {
         );
         assert!(app.pending_close.is_none(), "pending target consumed");
         assert!(app.active_tab < app.tabs.len(), "active tab stays valid");
+    }
+}
+
+#[cfg(test)]
+mod grip_ctrl_cycle_tests {
+    use crate::app::{Message, OpenCADStudio};
+    use crate::scene::model::object::GripMenuAction;
+    use codec::entities::LwPolyline;
+    use codec::types::Vector2;
+    use codec::{EntityType, Handle};
+    use glam::DVec3;
+
+    fn app_with_polyline() -> (OpenCADStudio, usize, Handle) {
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let polyline = LwPolyline::from_points(vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(10.0, 0.0),
+            Vector2::new(10.0, 10.0),
+        ]);
+        let handle = app.tabs[i]
+            .scene
+            .add_entity(EntityType::LwPolyline(polyline));
+        app.tabs[i].scene.selected.insert(handle);
+        app.refresh_selected_grips();
+        (app, i, handle)
+    }
+
+    fn pick_up(app: &mut OpenCADStudio, i: usize, handle: Handle, grip_id: usize, at: DVec3) {
+        let edit = app.grip_edit_for_hit(i, handle, grip_id, false, at);
+        app.tabs[i].active_grip = Some(edit);
+    }
+
+    fn press_ctrl(app: &mut OpenCADStudio) {
+        let _ = app.update(Message::SetModifiers {
+            shift: false,
+            ctrl: true,
+            alt: false,
+        });
+        let _ = app.update(Message::SetModifiers {
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+    }
+
+    fn polyline(app: &OpenCADStudio, i: usize, handle: Handle) -> LwPolyline {
+        match app.tabs[i].scene.document.get_entity(handle) {
+            Some(EntityType::LwPolyline(polyline)) => polyline.clone(),
+            other => panic!("expected a polyline, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_cycles_a_vertex_grip_and_a_full_turn_changes_nothing() {
+        let (mut app, i, handle) = app_with_polyline();
+        let dirty = app.tabs[i].dirty;
+        pick_up(&mut app, i, handle, 1, DVec3::new(10.0, 0.0, 0.0));
+
+        press_ctrl(&mut app);
+        assert_eq!(
+            polyline(&app, i, handle).vertices.len(),
+            4,
+            "Add Vertex is provisional"
+        );
+        assert_eq!(app.grip_ctrl_one_shot(i), None);
+        assert_eq!(
+            app.tabs[i].active_grip.as_ref().map(|grip| grip.grip_id),
+            Some(2)
+        );
+
+        press_ctrl(&mut app);
+        assert_eq!(
+            polyline(&app, i, handle).vertices.len(),
+            3,
+            "Add Vertex left behind"
+        );
+        assert_eq!(
+            app.grip_ctrl_one_shot(i),
+            Some(GripMenuAction::RemoveVertex)
+        );
+
+        press_ctrl(&mut app);
+        assert_eq!(polyline(&app, i, handle).vertices.len(), 3);
+        assert_eq!(app.grip_ctrl_one_shot(i), None);
+        assert_eq!(
+            app.tabs[i].active_grip.as_ref().map(|grip| grip.grip_id),
+            Some(1)
+        );
+        assert_eq!(
+            app.tabs[i].dirty, dirty,
+            "a full turn leaves the drawing clean"
+        );
+    }
+
+    #[test]
+    fn the_click_after_ctrl_removes_the_vertex_as_one_undo_step() {
+        let (mut app, i, handle) = app_with_polyline();
+        pick_up(&mut app, i, handle, 1, DVec3::new(10.0, 0.0, 0.0));
+        press_ctrl(&mut app);
+        press_ctrl(&mut app);
+
+        // The cursor has nothing to place while the removal waits for a click.
+        let _ = app.update(Message::ViewportMove(iced::Point::new(50.0, 50.0)));
+        assert_eq!(
+            polyline(&app, i, handle).vertices[1].location,
+            Vector2::new(10.0, 0.0)
+        );
+
+        let _ = app.on_viewport_left_release();
+        assert_eq!(polyline(&app, i, handle).vertices.len(), 2);
+        assert!(app.tabs[i].active_grip.is_none());
+        assert!(app.grip_ctrl_cycle.is_none());
+
+        let _ = app.update(Message::Undo);
+        assert_eq!(polyline(&app, i, handle).vertices.len(), 3);
+    }
+
+    #[test]
+    fn ctrl_cycles_a_midpoint_grip_through_add_vertex_and_arc() {
+        let (mut app, i, handle) = app_with_polyline();
+        // Grips 0..3 are the vertices; grip 3 is the first segment's midpoint.
+        pick_up(&mut app, i, handle, 3, DVec3::new(5.0, 0.0, 0.0));
+
+        press_ctrl(&mut app);
+        assert_eq!(polyline(&app, i, handle).vertices.len(), 4);
+
+        press_ctrl(&mut app);
+        let arc = polyline(&app, i, handle);
+        assert_eq!(arc.vertices.len(), 3);
+        assert!(
+            arc.vertices[0].bulge.abs() > 1e-9,
+            "the segment is an arc while placing"
+        );
+
+        press_ctrl(&mut app);
+        let back = polyline(&app, i, handle);
+        assert_eq!(back.vertices.len(), 3);
+        assert_eq!(
+            back.vertices[0].bulge, 0.0,
+            "leaving the stage restores the line"
+        );
+    }
+
+    #[test]
+    fn escape_during_the_cycle_restores_the_polyline() {
+        let (mut app, i, handle) = app_with_polyline();
+        pick_up(&mut app, i, handle, 1, DVec3::new(10.0, 0.0, 0.0));
+        press_ctrl(&mut app);
+        assert!(app.cancel_active_grip_edit());
+        assert_eq!(polyline(&app, i, handle).vertices.len(), 3);
+        assert!(app.tabs[i].active_grip.is_none());
+        assert!(app.grip_ctrl_cycle.is_none());
+    }
+
+    #[test]
+    fn ctrl_leaves_other_grips_alone() {
+        use codec::entities::Line;
+        use codec::types::Vector3;
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        let i = app.active_tab;
+        let line = Line::from_points(Vector3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 0.0, 0.0));
+        let handle = app.tabs[i].scene.add_entity(EntityType::Line(line));
+        app.tabs[i].scene.selected.insert(handle);
+        app.refresh_selected_grips();
+        pick_up(&mut app, i, handle, 0, DVec3::ZERO);
+        press_ctrl(&mut app);
+        assert!(app.grip_ctrl_cycle.is_none());
+        assert_eq!(
+            app.tabs[i].active_grip.as_ref().map(|grip| grip.grip_id),
+            Some(0)
+        );
     }
 }

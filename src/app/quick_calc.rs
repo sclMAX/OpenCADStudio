@@ -45,6 +45,7 @@ pub(super) fn sysvars(tab: &DocumentTab) -> SysVars {
         ("dimscale", n(h.dim_scale)),
         ("mirrtext", n(f64::from(u8::from(h.mirror_text)))),
         ("osmode", n(f64::from(h.object_snap_mode))),
+        ("matchmode", n(f64::from(crate::entities::match_props::match_mode()))),
         ("userr1", n(h.user_real1)),
         ("userr2", n(h.user_real2)),
         ("userr3", n(h.user_real3)),
@@ -145,6 +146,7 @@ impl OpenCADStudio {
         if self.dock_panel_visible(PanelId::QuickCalc) {
             return self.on_dock(crate::ui::dock::DockMsg::Close(PanelId::QuickCalc));
         }
+        self.pallet_as_window(PanelId::QuickCalc);
         self.quick_calc.show = true;
         self.dock_open_at_default(PanelId::QuickCalc);
         self.save_config();
